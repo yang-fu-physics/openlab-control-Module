@@ -2,20 +2,19 @@
 
 This module controls one Model 372/372A measurement input scanner through a
 VISA GPIB resource. It requires a locally installed VISA implementation such
-as NI-VISA or Keysight VISA. Python dependencies are pinned with hashes and
-must be carried as offline wheels; OpenLab Control never falls back to a
-network install.
+as NI-VISA or Keysight VISA.
 
-## Offline dependency status
+## Framework dependency status
 
-The complete wheel set is present under `wheels/`. Its SHA-256 values match
-`requirements.lock`, and installation through the core
-`--no-index --only-binary=:all: --require-hashes` path has been verified:
+PyVISA 1.16.2 and typing_extensions 4.16.0 are shared framework dependencies
+provided directly by OpenLab Control. The manifest keeps compatible version
+ranges so an incompatible core is rejected before module source is imported,
+but this module has no additional dependency runtime, lock file, wheel folder,
+or Install Dependencies step.
 
-- `pyvisa-1.16.2-py3-none-any.whl`:
-  `54f034adafd3e8d1858d57cdafec64e920444f4b84b31c9fd17487fbad0a197a`
-- `typing_extensions-4.16.0-py3-none-any.whl`:
-  `481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8`
+The VISA vendor implementation itself is a system driver, not a Python wheel.
+Install and configure NI-VISA or Keysight VISA separately on the instrument
+computer; that operation is outside OpenLab Control.
 
 ## Measurement order
 

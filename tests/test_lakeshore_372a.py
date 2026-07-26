@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import sys
@@ -18,10 +17,6 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from labcontrol.extensions.dependencies import (  # noqa: E402
-    dependency_runtime_errors,
-    install_offline_dependencies,
-)
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
 from labcontrol.measurement.api import (  # noqa: E402
     ModuleError,
@@ -858,7 +853,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
 
 
 class LakeShore372AManifestTests(unittest.TestCase):
-    def test_manifest_has_fixed_per_slot_columns_and_lock(
+    def test_manifest_uses_framework_dependencies_and_fixed_columns(
         self,
     ) -> None:
         descriptor = load_manifest(MODULE)
@@ -872,7 +867,15 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b2",
+            "0.1.0b3",
+        )
+        self.assertEqual(descriptor.dependencies, ())
+        self.assertEqual(
+            descriptor.framework_dependencies,
+            (
+                "PyVISA>=1.16.2,<1.17",
+                "typing_extensions>=4.16,<5",
+            ),
         )
         self.assertEqual(
             [column.name for column in descriptor.columns],
@@ -897,78 +900,10 @@ class LakeShore372AManifestTests(unittest.TestCase):
                 "Status4",
             ],
         )
-        lock = (
-            MODULE / "requirements.lock"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "PyVISA==1.16.2 --hash=sha256:",
-            lock,
+        self.assertFalse(
+            (MODULE / "requirements.lock").exists()
         )
-        self.assertIn(
-            "typing_extensions==4.16.0 "
-            "--hash=sha256:",
-            lock,
-        )
-        expected_wheels = {
-            "pyvisa-1.16.2-py3-none-any.whl": (
-                "54f034adafd3e8d1858d57cdafec64e9"
-                "20444f4b84b31c9fd17487fbad0a197a"
-            ),
-            "typing_extensions-4.16.0-py3-none-any.whl": (
-                "481caa481374e813c1b176ada14e97f1"
-                "f67a4539ce9cfeb3f350d78d6370c2e8"
-            ),
-        }
-        wheel_directory = MODULE / "wheels"
-        self.assertEqual(
-            {
-                path.name
-                for path in wheel_directory.glob("*.whl")
-            },
-            set(expected_wheels),
-        )
-        for name, expected_hash in expected_wheels.items():
-            with self.subTest(wheel=name):
-                self.assertEqual(
-                    hashlib.sha256(
-                        (wheel_directory / name).read_bytes()
-                    ).hexdigest(),
-                    expected_hash,
-                )
-
-    def test_offline_wheels_install_with_core_installer(
-        self,
-    ) -> None:
-        descriptor = load_manifest(MODULE)
-        self.assertTrue(
-            descriptor.valid,
-            descriptor.error,
-        )
-        with tempfile.TemporaryDirectory() as temp:
-            site_packages = (
-                Path(temp)
-                / "runtime"
-                / "site-packages"
-            )
-            result = install_offline_dependencies(
-                python_executable=Path(sys.executable),
-                extension_directory=MODULE,
-                site_packages=site_packages,
-                shared_wheels_directory=(
-                    ROOT / "wheels"
-                ),
-                dependencies=descriptor.dependencies,
-                fingerprint=descriptor.fingerprint,
-                timeout_seconds=120.0,
-            )
-            self.assertEqual(
-                dependency_runtime_errors(
-                    descriptor.dependencies,
-                    result.target,
-                    descriptor.fingerprint,
-                ),
-                (),
-            )
+        self.assertFalse((MODULE / "wheels").exists())
 
 
 if __name__ == "__main__":
