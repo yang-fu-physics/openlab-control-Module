@@ -1,0 +1,34 @@
+# OpenLab Measurement Modules repository
+
+This is the Git-ready layout for the single shared Measurement Module
+repository. Keep every independently installable module under `modules/<id>/`.
+The included `simulated_transport` module is hardware-free and serves as the
+reference implementation and test fixture.
+
+## Manual offline installation
+
+1. Review the module source, `module.toml`, `requirements.lock`, and wheels.
+2. Copy one complete module folder to `OpenLabControl/modules/<id>/`.
+3. If the module declares dependencies, include every required Windows wheel
+   under that module's `wheels/` folder (or the application's shared
+   `wheels/` folder). Network fallback is intentionally unavailable.
+4. Restart OpenLab Control, open Modules Manager, select the module, and use
+   `Install Dependencies` if shown.
+5. Enable the module and approve the first-load trust prompt.
+6. Verify that saved settings are loaded but not applied until the operator
+   chooses `Apply Settings`.
+
+Never commit `module_data`, acquired DAT files, instrument addresses containing
+secrets, or generated `plugin_runtime` contents. A module owns its measurement
+instruments, runs its backend in one child process, and may only read the
+temperature/field/monitor snapshot supplied by the core.
+
+## Required release checks
+
+- Validate manifest ID, API/core range, fixed columns, and source entry points.
+- Exercise initialize/apply/begin/measure/end/abort and every error path.
+- Verify Warning deduplication and Error termination.
+- Test multi-row output and parallel execution with another module.
+- Test bounded driver and framework timeouts plus forced worker cleanup.
+- Test the exact offline wheel set on the target Windows/Python architecture.
+- Increment `version` whenever shipped content or dependencies change.
