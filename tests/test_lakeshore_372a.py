@@ -778,6 +778,14 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             owner
         )
         status_page = frontend.create_status_page(owner)
+        self.assertGreaterEqual(
+            settings_page.sizeHint().width(),
+            980,
+        )
+        self.assertGreaterEqual(
+            settings_page.sizeHint().height(),
+            600,
+        )
         settings = _all_channels_settings()
         settings["frequency_index"] = 5
         settings["channels"]["r3"][

@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from PySide6.QtCore import QSignalBlocker
+from PySide6.QtCore import QSize, QSignalBlocker
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -33,15 +34,23 @@ from .constants import (
 )
 
 
+class _SettingsPage(QWidget):
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(980, 600)
+
+
 class LakeShore372AFrontend(ModuleFrontend):
     def create_settings_page(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
-        page = QWidget(parent)
+        page = _SettingsPage(parent)
         outer = QVBoxLayout(page)
         scroll = QScrollArea(page)
         scroll.setWidgetResizable(True)
+        scroll.setSizeAdjustPolicy(
+            QAbstractScrollArea.SizeAdjustPolicy.AdjustToContentsOnFirstShow
+        )
         content = QWidget(scroll)
         layout = QVBoxLayout(content)
 
@@ -156,8 +165,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         for index, (label, widget) in enumerate(
             controls
         ):
-            row = index // 3
-            column = (index % 3) * 2
+            row = index // 2
+            column = (index % 2) * 2
             scan_layout.addWidget(
                 QLabel(label),
                 row,
@@ -170,10 +179,10 @@ class LakeShore372AFrontend(ModuleFrontend):
             )
         scan_layout.addWidget(
             self.shunt_after_read,
-            2,
+            3,
             0,
             1,
-            6,
+            4,
         )
         layout.addWidget(scan)
 
