@@ -3,7 +3,9 @@
 This is the Git-ready layout for the single shared Measurement Module
 repository. Keep every independently installable module under `modules/<id>/`.
 The included `simulated_transport` module is hardware-free and serves as the
-reference implementation and test fixture.
+reference implementation and test fixture. `lakeshore_372a` is the first
+hardware module; it scans up to four selectable Model 372/372A inputs over
+GPIB and emits one sparse DAT row per enabled slot.
 
 ## Manual offline installation
 
