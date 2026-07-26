@@ -570,7 +570,7 @@ class LakeShore372ABackend(ModuleBackend):
             raise ModuleError(
                 "This module requires the live, interruptible "
                 "Measurement Module context added after "
-                "OpenLab Control 0.11.0 Beta 1",
+                "OpenLab Control 0.11.0 Beta 2 or newer",
                 "LS372_CORE_API_TOO_OLD",
             )
 

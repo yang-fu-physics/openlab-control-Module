@@ -872,7 +872,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b1",
+            "0.1.0b2",
         )
         self.assertEqual(
             [column.name for column in descriptor.columns],

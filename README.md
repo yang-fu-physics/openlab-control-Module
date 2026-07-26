@@ -7,6 +7,10 @@ reference implementation and test fixture. `lakeshore_372a` is the first
 hardware module; it scans up to four selectable Model 372/372A inputs over
 GPIB and emits one sparse DAT row per enabled slot.
 
+The current `simulated_transport` 1.0.1 and `lakeshore_372a` 0.1.0b2 releases
+require OpenLab Control 0.11.0 Beta 2 or newer because they use the live,
+interruptible measurement context introduced in that core release.
+
 ## Manual offline installation
 
 1. Review the module source, `module.toml`, `requirements.lock`, and wheels.
