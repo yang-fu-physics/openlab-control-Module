@@ -6,11 +6,18 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CORE = ROOT.parent / "OpenLabControl"
 MODULE = ROOT / "modules" / "simulated_transport"
-sys.path.insert(0, str(MODULE))
+sys.path.insert(0, str(CORE / "src"))
 
-from backend import SimulatedTransportBackend  # noqa: E402
+from labcontrol.extensions.loading import load_source_object  # noqa: E402
 from labcontrol.measurement.api import ModuleOperationContext  # noqa: E402
+
+SimulatedTransportBackend = load_source_object(
+    MODULE,
+    "backend:SimulatedTransportBackend",
+    "test_simulated_transport_backend",
+)
 
 
 class SimulatedTransportTests(unittest.TestCase):
