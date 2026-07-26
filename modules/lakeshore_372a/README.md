@@ -8,10 +8,9 @@ network install.
 
 ## Offline dependency status
 
-`requirements.lock` is complete, but the two binary files below are not yet
-present because the development environment could not perform the official
-PyPI download. Do not distribute this module as "offline complete" until both
-files have been placed in `wheels/` and their SHA-256 values have been checked:
+The complete wheel set is present under `wheels/`. Its SHA-256 values match
+`requirements.lock`, and installation through the core
+`--no-index --only-binary=:all: --require-hashes` path has been verified:
 
 - `pyvisa-1.16.2-py3-none-any.whl`:
   `54f034adafd3e8d1858d57cdafec64e920444f4b84b31c9fd17487fbad0a197a`
@@ -22,16 +21,18 @@ files have been placed in `wheels/` and their SHA-256 values have been checked:
 
 For each enabled R1-R4 slot, the module:
 
-1. enables/configures the selected physical input (1-16), unshunts its
-   excitation, and sends `SCAN <channel>,0`;
-2. waits the configured change-pause time;
-3. asks the OpenLab core for a fresh primary temperature/field snapshot;
-4. waits the configured dwell time;
-5. asks for a second fresh system snapshot and reads `RDGR?`, `QRDG?`,
+1. enables/configures the selected physical input (1-16) while keeping its
+   excitation shunted;
+2. sends and verifies `SCAN <channel>,0`, then unshunts and verifies the
+   selected input;
+3. waits the configured change-pause time;
+4. asks the OpenLab core for a fresh primary temperature/field snapshot;
+5. waits the configured dwell time;
+6. asks for a second fresh system snapshot and reads `RDGR?`, `QRDG?`,
    `RDGPWR?`, and `RDGST?`;
-6. writes one row for that slot, with the other R/phase/current/status slots
+7. writes one row for that slot, with the other R/phase/current/status slots
    blank;
-7. shunts excitation immediately by default, including Stop/Error paths.
+8. shunts excitation immediately by default, including Stop/Error paths.
 
 Temperature is normalized to kelvin and field to oersted before averaging.
 The ordinary OpenLab system columns still contain the live values at row-write
