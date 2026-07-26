@@ -1,8 +1,15 @@
+"""Lake Shore Model 372 协议枚举和模块默认设置。
+
+元组第一项是仪表命令使用的离散索引，显示文字只用于 UI，第三项统一使用 SI 数值供
+计算。不要仅按列表位置推导协议索引；修改表格时应同时对照 Model 372 手册和测试。
+"""
+
 from __future__ import annotations
 
 from typing import Any
 
 
+# FREQ 命令的离散频率索引。Model 372 的协议顺序并非按数值单调递增。
 FREQUENCIES_HZ: tuple[tuple[int, float], ...] = (
     (1, 9.8),
     (2, 13.7),
@@ -11,6 +18,7 @@ FREQUENCIES_HZ: tuple[tuple[int, float], ...] = (
     (5, 18.2),
 )
 
+# INTYPE 电流激励量程：协议索引、UI 标签、安培值。
 CURRENT_EXCITATIONS: tuple[
     tuple[int, str, float],
     ...,
@@ -39,6 +47,7 @@ CURRENT_EXCITATIONS: tuple[
     (22, "31.6 mA", 31.6e-3),
 )
 
+# INTYPE 电压激励量程：协议索引、UI 标签、伏特值。
 VOLTAGE_EXCITATIONS: tuple[
     tuple[int, str, float],
     ...,
@@ -57,6 +66,7 @@ VOLTAGE_EXCITATIONS: tuple[
     (12, "632 mV", 632e-3),
 )
 
+# INTYPE 电阻量程：协议索引、UI 标签、欧姆值。
 RESISTANCE_RANGES: tuple[
     tuple[int, str, float],
     ...,
@@ -85,6 +95,8 @@ RESISTANCE_RANGES: tuple[
     (22, "63.2 MOhm", 63.2e6),
 )
 
+# RDGST? 返回的 8 位状态字。bit 0 是电流源 compliance，后端会把它单独升级显示；
+# 其他位仍完整保存在 StatusDetails，不能只保留归一化后的 NORMAL/OVER_RANGE。
 STATUS_BITS: tuple[tuple[int, str], ...] = (
     (1, "CS_OVL"),
     (2, "VCM_OVL"),
@@ -98,6 +110,12 @@ STATUS_BITS: tuple[tuple[int, str], ...] = (
 
 
 def default_channel(slot: int) -> dict[str, Any]:
+    """返回一个逻辑 R 槽位的全新默认字典。
+
+    默认仅 R1 Enabled，物理输入号等于槽位号；量程索引 5/17 分别对应手册中的
+    100 pA 与 200 kOhm。每次新建字典，避免多个窗口共享可变通道设置。
+    """
+
     return {
         "enabled": slot == 1,
         "input_channel": slot,
@@ -109,6 +127,12 @@ def default_channel(slot: int) -> dict[str, Any]:
 
 
 def default_settings() -> dict[str, Any]:
+    """返回模块初始设置；资源为空，且默认要求每通道读完后恢复分流。
+
+    保存设置由界面读取但不会在 Enable 时自动 Apply。这些默认值只是初始选择，真正
+    发给仪表前仍需后端做类型、范围、唯一物理输入和总超时校验。
+    """
+
     return {
         "resource": "",
         "frequency_index": 2,

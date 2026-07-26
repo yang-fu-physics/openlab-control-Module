@@ -1,3 +1,15 @@
+"""Lake Shore Model 372 AC Resistance Bridge 的 Measurement Module 后端。
+
+用户界面沿用实验室常用的“372A”名称，协议实现依据 Model 372 手册中的
+``FREQ/FILTER/INSET/INTYPE/SCAN`` 设置命令和
+``RDGR/QRDG/RDGPWR/RDGST`` 读数命令。模块仍是未经过真实 GPIB 控制器、VISA
+实现和仪表固件验证的 Beta，不能把仿真测试通过理解成硬件安全认证。
+
+安全原则是：Enable 只发现资源，不连接、不 Apply；Apply 对每项写入做读回并保持激励
+分流；Measure 才逐通道临时解除分流；异常、Stop、Disable 和应用退出都尽力恢复分流。
+任何无法读回确认分流的情况都报告 Error，而不是仅凭本机进程退出宣称仪表安全。
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -22,6 +34,8 @@ from .constants import (
 
 
 class InstrumentTransport(Protocol):
+    """后端所需的最小通信接口，便于使用真实 PyVISA 或测试替身。"""
+
     def write(self, command: str) -> None: ...
 
     def query(self, command: str) -> str: ...
@@ -38,13 +52,19 @@ Waiter = Callable[[ModuleOperationContext, float], None]
 
 
 class PyVisaTransport:
-    """Small lazy PyVISA adapter kept entirely in the module worker."""
+    """完全位于模块 worker 内的惰性 PyVISA 适配器。
+
+    主进程不 import PyVISA，也不持有 ResourceManager/Instrument；模块被强制回收时，
+    VISA 对象随独立进程一起释放。仪表 I/O timeout 在打开资源后立即换算为毫秒设置。
+    """
 
     def __init__(
         self,
         resource_name: str,
         timeout_seconds: float,
     ) -> None:
+        """打开单个 VISA session，并把核心的秒制超时转换成 PyVISA 毫秒。"""
+
         pyvisa = importlib.import_module("pyvisa")
         self._manager = pyvisa.ResourceManager()
         try:
@@ -63,6 +83,8 @@ class PyVisaTransport:
 
     @staticmethod
     def list_resources() -> tuple[str, ...]:
+        """枚举并排序 GPIB VISA 资源；不把串口/USB/TCPIP 混入下拉框。"""
+
         pyvisa = importlib.import_module("pyvisa")
         manager = pyvisa.ResourceManager()
         try:
@@ -84,12 +106,18 @@ class PyVisaTransport:
         )
 
     def write(self, command: str) -> None:
+        """向仪表发送一条已经过后端构造的绝对设置命令。"""
+
         self._instrument.write(command)
 
     def query(self, command: str) -> str:
+        """发送查询并保留 PyVISA 返回的原始文本，解析由后端集中完成。"""
+
         return str(self._instrument.query(command))
 
     def close(self) -> None:
+        """先关闭仪表 session，再关闭其 ResourceManager。"""
+
         try:
             self._instrument.close()
         finally:
@@ -97,6 +125,22 @@ class PyVisaTransport:
 
 
 class LakeShore372ABackend(ModuleBackend):
+    """372A 生命周期、设置读回、逐通道测量和异常分流状态机。
+
+    每个 Enabled 通道的测量顺序固定为：
+
+    1. 以“Enabled + Shunted”重新写入并核对该通道配置；
+    2. ``SCAN channel,0`` 切换到物理输入并读回确认；
+    3. 解除该通道分流，等待 Change Pause；
+    4. 获取第一份核心温场快照；
+    5. 等待 Scan Dwell，再获取时间戳更新的第二份快照；
+    6. 读取电阻、正交分量、功率和 8 位读数状态，计算相角/电流；
+    7. 写一行只含该 R 槽位的数据，并按配置或异常路径恢复分流。
+
+    R1-R4 是 DAT 的固定逻辑槽位，不等同于仪表物理输入号；四个物理输入由设置独立选择
+    且必须互不重复。
+    """
+
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
@@ -130,6 +174,8 @@ class LakeShore372ABackend(ModuleBackend):
         settings: Mapping[str, Any],
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """Enable 阶段只规范化设置和发现 GPIB，不连接仪表、不发送设置。"""
+
         self._require_live_context(context)
         self.desired_settings = self._normalized_settings(
             settings,
@@ -144,6 +190,8 @@ class LakeShore372ABackend(ModuleBackend):
                 self._resource_lister()
             )
         except Exception as exc:
+            # 资源发现失败不阻止模块窗口打开；用户仍可手动输入 VISA resource。错误
+            # 只显示在 Status，真正 Apply 时会再次严格验证并连接。
             self.available_resources = ()
             discovery_message = (
                 f"{type(exc).__name__}: {exc}"
@@ -178,6 +226,13 @@ class LakeShore372ABackend(ModuleBackend):
         settings: Mapping[str, Any],
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """连接并发送用户确认的设置，每个写入都必须通过查询读回。
+
+        所有通道在 Apply 时强制写成 Shunted，即使保存设置来自旧版本也不会仅因 Apply
+        打开激励。任一步失败都会尽力分流已涉及通道、关闭 transport，并且不更新
+        ``applied_settings``。
+        """
+
         desired = self._normalized_settings(
             settings,
             require_resource=True,
@@ -191,6 +246,7 @@ class LakeShore372ABackend(ModuleBackend):
             float(desired["io_timeout_seconds"]),
         )
         try:
+            # FREQ 的第一个参数 0 表示全局/测量输入组；写后立即 FREQ? 核对索引。
             self._write(
                 f"FREQ 0,{desired['frequency_index']}",
                 context,
@@ -211,9 +267,11 @@ class LakeShore372ABackend(ModuleBackend):
                     context=context,
                 )
         except Exception:
+            # 清理路径不依赖 context checkpoint，Stop 已到达时仍会直接尝试分流。
             self._best_effort_shunt_settings(desired)
             self._close_transport()
             raise
+        # 只有全部读回一致后才把 desired 提升为 applied，Measure 绝不使用半套设置。
         self.applied_settings = deepcopy(desired)
         status = {
             "Connection": "Connected",
@@ -232,6 +290,8 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """确认已经 Apply，并标记本次 SEQ；此时仍保持全部激励分流。"""
+
         self._require_ready()
         self.sequence_active = True
         status = {
@@ -245,6 +305,8 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> None:
+        """按 R1→R4 顺序测量 Enabled 通道，每个通道独立 emit 一行稀疏数据。"""
+
         self._require_ready()
         settings = self.applied_settings
         self._validate_measure_duration(
@@ -255,6 +317,7 @@ class LakeShore372ABackend(ModuleBackend):
             channel = settings["channels"][f"r{slot}"]
             if not channel["enabled"]:
                 continue
+            # 通道之间的 checkpoint 使 Stop 不会开始下一个输入。
             context.checkpoint()
             self._measure_channel(
                 slot,
@@ -270,9 +333,13 @@ class LakeShore372ABackend(ModuleBackend):
         settings: Mapping[str, Any],
         context: ModuleOperationContext,
     ) -> None:
+        """执行单通道完整事务，并在 finally 中处理分流确认。"""
+
         input_channel = int(channel["input_channel"])
         failure: Exception | None = None
         try:
+            # 先以 shunted=True 重写完整配置，再切换 SCAN，最后才解除分流。即使上次
+            # 测量中断，也不会直接在未知配置下打开激励。
             self._configure_channel(
                 channel,
                 enabled=True,
@@ -298,12 +365,15 @@ class LakeShore372ABackend(ModuleBackend):
                 context,
                 float(settings["pause_seconds"]),
             )
+            # 第一份温场快照位于 Change Pause 之后、Dwell 之前。
             first = context.sample_system()
             self._waiter(
                 context,
                 float(settings["dwell_seconds"]),
             )
             second = context.sample_system()
+            # 平均函数还会要求第二份 temperature/field 时间戳严格更新，避免把同一份
+            # 缓存读数重复两次伪装成时间平均。
             temperature, field = (
                 self._averaged_system_values(
                     first,
@@ -327,6 +397,7 @@ class LakeShore372ABackend(ModuleBackend):
                 context,
             )
             phase = math.degrees(
+                # QRDG 是正交分量，RDGR 是同相电阻分量；atan2 保留正确象限。
                 math.atan2(
                     quadrature,
                     resistance,
@@ -349,6 +420,8 @@ class LakeShore372ABackend(ModuleBackend):
                 context,
             )
             row = {
+                # manifest 为四个槽位预声明列。本行只填写当前槽位，其他 R/Phase/
+                # Current/Status 列由核心 DAT writer 留空。
                 "TemperatureAverage": temperature,
                 "FieldAverage": field,
                 f"R{slot}": resistance,
@@ -382,6 +455,8 @@ class LakeShore372ABackend(ModuleBackend):
             failure = exc
             raise
         finally:
+            # 用户可显式关闭“每通道读完分流”，但任何异常都无条件尝试分流。成功路径
+            # 若不分流，最终 end_sequence/abort 仍会对全部 Enabled 通道分流。
             should_shunt = (
                 bool(settings["shunt_after_read"])
                 or failure is not None
@@ -396,6 +471,8 @@ class LakeShore372ABackend(ModuleBackend):
                     "Excitation": "Shunted",
                 })
                 if cleanup_error is not None:
+                    # 原始测量异常与 cleanup 异常同时存在时，分流未确认具有更高安全
+                    # 优先级；用 from failure 保留原始异常链供诊断。
                     raise ModuleError(
                         "Could not confirm excitation shunt "
                         f"for input {input_channel}: "
@@ -409,6 +486,12 @@ class LakeShore372ABackend(ModuleBackend):
         reason: str,
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """对 completed/stopped/error 一律分流全部 Enabled 通道。
+
+        任一通道读回失败会让核心把 Run 标为 Faulted；``sequence_active`` 无论如何都
+        清除，使后续 Disable 仍可执行。
+        """
+
         try:
             self._shunt_all(context)
         except Exception:
@@ -430,6 +513,12 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """Disable/应用退出时逐通道尽力分流，然后无条件关闭 VISA transport。
+
+        分流失败不会阻止本机资源释放，但会在断开后抛出 Error 并显示
+        ``Shunt unconfirmed``，提醒用户到仪表面板人工确认。
+        """
+
         errors = self._best_effort_shunt_settings(
             self.applied_settings
         )
@@ -460,6 +549,8 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """只读查询 ``*IDN?`` 验证当前连接，没有连接时不隐式重连。"""
+
         if self.transport is None:
             return {
                 "Connection": "Disconnected",
@@ -493,6 +584,8 @@ class LakeShore372ABackend(ModuleBackend):
         payload: Mapping[str, Any],
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
+        """处理 Idle 时的资源刷新和连接测试；两者都不会 Apply 仪表设置。"""
+
         if action == "refresh_resources":
             try:
                 self.available_resources = (
@@ -515,6 +608,7 @@ class LakeShore372ABackend(ModuleBackend):
                 ),
             }
         elif action == "test_connection":
+            # 使用 Settings 页“当前尚未保存/Apply”的值，使用户可以先验证新地址。
             supplied = payload.get("settings")
             source = (
                 supplied
@@ -555,6 +649,8 @@ class LakeShore372ABackend(ModuleBackend):
     def _require_live_context(
         context: ModuleOperationContext,
     ) -> None:
+        """拒绝缺少实时快照和可中断等待能力的旧核心 API。"""
+
         if (
             not callable(
                 getattr(context, "sample_system", None)
@@ -579,6 +675,8 @@ class LakeShore372ABackend(ModuleBackend):
         resource: str,
         timeout_seconds: float,
     ) -> None:
+        """关闭旧 session，打开新资源并在接管前严格验证 ``*IDN?``。"""
+
         self._close_transport()
         transport: InstrumentTransport | None = None
         try:
@@ -607,6 +705,8 @@ class LakeShore372ABackend(ModuleBackend):
 
     @staticmethod
     def _validate_identity(identity: str) -> None:
+        """宽容厂商字符串中的空格/下划线/连字符，但必须明确包含 MODEL372。"""
+
         compact = re.sub(
             r"[\s_-]+",
             "",
@@ -624,6 +724,8 @@ class LakeShore372ABackend(ModuleBackend):
         command: str,
         context: ModuleOperationContext,
     ) -> None:
+        """通过统一重试入口发送命令，禁止调用者绕过通信错误归一化。"""
+
         self._call_with_retry(
             command,
             lambda transport: transport.write(command),
@@ -635,6 +737,8 @@ class LakeShore372ABackend(ModuleBackend):
         command: str,
         context: ModuleOperationContext,
     ) -> str:
+        """查询非空文本；空回复与传输异常一样不能被当作有效读回。"""
+
         result = self._call_with_retry(
             command,
             lambda transport: transport.query(command),
@@ -659,6 +763,13 @@ class LakeShore372ABackend(ModuleBackend):
         ],
         context: ModuleOperationContext,
     ) -> Any:
+        """在固定次数内重连重试，并把最终失败升级为 ModuleError。
+
+        本模块写命令都是绝对设置（不是递增/触发型命令），且关键设置随后都有查询读回；
+        因此短暂 I/O 失败后允许重发。重连只重新验证仪表身份，不声称恢复全部内部设置，
+        这也是 372A 仍需真机断线测试的原因。
+        """
+
         settings = (
             self.applied_settings
             or self.desired_settings
@@ -721,6 +832,8 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         settings: Mapping[str, Any],
     ) -> None:
+        """重建同一资源并只验证身份；不静默修改 ``applied_settings``。"""
+
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
         self._close_transport()
@@ -747,6 +860,13 @@ class LakeShore372ABackend(ModuleBackend):
         shunted: bool,
         context: ModuleOperationContext,
     ) -> None:
+        """按 FILTER→INSET→INTYPE 顺序完整配置一个物理输入并逐项核对。
+
+        这里故意不依赖仪表中残留的局部设置：每次都发送完整的绝对参数，随后用对应
+        ``...?`` 查询要求整数元组完全一致。这样断线重连或前一次中断后不会在未知配置
+        上仅切换 shunt 位。
+        """
+
         settings = (
             self.applied_settings
             or self.desired_settings
@@ -807,6 +927,8 @@ class LakeShore372ABackend(ModuleBackend):
         input_channel: int,
         context: ModuleOperationContext,
     ) -> None:
+        """切换 SCAN 到指定输入并关闭仪表内部自动扫描，然后读回确认。"""
+
         self._write(
             f"SCAN {input_channel},0",
             context,
@@ -824,6 +946,8 @@ class LakeShore372ABackend(ModuleBackend):
         shunted: bool,
         context: ModuleOperationContext,
     ) -> None:
+        """用完整 INTYPE 设置改变分流位，并要求仪表返回完全一致的配置。"""
+
         self._write(
             self._intype_command(
                 channel,
@@ -844,6 +968,8 @@ class LakeShore372ABackend(ModuleBackend):
         shunted: bool,
         context: ModuleOperationContext,
     ) -> None:
+        """核对 INTYPE 的模式、量程、自动量程、分流和首选单位全部字段。"""
+
         self._expect_integers(
             f"INTYPE? {channel['input_channel']}",
             self._intype_values(
@@ -859,6 +985,12 @@ class LakeShore372ABackend(ModuleBackend):
         expected: tuple[int, ...],
         context: ModuleOperationContext,
     ) -> None:
+        """解析逗号分隔的整数读回，字段数量和值都必须与期望完全相同。
+
+        不做“只比较关键字段”的宽松处理，因为遗漏字段可能掩盖仪表拒绝设置、固件协议
+        差异或通道仍处于未确认的激励状态。
+        """
+
         reply = self._query_text(command, context)
         try:
             actual = tuple(
@@ -886,6 +1018,8 @@ class LakeShore372ABackend(ModuleBackend):
         command: str,
         context: ModuleOperationContext,
     ) -> float:
+        """读取一个有限浮点数；NaN/Inf 不允许进入 DAT 或后续电流计算。"""
+
         reply = self._query_text(command, context)
         try:
             value = float(reply)
@@ -910,6 +1044,8 @@ class LakeShore372ABackend(ModuleBackend):
         input_channel: int,
         context: ModuleOperationContext,
     ) -> int:
+        """读取 RDGST 的 8 位状态字，并拒绝负数或超出一个字节的回复。"""
+
         command = f"RDGST? {input_channel}"
         reply = self._query_text(command, context)
         try:
@@ -934,6 +1070,12 @@ class LakeShore372ABackend(ModuleBackend):
     def _status(
         status_bits: int,
     ) -> tuple[str, str]:
+        """把状态位归为正常、超量程或超 compliance，并保留全部原始位名称。
+
+        CS_OVL（bit 0）对电流源安全最直接，因此优先映射为 ``OVER_COMPLIANCE``；
+        其余任意置位统一映射为 ``OVER_RANGE``，详细列仍记录所有置位名称。
+        """
+
         details = "|".join(
             label
             for bit, label in STATUS_BITS
@@ -953,6 +1095,12 @@ class LakeShore372ABackend(ModuleBackend):
         details: str,
         context: ModuleOperationContext,
     ) -> None:
+        """按逻辑槽位和物理输入发布可恢复 Warning，并在状态恢复时解除。
+
+        ``R槽位/物理输入`` 作为去重上下文：同一故障连续出现只提示一次，不同通道互不
+        吞并；compliance 与普通量程告警互斥，状态切换时先解除旧类型。
+        """
+
         warning_context = (
             f"R{slot}/input {input_channel}"
         )
@@ -995,6 +1143,13 @@ class LakeShore372ABackend(ModuleBackend):
         quadrature: float,
         power: float,
     ) -> float:
+        """返回本行所用的激励电流，单位为 A。
+
+        电流模式直接使用手册量程表中的设定值。电压模式没有直接电流读数，因此按仪表
+        报告的耗散功率和同相电阻估算 ``sqrt(abs(P)/abs(R))``；零电阻或非有限结果
+        视为数据错误。``quadrature`` 目前不参与该耗散模型，参数保留用于明确调用语义。
+        """
+
         if channel["excitation_mode"] == "current":
             values = {
                 index: current
@@ -1028,6 +1183,12 @@ class LakeShore372ABackend(ModuleBackend):
         first: Mapping[str, Mapping[str, Any]],
         second: Mapping[str, Mapping[str, Any]],
     ) -> tuple[float, float]:
+        """从 Dwell 前后两份核心快照计算主温度(K)和主磁场(Oe)算术平均。
+
+        第二份快照必须使用与第一份相同的设备 ID，且时间戳严格增加；不能在两次读取间
+        偷换主设备，也不能把同一缓存值重复平均。单位转换完成后才做平均。
+        """
+
         first_temperature = cls._primary_snapshot(
             first,
             "temperature",
@@ -1081,6 +1242,12 @@ class LakeShore372ABackend(ModuleBackend):
         system: Mapping[str, Mapping[str, Any]],
         kind: str,
     ) -> tuple[str, float, str, float]:
+        """确定温度或磁场的主快照，返回设备 ID、值、单位和时间戳。
+
+        选择优先级固定为显式 ``role=primary``、启用控制的设备、其余设备；同级按设备
+        ID 排序，避免字典插入顺序让同一数据集在不同进程中选择不同设备。
+        """
+
         candidates = [
             (str(device_id), values)
             for device_id, values in system.items()
@@ -1127,6 +1294,8 @@ class LakeShore372ABackend(ModuleBackend):
         device_id: str,
         kind: str,
     ) -> tuple[str, float, str, float]:
+        """从第二份系统快照提取同一设备，禁止在 Dwell 中途切换数据来源。"""
+
         values = system.get(device_id)
         if values is None:
             raise ModuleError(
@@ -1147,6 +1316,8 @@ class LakeShore372ABackend(ModuleBackend):
         values: Mapping[str, Any],
         kind: str,
     ) -> tuple[str, float, str, float]:
+        """验证核心设备快照处于连接状态，并含有限的 current/timestamp。"""
+
         if not bool(values.get("connected", True)):
             raise ModuleError(
                 f"{kind.title()} device {device_id} is "
@@ -1186,6 +1357,8 @@ class LakeShore372ABackend(ModuleBackend):
         first: tuple[str, float, str, float],
         second: tuple[str, float, str, float],
     ) -> None:
+        """要求第二次采样时间戳严格更新，防止缓存读数冒充两次独立测量。"""
+
         if second[3] <= first[3]:
             raise ModuleError(
                 f"OpenLab system snapshot for {first[0]} "
@@ -1200,6 +1373,8 @@ class LakeShore372ABackend(ModuleBackend):
         value: float,
         unit: str,
     ) -> float:
+        """把核心允许的温度单位显式换算为 DAT 约定的 K。"""
+
         normalized = unit.strip().casefold()
         if normalized in {"k", "kelvin"}:
             return value
@@ -1223,6 +1398,8 @@ class LakeShore372ABackend(ModuleBackend):
         value: float,
         unit: str,
     ) -> float:
+        """把核心允许的磁场单位显式换算为 DAT 约定的 Oe。"""
+
         normalized = unit.strip().casefold()
         if normalized in {"oe", "oersted", "g", "gauss"}:
             return value
@@ -1242,6 +1419,12 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> None:
+        """严格分流全部已 Apply 且 Enabled 的输入，并汇总所有失败后一次抛出。
+
+        循环不会因第一个通道失败而停止，因而其余通道仍有机会进入安全状态；只要有一个
+        通道未确认，整个清理动作就失败，调用者不能报告安全完成。
+        """
+
         if not self.applied_settings:
             return
         errors: list[str] = []
@@ -1274,6 +1457,12 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         channel: Mapping[str, Any],
     ) -> str | None:
+        """在异常清理路径直接尝试一次分流及读回，不依赖已取消的操作上下文。
+
+        此路径故意不调用普通重试/等待逻辑：Stop 或 worker 超时后 checkpoint 可能已拒绝
+        继续执行。返回 ``None`` 只代表本次读回确认成功，字符串则是必须上报的原因。
+        """
+
         transport = self.transport
         if transport is None:
             return "transport is disconnected"
@@ -1310,6 +1499,11 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         settings: Mapping[str, Any],
     ) -> list[str]:
+        """尽力处理设置中的全部 Enabled 通道，并返回所有未确认分流的说明。
+
+        transport 已断开时不能把“没有可写对象”视为安全成功，因为仪表端激励状态未知。
+        """
+
         if not settings:
             return []
         errors: list[str] = []
@@ -1345,6 +1539,12 @@ class LakeShore372ABackend(ModuleBackend):
         *,
         shunted: bool,
     ) -> str:
+        """构造完整 INTYPE 绝对设置；末尾 ``2`` 固定首选单位为 Ohm。
+
+        手册规定 current=1、voltage=0，分流开启=1。调用者不能只拼接最后一个分流字段，
+        以免覆盖或继承未知的其余参数。
+        """
+
         mode = (
             1
             if channel["excitation_mode"] == "current"
@@ -1367,6 +1567,8 @@ class LakeShore372ABackend(ModuleBackend):
         *,
         shunted: bool,
     ) -> tuple[int, ...]:
+        """返回 INTYPE? 应读回的六个字段，不含查询中已指定的输入号。"""
+
         return (
             (
                 1
@@ -1381,6 +1583,8 @@ class LakeShore372ABackend(ModuleBackend):
         )
 
     def _close_transport(self) -> None:
+        """先清空对象引用再关闭底层资源，避免 close 异常留下“似乎仍连接”的状态。"""
+
         transport = self.transport
         self.transport = None
         self.identity = ""
@@ -1391,6 +1595,8 @@ class LakeShore372ABackend(ModuleBackend):
                 pass
 
     def _require_ready(self) -> None:
+        """Measure/Run 只能使用完整 Apply 且仍连接的设置。"""
+
         if (
             self.transport is None
             or not self.applied_settings
@@ -1409,6 +1615,13 @@ class LakeShore372ABackend(ModuleBackend):
         require_resource: bool,
         operation_timeout_seconds: float,
     ) -> dict[str, Any]:
+        """把保存文件或 UI 提供的不可信设置规范化为严格、可发送的副本。
+
+        资源名限制为单行 GPIB 地址以阻止命令/日志注入；所有数值按手册和 UI 边界再次
+        校验；R1-R4 的物理输入必须互不重复且至少启用一个。最后把 Pause、Dwell、I/O
+        重试的保守时间预算与核心单次操作总超时关联，避免已知必超时的配置进入 Apply。
+        """
+
         defaults = default_settings()
         raw = dict(settings)
         result = {
@@ -1601,6 +1814,12 @@ class LakeShore372ABackend(ModuleBackend):
     def _estimated_measure_seconds(
         settings: Mapping[str, Any],
     ) -> float:
+        """保守估计一次 Measure 的总耗时，用于 Apply 前的超时安全检查。
+
+        每个通道包含 Pause+Dwell 和约一秒命令开销，再加一次完整通信重试预算及固定清理
+        余量；这不是进度条的精确预测，而是拒绝明显不可能在总截止时间内完成的配置。
+        """
+
         enabled = sum(
             bool(channel["enabled"])
             for channel in settings[
@@ -1625,6 +1844,8 @@ class LakeShore372ABackend(ModuleBackend):
         settings: Mapping[str, Any],
         operation_timeout_seconds: float,
     ) -> None:
+        """要求估算时间至少比核心总截止时间短两秒，为 IPC 返回和分流清理留余量。"""
+
         estimate = cls._estimated_measure_seconds(
             settings
         )
@@ -1650,6 +1871,8 @@ class LakeShore372ABackend(ModuleBackend):
         maximum: int,
         name: str,
     ) -> int:
+        """读取有界整数；显式拒绝 Python 中同时属于 int 的 bool 和小数浮点。"""
+
         if isinstance(value, bool):
             raise ModuleError(
                 f"{name} must be an integer from {minimum} "
@@ -1685,6 +1908,8 @@ class LakeShore372ABackend(ModuleBackend):
         maximum: float,
         name: str,
     ) -> float:
+        """读取有界有限浮点数；拒绝 bool、NaN 和无穷值。"""
+
         if isinstance(value, bool):
             raise ModuleError(
                 f"{name} must be from {minimum:g} to "
@@ -1718,6 +1943,8 @@ class LakeShore372ABackend(ModuleBackend):
         value: Any,
         name: str,
     ) -> bool:
+        """只接受真正的布尔值，不把 0/1 或任意非空字符串静默转换。"""
+
         if not isinstance(value, bool):
             raise ModuleError(
                 f"{name} must be true or false",

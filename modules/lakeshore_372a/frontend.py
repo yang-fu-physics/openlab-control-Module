@@ -1,3 +1,10 @@
+"""Lake Shore 372A 模块窗口的 PySide6 前端。
+
+前端只负责展示、编辑和序列化设置；所有范围、跨字段约束、仪表身份和写入读回仍由
+独立 worker 中的后端重新验证。读取保存设置不会自动 Apply，连接测试也只验证当前
+VISA 地址，不会改变仪表测量参数。
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -35,17 +42,27 @@ from .constants import (
 
 
 class _SettingsPage(QWidget):
+    """给核心浮动窗口提供合理初始尺寸，内容过大时由内部滚动区承载。"""
+
     def sizeHint(self) -> QSize:  # noqa: N802
+        """返回普通 DPI 下的首选内容尺寸；Qt 仍会按系统缩放因子换算。"""
+
         return QSize(980, 600)
 
 
 class LakeShore372AFrontend(ModuleFrontend):
+    """372A 的 Settings/Status 两页视图及设置脏状态信号适配器。"""
+
     def create_settings_page(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
+        """创建可滚动 Settings 页，并只连接一次控件信号。"""
+
         page = _SettingsPage(parent)
         outer = QVBoxLayout(page)
+        # 四组通道参数在 4K 缩放或较小屏幕上可能超过可用高度；滚动区让浮动窗口
+        # 不必扩大到屏幕之外，setWidgetResizable 同时允许宽屏时自然伸展。
         scroll = QScrollArea(page)
         scroll.setWidgetResizable(True)
         scroll.setSizeAdjustPolicy(
@@ -62,6 +79,7 @@ class LakeShore372AFrontend(ModuleFrontend):
             communication
         )
         self.resource = QComboBox()
+        # 下拉框展示自动发现结果，但必须允许手动输入离线配置中已知的 GPIB 地址。
         self.resource.setEditable(True)
         self.resource.setMinimumContentsLength(24)
         self.refresh_resources_button = QPushButton(
@@ -260,6 +278,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
+        # 所有用户编辑最终只发 settingsChanged；是否允许 Apply、何时保存以及正在
+        # Run 时的拒绝逻辑由核心统一管理，前端不直接调用后端。
         for widget in self._setting_widgets():
             if isinstance(widget, QComboBox):
                 widget.currentTextChanged.connect(
@@ -277,6 +297,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         for key, widgets in self.channel_widgets.items():
             mode = widgets["excitation_mode"]
             assert isinstance(mode, QComboBox)
+            # mode 需要先重建 excitation 量程列表再标记脏。先断开通用连接，避免一次
+            # 用户操作发出两个 settingsChanged，也避免窗口重建后积累重复槽函数。
             try:
                 mode.currentTextChanged.disconnect(
                     self._changed
@@ -293,6 +315,12 @@ class LakeShore372AFrontend(ModuleFrontend):
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
+        """创建只读状态页和 Idle 手动动作按钮。
+
+        Test Connection 会把 Settings 页当前值作为一次性 payload 发送，方便在 Apply
+        前验证新地址；后端不会因此保存设置或写入 FILTER/INSET/INTYPE。
+        """
+
         page = QWidget(parent)
         layout = QVBoxLayout(page)
         group = QGroupBox("Instrument Status")
@@ -359,6 +387,12 @@ class LakeShore372AFrontend(ModuleFrontend):
         return page
 
     def settings(self) -> dict[str, Any]:
+        """返回当前控件值的纯字典快照，供保存、Apply 或连接测试使用。
+
+        这里不复制后端的完整校验逻辑；即使调用方绕过控件范围构造字典，后端也会把它
+        当作不可信输入重新规范化。
+        """
+
         channels: dict[str, dict[str, Any]] = {}
         for key, widgets in self.channel_widgets.items():
             input_channel = widgets["input_channel"]
@@ -421,6 +455,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         self,
         settings: Mapping[str, Any],
     ) -> None:
+        """把保存设置与默认值合并后装入控件，但不发脏信号、更不会自动 Apply。"""
+
         defaults = default_settings()
         values = {
             **defaults,
@@ -430,6 +466,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         if not isinstance(raw_channels, Mapping):
             raw_channels = {}
         widgets = self._setting_widgets()
+        # 批量加载期间阻断所有值变化信号。尤其是 excitation mode 会重建另一个
+        # QComboBox；若不阻断，启动时仅“读取设置”就会被误认为用户修改。
         blockers = [
             QSignalBlocker(widget)
             for widget in widgets
@@ -525,6 +563,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         self,
         status: Mapping[str, Any],
     ) -> None:
+        """合并 worker 状态到标签，并用资源发现结果刷新可编辑下拉框。"""
+
         resources = status.get(
             "Available GPIB Resources"
         )
@@ -550,6 +590,12 @@ class LakeShore372AFrontend(ModuleFrontend):
         self,
         running: bool,
     ) -> None:
+        """Run 期间禁用会产生 I/O 的手动按钮。
+
+        这是界面层防误触；即使外部代码直接触发动作，核心服务仍会依据生命周期状态拒绝
+        与正在运行的 Measure 冲突的请求。
+        """
+
         for button in (
             self.refresh_resources_button,
             self.test_connection_button,
@@ -559,6 +605,8 @@ class LakeShore372AFrontend(ModuleFrontend):
             button.setEnabled(not running)
 
     def _mode_changed(self, key: str) -> None:
+        """切换电流/电压模式时重建对应量程，并只发送一次设置变化信号。"""
+
         widgets = self.channel_widgets[key]
         excitation = widgets["excitation_range"]
         assert isinstance(excitation, QComboBox)
@@ -575,6 +623,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         key: str,
         selected: int,
     ) -> None:
+        """按当前模式填充手册量程表，并把旧索引夹在新模式的合法范围内。"""
+
         widgets = self.channel_widgets[key]
         mode = widgets["excitation_mode"]
         excitation = widgets["excitation_range"]
@@ -600,6 +650,11 @@ class LakeShore372AFrontend(ModuleFrontend):
         self,
         resources: tuple[str, ...],
     ) -> None:
+        """更新发现列表，同时保留用户正在编辑但尚未被发现的手动地址。
+
+        更新过程阻断信号，避免一次 Status 自动刷新把设置标成已修改。
+        """
+
         current = self.resource.currentText().strip()
         blocker = QSignalBlocker(self.resource)
         self.resource.clear()
@@ -614,6 +669,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         del blocker
 
     def _select_resource(self, resource: str) -> None:
+        """选择保存的资源；不在发现列表时先加入，支持完全离线的手动配置。"""
+
         value = resource.strip()
         if value and self.resource.findText(value) < 0:
             self.resource.addItem(value)
@@ -624,11 +681,15 @@ class LakeShore372AFrontend(ModuleFrontend):
         combo: QComboBox,
         value: Any,
     ) -> None:
+        """按 itemData 而不是可翻译的显示文字选择枚举项。"""
+
         index = combo.findData(value)
         if index >= 0:
             combo.setCurrentIndex(index)
 
     def _setting_widgets(self) -> list[QWidget]:
+        """返回所有参与保存和脏状态跟踪的控件，供加载时统一阻断信号。"""
+
         widgets: list[QWidget] = [
             self.resource,
             self.frequency,
@@ -646,6 +707,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         return widgets
 
     def _changed(self, *_args: Any) -> None:
+        """把不同 Qt 信号携带的参数收敛成核心定义的无参数 settingsChanged。"""
+
         self.settingsChanged.emit()
 
     @staticmethod
@@ -653,6 +716,8 @@ class LakeShore372AFrontend(ModuleFrontend):
         minimum: int,
         maximum: int,
     ) -> QSpinBox:
+        """创建显示秒单位的整数输入框；后端会再次检查相同边界。"""
+
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setSuffix(" s")
