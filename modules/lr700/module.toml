@@ -1,0 +1,63 @@
+id = "lr700"
+name = "Linear Research LR-700 + LR-720-16"
+version = "0.1.0b1"
+api_version = "1.0"
+core_requires = ">=0.11.1,<0.12"
+frontend = "frontend:LR700Frontend"
+backend = "backend:LR700Backend"
+backend_type = "python"
+dependencies = [
+    "PyVISA>=1.16.2,<1.17",
+]
+
+[[columns]]
+name = "TemperatureAverage"
+unit = "K"
+
+[[columns]]
+name = "FieldAverage"
+unit = "Oe"
+
+[[columns]]
+name = "R1"
+unit = "Ohm"
+
+[[columns]]
+name = "X1"
+unit = "Ohm"
+
+[[columns]]
+name = "Status1"
+
+[[columns]]
+name = "R2"
+unit = "Ohm"
+
+[[columns]]
+name = "X2"
+unit = "Ohm"
+
+[[columns]]
+name = "Status2"
+
+[[columns]]
+name = "R3"
+unit = "Ohm"
+
+[[columns]]
+name = "X3"
+unit = "Ohm"
+
+[[columns]]
+name = "Status3"
+
+[[columns]]
+name = "R4"
+unit = "Ohm"
+
+[[columns]]
+name = "X4"
+unit = "Ohm"
+
+[[columns]]
+name = "Status4"

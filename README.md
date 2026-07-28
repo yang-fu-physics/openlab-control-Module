@@ -5,12 +5,16 @@ repository. Keep every independently installable module under `modules/<id>/`.
 The included `simulated_transport` module is hardware-free and serves as the
 reference implementation and test fixture. `lakeshore_372a` is the first
 hardware module; it scans up to four selectable Model 372/372A inputs over
-GPIB and emits one sparse DAT row per enabled slot.
+GPIB and emits one sparse DAT row per enabled slot. `lr700` controls an
+LR-700 bridge with one LR-720-16 multiplexer, lets R1-R4 select four physical
+sensor inputs, and emits one sparse R/X/status row per enabled slot.
 
 The current `simulated_transport` 1.0.1 requires OpenLab Control 0.11.0 Beta 2
 or newer because it uses the live, interruptible measurement context.
 `lakeshore_372a` 0.1.0b3 requires OpenLab Control 0.11.1 or newer because its
 PyVISA runtime is supplied and version-checked by the core framework.
+`lr700` 0.1.0b1 has the same core requirement and shared PyVISA boundary.
+Both hardware modules remain beta until verified with their real instruments.
 
 ## Manual offline installation
 
