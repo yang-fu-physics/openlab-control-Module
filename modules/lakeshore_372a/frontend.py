@@ -689,7 +689,8 @@ class LakeShore372AFrontend(ModuleFrontend):
 
         用户主动改变模式或激励时，如果旧量程已经不可用，则选择索引距离最近的合法
         量程，避免产生一个无法 Apply 的新设置。加载文件时 ``adjust_selection`` 为
-        False，保留原值供操作者检查，真正 Apply 仍由后端进行同一约束的安全校验。
+        False，保留原值供操作者检查；后端会在该槽位 Enabled 并执行 Apply 时再次
+        进行同一约束的安全校验。
         """
 
         widgets = self.channel_widgets[key]
@@ -760,7 +761,8 @@ class LakeShore372AFrontend(ModuleFrontend):
             resistance.setToolTip(
                 "Saved resistance range is incompatible "
                 "with the selected excitation; choose an "
-                "enabled range before Apply Settings."
+                "enabled range before enabling this slot "
+                "and applying settings."
             )
         elif allowed:
             resistance.setToolTip(

@@ -341,6 +341,54 @@ class LakeShore372ABackendTests(unittest.TestCase):
             ],
         )
 
+    def test_legacy_incompatible_disabled_channel_can_initialize_and_apply(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state)
+        settings = default_settings()
+        settings["resource"] = "GPIB0::12::INSTR"
+        settings["channels"]["r3"].update({
+            "enabled": False,
+            "excitation_mode": "current",
+            "excitation_range": 19,
+            "resistance_range": 17,
+        })
+        context = self._context(messages)
+
+        backend.initialize(settings, context)
+        self.assertEqual(state.opened, [])
+        self.assertEqual(
+            backend.desired_settings["channels"]["r3"][
+                "resistance_range"
+            ],
+            17,
+        )
+
+        backend.apply_settings(settings, context)
+
+        # 用户保存值仍是 17；仪表端的 Disabled 输入只使用临时兼容值 12，
+        # 并且必须保持 shunted=1。
+        self.assertEqual(
+            backend.applied_settings["channels"]["r3"][
+                "resistance_range"
+            ],
+            17,
+        )
+        self.assertEqual(
+            state.intypes[3],
+            (1, 19, 1, 12, 1, 2),
+        )
+        self.assertFalse(
+            any(
+                action == "write"
+                and command.startswith("INTYPE 3,")
+                and command.endswith(",0,2")
+                for action, command in state.commands
+            )
+        )
+
     def test_apply_measure_four_rows_and_shunt_each_channel(
         self,
     ) -> None:
@@ -723,6 +771,44 @@ class LakeShore372ABackendTests(unittest.TestCase):
             "GPIB0::7::INSTR",
         )
 
+    def test_test_connection_ignores_unapplied_range_compatibility(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state)
+        settings = default_settings()
+        settings["resource"] = "GPIB0::12::INSTR"
+        settings["channels"]["r1"].update({
+            "excitation_mode": "current",
+            "excitation_range": 22,
+            "resistance_range": 17,
+        })
+        context = self._context(messages)
+
+        backend.initialize(settings, context)
+        result = backend.manual_action(
+            "test_connection",
+            {"settings": settings},
+            context,
+        )
+
+        self.assertEqual(
+            result["Last Action"],
+            "Connection test passed",
+        )
+        self.assertEqual(
+            state.opened[-1][0],
+            "GPIB0::12::INSTR",
+        )
+        self.assertFalse(
+            any(
+                command.startswith(("FREQ ", "INTYPE "))
+                for action, command in state.commands
+                if action == "write"
+            )
+        )
+
     def test_abort_shunts_and_releases_transport(self) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
@@ -1036,7 +1122,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b4",
+            "0.1.0b5",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(

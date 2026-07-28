@@ -181,6 +181,7 @@ class LakeShore372ABackend(ModuleBackend):
         self.desired_settings = self._normalized_settings(
             settings,
             require_resource=False,
+            validate_enabled_compatibility=False,
             operation_timeout_seconds=(
                 context.operation_timeout_seconds
             ),
@@ -237,6 +238,7 @@ class LakeShore372ABackend(ModuleBackend):
         desired = self._normalized_settings(
             settings,
             require_resource=True,
+            validate_enabled_compatibility=True,
             operation_timeout_seconds=(
                 context.operation_timeout_seconds
             ),
@@ -261,8 +263,21 @@ class LakeShore372ABackend(ModuleBackend):
                 channel = desired["channels"][
                     f"r{slot}"
                 ]
+                # Disabled 槽位仍需在仪表端明确关闭并分流，不能简单跳过：该物理
+                # 输入可能保留着人工操作或上一次运行留下的激励。旧设置文件可能
+                # 保存了当前激励下已被新兼容矩阵禁止的电阻量程；这种组合不会用于
+                # 测量，因此仅在发送给仪表的临时副本中换成最近的安全量程。界面、
+                # 保存文件和 desired/applied_settings 均继续保留原值，操作者日后
+                # 启用该槽位时仍必须主动选定有效组合。
+                instrument_channel = (
+                    channel
+                    if channel["enabled"]
+                    else self._disabled_channel_for_shunt(
+                        channel
+                    )
+                )
                 self._configure_channel(
-                    channel,
+                    instrument_channel,
                     enabled=bool(channel["enabled"]),
                     shunted=True,
                     context=context,
@@ -619,6 +634,7 @@ class LakeShore372ABackend(ModuleBackend):
             settings = self._normalized_settings(
                 source,
                 require_resource=True,
+                validate_enabled_compatibility=False,
                 operation_timeout_seconds=(
                     context.operation_timeout_seconds
                 ),
@@ -922,6 +938,36 @@ class LakeShore372ABackend(ModuleBackend):
             shunted=shunted,
             context=context,
         )
+
+    @staticmethod
+    def _disabled_channel_for_shunt(
+        channel: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """为 Disabled 输入生成只用于仪表分流的兼容设置副本。
+
+        0.1.0b4 加入 Figure 1-16 兼容矩阵之前，设置文件可以保存例如“电流
+        19 档 + 电阻 17 档”。即使这个槽位处于 Disabled，直接把该组合写入
+        INTYPE 仍可能被仪表拒绝，进而让 Apply 无法完成安全分流。这里不修改
+        用户设置，只把临时写入值移动到数值上最近的允许档位；相同距离时选择
+        较小档位，与前端在用户主动改变激励时的选择规则一致。
+        """
+
+        allowed = compatible_resistance_range_indices(
+            str(channel["excitation_mode"]),
+            int(channel["excitation_range"]),
+        )
+        requested = int(channel["resistance_range"])
+        if requested in allowed:
+            return channel
+        safe_channel = dict(channel)
+        safe_channel["resistance_range"] = min(
+            allowed,
+            key=lambda value: (
+                abs(value - requested),
+                value,
+            ),
+        )
+        return safe_channel
 
     def _switch_channel(
         self,
@@ -1614,13 +1660,17 @@ class LakeShore372ABackend(ModuleBackend):
         settings: Mapping[str, Any],
         *,
         require_resource: bool,
+        validate_enabled_compatibility: bool,
         operation_timeout_seconds: float,
     ) -> dict[str, Any]:
         """把保存文件或 UI 提供的不可信设置规范化为严格、可发送的副本。
 
         资源名限制为单行 GPIB 地址以阻止命令/日志注入；所有数值按手册和 UI 边界再次
-        校验；R1-R4 的物理输入必须互不重复且至少启用一个。最后把 Pause、Dwell、I/O
-        重试的保守时间预算与核心单次操作总超时关联，避免已知必超时的配置进入 Apply。
+        校验；R1-R4 的物理输入必须互不重复且至少启用一个。只有 Apply 会把
+        ``validate_enabled_compatibility`` 设为 True，并对 Enabled 槽位执行
+        Figure 1-16 的交叉量程校验；Enable 和 Test Connection 必须允许旧设置
+        先打开窗口供用户检查。最后把 Pause、Dwell、I/O 重试的保守时间预算与核心
+        单次操作总超时关联，避免已知必超时的配置进入 Apply。
         """
 
         defaults = default_settings()
@@ -1791,7 +1841,9 @@ class LakeShore372ABackend(ModuleBackend):
                 )
             )
             if (
-                int(channel["resistance_range"])
+                validate_enabled_compatibility
+                and channel["enabled"]
+                and int(channel["resistance_range"])
                 not in compatible_ranges
             ):
                 raise ModuleError(

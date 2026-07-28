@@ -65,8 +65,11 @@ system snapshots, or identity mismatch are Errors and stop the SEQ.
 - The Settings page disables resistance ranges that Figure 1-16 marks
   unavailable for the selected current or voltage excitation. A user
   excitation change moves an incompatible old selection to the nearest
-  available range; loaded settings are preserved for review and rejected by
-  the backend if they attempt to bypass the same compatibility matrix.
+  available range. Loaded settings are preserved for review and never block
+  Enable or Test Connection. Apply rejects an incompatible Enabled slot before
+  opening the instrument; an incompatible Disabled slot is kept disabled and
+  shunted with a temporary compatible instrument value without altering its
+  saved setting.
 - The estimated scan duration must fit inside the core module operation
   timeout.
 - End/Stop/Error shunts all enabled configured inputs. Disable/application

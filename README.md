@@ -11,7 +11,7 @@ sensor inputs, and emits one sparse R/X/status row per enabled slot.
 
 The current `simulated_transport` 1.0.1 requires OpenLab Control 0.11.0 Beta 2
 or newer because it uses the live, interruptible measurement context.
-`lakeshore_372a` 0.1.0b4 requires OpenLab Control 0.11.1 or newer because its
+`lakeshore_372a` 0.1.0b5 requires OpenLab Control 0.11.1 or newer because its
 PyVISA runtime is supplied and version-checked by the core framework.
 `lr700` 0.1.0b1 has the same core requirement and shared PyVISA boundary.
 Both hardware modules remain beta until verified with their real instruments.
