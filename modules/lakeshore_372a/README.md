@@ -62,6 +62,11 @@ system snapshots, or identity mismatch are Errors and stop the SEQ.
   accepted.
 - At least one slot must be enabled and all four physical channel selections
   must be unique.
+- The Settings page disables resistance ranges that Figure 1-16 marks
+  unavailable for the selected current or voltage excitation. A user
+  excitation change moves an incompatible old selection to the nearest
+  available range; loaded settings are preserved for review and rejected by
+  the backend if they attempt to bypass the same compatibility matrix.
 - The estimated scan duration must fit inside the core module operation
   timeout.
 - End/Stop/Error shunts all enabled configured inputs. Disable/application
@@ -74,5 +79,6 @@ not a substitute for hardware interlocks.
 
 Implementation commands and status bits were checked against the uploaded
 Lake Shore Model 372 AC Resistance Bridge and Temperature Controller manual,
-interface-command pages 162, 165-168, 172, and 174-175. A real instrument has
-not yet been connected, so this module remains beta hardware support.
+Figure 1-16, section 2.5.5.1, and interface-command pages 162, 165-168, 172,
+and 174-175. A real instrument has not yet been connected, so this module
+remains beta hardware support.

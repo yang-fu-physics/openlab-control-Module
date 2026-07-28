@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from PySide6.QtCore import QSize, QSignalBlocker
+from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
@@ -37,6 +38,7 @@ from .constants import (
     FREQUENCIES_HZ,
     RESISTANCE_RANGES,
     VOLTAGE_EXCITATIONS,
+    compatible_resistance_range_indices,
     default_settings,
 )
 
@@ -258,6 +260,11 @@ class LakeShore372AFrontend(ModuleFrontend):
                 "resistance_range": resistance_range,
             }
             self._populate_excitation(key, 5)
+            self._select_data(resistance_range, 17)
+            self._update_resistance_options(
+                key,
+                adjust_selection=True,
+            )
             channel_grid.addWidget(
                 group,
                 (slot - 1) // 2,
@@ -296,18 +303,25 @@ class LakeShore372AFrontend(ModuleFrontend):
                 )
         for key, widgets in self.channel_widgets.items():
             mode = widgets["excitation_mode"]
+            excitation = widgets["excitation_range"]
             assert isinstance(mode, QComboBox)
-            # mode 需要先重建 excitation 量程列表再标记脏。先断开通用连接，避免一次
-            # 用户操作发出两个 settingsChanged，也避免窗口重建后积累重复槽函数。
-            try:
-                mode.currentTextChanged.disconnect(
-                    self._changed
-                )
-            except (RuntimeError, TypeError):
-                pass
+            assert isinstance(excitation, QComboBox)
+            # mode 需要先重建 excitation 列表，excitation 需要先更新电阻量程可用状态。
+            # 两者都先断开通用连接，确保一次用户操作只发一个 settingsChanged。
+            for combo in (mode, excitation):
+                try:
+                    combo.currentTextChanged.disconnect(
+                        self._changed
+                    )
+                except (RuntimeError, TypeError):
+                    pass
             mode.currentIndexChanged.connect(
                 lambda _index, channel_key=key:
                 self._mode_changed(channel_key)
+            )
+            excitation.currentIndexChanged.connect(
+                lambda _index, channel_key=key:
+                self._excitation_changed(channel_key)
             )
         return page
 
@@ -557,6 +571,12 @@ class LakeShore372AFrontend(ModuleFrontend):
                 resistance,
                 int(channel["resistance_range"]),
             )
+            # Load Settings/SEQ 必须忠实保留文件中的值。若旧文件含不兼容组合，界面
+            # 会把该项和其他不可用项置灰，后端 Apply 时仍会明确拒绝，而不会静默改值。
+            self._update_resistance_options(
+                key,
+                adjust_selection=False,
+            )
         del blockers
 
     def update_status(
@@ -605,7 +625,7 @@ class LakeShore372AFrontend(ModuleFrontend):
             button.setEnabled(not running)
 
     def _mode_changed(self, key: str) -> None:
-        """切换电流/电压模式时重建对应量程，并只发送一次设置变化信号。"""
+        """切换模式后重建激励表、修正电阻量程，并只发送一次变化信号。"""
 
         widgets = self.channel_widgets[key]
         excitation = widgets["excitation_range"]
@@ -616,6 +636,19 @@ class LakeShore372AFrontend(ModuleFrontend):
             else 5
         )
         self._populate_excitation(key, selected)
+        self._update_resistance_options(
+            key,
+            adjust_selection=True,
+        )
+        self._changed()
+
+    def _excitation_changed(self, key: str) -> None:
+        """激励改变时同步禁用不兼容量程，并将旧选择夹到最近合法范围。"""
+
+        self._update_resistance_options(
+            key,
+            adjust_selection=True,
+        )
         self._changed()
 
     def _populate_excitation(
@@ -645,6 +678,96 @@ class LakeShore372AFrontend(ModuleFrontend):
             min(max(1, selected), maximum),
         )
         del blocker
+
+    def _update_resistance_options(
+        self,
+        key: str,
+        *,
+        adjust_selection: bool,
+    ) -> None:
+        """按手册 Figure 1-16 将不可用电阻量程置灰。
+
+        用户主动改变模式或激励时，如果旧量程已经不可用，则选择索引距离最近的合法
+        量程，避免产生一个无法 Apply 的新设置。加载文件时 ``adjust_selection`` 为
+        False，保留原值供操作者检查，真正 Apply 仍由后端进行同一约束的安全校验。
+        """
+
+        widgets = self.channel_widgets[key]
+        mode = widgets["excitation_mode"]
+        excitation = widgets["excitation_range"]
+        resistance = widgets["resistance_range"]
+        assert isinstance(mode, QComboBox)
+        assert isinstance(excitation, QComboBox)
+        assert isinstance(resistance, QComboBox)
+        excitation_data = excitation.currentData()
+        allowed = compatible_resistance_range_indices(
+            str(mode.currentData()),
+            (
+                int(excitation_data)
+                if excitation_data is not None
+                else 0
+            ),
+        )
+        allowed_set = set(allowed)
+        model = resistance.model()
+        if not isinstance(model, QStandardItemModel):
+            raise RuntimeError(
+                "Resistance range combo uses an "
+                "unsupported item model"
+            )
+        for row in range(resistance.count()):
+            range_index = int(
+                resistance.itemData(row)
+            )
+            item = model.item(row)
+            if item is None:
+                continue
+            available = range_index in allowed_set
+            item.setEnabled(available)
+            item.setToolTip(
+                ""
+                if available
+                else (
+                    "Unavailable for the selected "
+                    "excitation"
+                )
+            )
+
+        current_data = resistance.currentData()
+        current = (
+            int(current_data)
+            if current_data is not None
+            else None
+        )
+        if (
+            adjust_selection
+            and allowed
+            and current not in allowed_set
+        ):
+            nearest = min(
+                allowed,
+                key=lambda value: (
+                    abs(value - (current or value)),
+                    value,
+                ),
+            )
+            blocker = QSignalBlocker(resistance)
+            self._select_data(resistance, nearest)
+            del blocker
+            current = nearest
+
+        if current not in allowed_set:
+            resistance.setToolTip(
+                "Saved resistance range is incompatible "
+                "with the selected excitation; choose an "
+                "enabled range before Apply Settings."
+            )
+        elif allowed:
+            resistance.setToolTip(
+                "Available resistance range indices for "
+                f"this excitation: {allowed[0]}-"
+                f"{allowed[-1]}"
+            )
 
     def _update_resources(
         self,

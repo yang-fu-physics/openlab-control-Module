@@ -29,6 +29,7 @@ from labcontrol.measurement.api import (
 from .constants import (
     CURRENT_EXCITATIONS,
     STATUS_BITS,
+    compatible_resistance_range_indices,
     default_settings,
 )
 
@@ -1783,6 +1784,27 @@ class LakeShore372ABackend(ModuleBackend):
                     f"{key}.resistance_range",
                 )
             )
+            compatible_ranges = (
+                compatible_resistance_range_indices(
+                    mode,
+                    int(channel["excitation_range"]),
+                )
+            )
+            if (
+                int(channel["resistance_range"])
+                not in compatible_ranges
+            ):
+                raise ModuleError(
+                    f"{key}.resistance_range "
+                    f"{channel['resistance_range']} is not "
+                    f"available for {mode} excitation range "
+                    f"{channel['excitation_range']}; allowed "
+                    f"resistance range indices are "
+                    f"{compatible_ranges[0]}-"
+                    f"{compatible_ranges[-1]}",
+                    "LS372_INVALID_SETTINGS",
+                    f"{key}.resistance_range",
+                )
             channels[key] = channel
             physical_channels.append(
                 channel["input_channel"]

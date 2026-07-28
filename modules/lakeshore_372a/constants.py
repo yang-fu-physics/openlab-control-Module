@@ -109,6 +109,38 @@ STATUS_BITS: tuple[tuple[int, str], ...] = (
 )
 
 
+def compatible_resistance_range_indices(
+    excitation_mode: str,
+    excitation_index: int,
+) -> tuple[int, ...]:
+    """返回 Figure 1-16 允许的测量输入电阻量程索引。
+
+    手册性能矩阵的行是 22 档电流激励，列是 12 档电压激励，每个非星号单元格给出
+    一个可用电阻量程。三组量程都按 ``1, 3.16, 10`` 的半十倍频程排列，因此矩阵中
+    的索引满足 ``voltage = current + resistance - 19``。由此可直接得到连续合法
+    区间，避免在前端和后端各维护一份容易错位的 22×12 布尔表。
+
+    返回空元组表示模式或激励索引本身无效；调用后端前仍应先执行各字段的独立范围
+    校验。带 ``**``、手册标为“可用但未给性能指标”的高阻量程仍属于可选择范围。
+    """
+
+    mode = str(excitation_mode).strip().casefold()
+    index = int(excitation_index)
+    if mode == "current":
+        if not 1 <= index <= 22:
+            return ()
+        minimum = max(1, 20 - index)
+        maximum = min(22, 31 - index)
+    elif mode == "voltage":
+        if not 1 <= index <= 12:
+            return ()
+        minimum = max(1, index - 3)
+        maximum = min(22, index + 18)
+    else:
+        return ()
+    return tuple(range(minimum, maximum + 1))
+
+
 def default_channel(slot: int) -> dict[str, Any]:
     """返回一个逻辑 R 槽位的全新默认字典。
 
@@ -157,6 +189,7 @@ __all__ = [
     "RESISTANCE_RANGES",
     "STATUS_BITS",
     "VOLTAGE_EXCITATIONS",
+    "compatible_resistance_range_indices",
     "default_channel",
     "default_settings",
 ]

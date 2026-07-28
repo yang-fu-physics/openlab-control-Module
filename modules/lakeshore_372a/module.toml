@@ -1,6 +1,6 @@
 id = "lakeshore_372a"
 name = "Lake Shore 372A"
-version = "0.1.0b3"
+version = "0.1.0b4"
 api_version = "1.0"
 core_requires = ">=0.11.1,<0.12"
 frontend = "frontend:LakeShore372AFrontend"

@@ -44,6 +44,13 @@ default_settings = load_source_object(
     "constants:default_settings",
     "test_lakeshore_372a_constants",
 )
+compatible_resistance_range_indices = (
+    load_source_object(
+        MODULE,
+        "constants:compatible_resistance_range_indices",
+        "test_lakeshore_372a_compatibility",
+    )
+)
 LakeShore372AFrontend = load_source_object(
     MODULE,
     "frontend:LakeShore372AFrontend",
@@ -225,6 +232,47 @@ def _samples_for_four_channels() -> list[dict]:
             ),
         ])
     return samples
+
+
+class LakeShore372AConstantsTests(unittest.TestCase):
+    def test_manual_figure_1_16_compatibility_boundaries(
+        self,
+    ) -> None:
+        self.assertEqual(
+            compatible_resistance_range_indices(
+                "current",
+                22,
+            ),
+            tuple(range(1, 10)),
+        )
+        self.assertEqual(
+            compatible_resistance_range_indices(
+                "current",
+                11,
+            ),
+            tuple(range(9, 21)),
+        )
+        self.assertEqual(
+            compatible_resistance_range_indices(
+                "current",
+                1,
+            ),
+            tuple(range(19, 23)),
+        )
+        self.assertEqual(
+            compatible_resistance_range_indices(
+                "voltage",
+                1,
+            ),
+            tuple(range(1, 20)),
+        )
+        self.assertEqual(
+            compatible_resistance_range_indices(
+                "voltage",
+                12,
+            ),
+            tuple(range(9, 23)),
+        )
 
 
 class LakeShore372ABackendTests(unittest.TestCase):
@@ -621,6 +669,36 @@ class LakeShore372ABackendTests(unittest.TestCase):
         )
         self.assertIsNone(backend.transport)
 
+    def test_incompatible_excitation_and_resistance_fail_before_connect(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        messages: list[tuple[str, dict]] = []
+        settings = default_settings()
+        settings["resource"] = "GPIB0::12::INSTR"
+        settings["channels"]["r1"].update({
+            "excitation_mode": "current",
+            "excitation_range": 22,
+            "resistance_range": 17,
+        })
+        backend = self._backend(state)
+
+        with self.assertRaises(ModuleError) as captured:
+            backend.apply_settings(
+                settings,
+                self._context(messages),
+            )
+
+        self.assertEqual(
+            captured.exception.code,
+            "LS372_INVALID_SETTINGS",
+        )
+        self.assertEqual(
+            captured.exception.context,
+            "r1.resistance_range",
+        )
+        self.assertEqual(state.opened, [])
+
     def test_test_connection_uses_unsaved_ui_settings_payload(
         self,
     ) -> None:
@@ -839,6 +917,97 @@ class LakeShore372AFrontendTests(unittest.TestCase):
         owner.deleteLater()
         self.application.processEvents()
 
+    def test_excitation_disables_incompatible_resistance_ranges(
+        self,
+    ) -> None:
+        frontend = LakeShore372AFrontend(
+            ModuleFrontendContext()
+        )
+        owner = QWidget()
+        settings_page = frontend.create_settings_page(
+            owner
+        )
+        frontend.load_settings(default_settings())
+        widgets = frontend.channel_widgets["r1"]
+        mode = widgets["excitation_mode"]
+        excitation = widgets["excitation_range"]
+        resistance = widgets["resistance_range"]
+        changes: list[None] = []
+        frontend.settingsChanged.connect(
+            lambda: changes.append(None)
+        )
+
+        mode.setCurrentIndex(
+            mode.findData("current")
+        )
+        excitation.setCurrentIndex(
+            excitation.findData(22)
+        )
+        self.application.processEvents()
+        current_enabled = {
+            int(resistance.itemData(row))
+            for row in range(resistance.count())
+            if resistance.model().item(row).isEnabled()
+        }
+        self.assertEqual(
+            current_enabled,
+            set(range(1, 10)),
+        )
+        self.assertEqual(
+            int(resistance.currentData()),
+            9,
+        )
+        self.assertEqual(len(changes), 1)
+
+        mode.setCurrentIndex(
+            mode.findData("voltage")
+        )
+        excitation.setCurrentIndex(
+            excitation.findData(1)
+        )
+        self.application.processEvents()
+        voltage_enabled = {
+            int(resistance.itemData(row))
+            for row in range(resistance.count())
+            if resistance.model().item(row).isEnabled()
+        }
+        self.assertEqual(
+            voltage_enabled,
+            set(range(1, 20)),
+        )
+        self.assertFalse(
+            resistance.model().item(
+                resistance.findData(20)
+            ).isEnabled()
+        )
+        self.assertEqual(len(changes), 3)
+
+        invalid_loaded = default_settings()
+        invalid_loaded["channels"]["r1"].update({
+            "excitation_mode": "current",
+            "excitation_range": 22,
+            "resistance_range": 17,
+        })
+        frontend.load_settings(invalid_loaded)
+        self.assertEqual(
+            int(resistance.currentData()),
+            17,
+        )
+        self.assertFalse(
+            resistance.model().item(
+                resistance.findData(17)
+            ).isEnabled()
+        )
+        self.assertEqual(
+            frontend.settings(),
+            invalid_loaded,
+        )
+        self.assertEqual(len(changes), 3)
+
+        settings_page.deleteLater()
+        owner.deleteLater()
+        self.application.processEvents()
+
     def test_nested_settings_can_be_saved_as_toml(
         self,
     ) -> None:
@@ -867,7 +1036,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b3",
+            "0.1.0b4",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(
