@@ -2,19 +2,28 @@
 
 This is the Git-ready layout for the single shared Measurement Module
 repository. Keep every independently installable module under `modules/<id>/`.
+The normative lifecycle, safety, data, dependency, UI, testing, and release
+rules for new modules are defined in
+[MODULE_SPECIFICATION.md](MODULE_SPECIFICATION.md).
 The included `simulated_transport` module is hardware-free and serves as the
 reference implementation and test fixture. `lakeshore_372a` is the first
 hardware module; it scans up to four selectable Model 372/372A inputs over
 GPIB and emits one sparse DAT row per enabled slot. `lr700` controls an
 LR-700 bridge with one LR-720-16 multiplexer, lets R1-R4 select four physical
 sensor inputs, and emits one sparse R/X/status row per enabled slot.
+`keithley_6221_2182a_delta` coordinates a 6221, its serial/Trigger-Link 2182A,
+and an optional 7001 for four-channel Delta measurements. It converts raw
+Delta voltage to resistance and stores the voltage sequence in a core-managed
+rawdata sidecar.
 
-The current `simulated_transport` 1.0.1 requires OpenLab Control 0.11.0 Beta 2
+The current `simulated_transport` 1.0.2 requires OpenLab Control 0.11.0 Beta 2
 or newer because it uses the live, interruptible measurement context.
-`lakeshore_372a` 0.1.0b5 requires OpenLab Control 0.11.1 or newer because its
+`lakeshore_372a` 0.1.0b8 requires OpenLab Control 0.11.1 or newer because its
 PyVISA runtime is supplied and version-checked by the core framework.
-`lr700` 0.1.0b1 has the same core requirement and shared PyVISA boundary.
-Both hardware modules remain beta until verified with their real instruments.
+`lr700` 0.1.0b4 has the same core requirement and shared PyVISA boundary.
+`keithley_6221_2182a_delta` 0.1.0b3 requires the rawdata API introduced in
+OpenLab Control 0.11.4 development builds. All hardware modules remain beta
+until verified with their real instruments.
 
 ## Manual offline installation
 

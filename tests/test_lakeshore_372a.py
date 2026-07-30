@@ -419,18 +419,11 @@ class LakeShore372ABackendTests(unittest.TestCase):
             if kind == "row"
         ]
         self.assertEqual(len(rows), 4)
+        expected_status_codes = [0, 2, 1, 2]
         for slot, row in enumerate(rows, start=1):
             self.assertEqual(
-                sorted(
-                    key
-                    for key in row
-                    if key.startswith("R")
-                ),
-                [f"R{slot}"],
-            )
-            self.assertNotIn(
-                f"R{(slot % 4) + 1}",
-                row,
+                row["StatusCode"],
+                expected_status_codes[slot - 1],
             )
             self.assertAlmostEqual(
                 row["TemperatureAverage"],
@@ -440,22 +433,39 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 row["FieldAverage"],
                 100 * slot + 10,
             )
-            self.assertAlmostEqual(
-                row[f"Phase{slot}"],
-                math.degrees(math.atan2(4.0, 3.0)),
-            )
-            self.assertAlmostEqual(
-                row[f"Current{slot}"],
-                100e-12,
-            )
+            for other_slot in range(1, 5):
+                if (
+                    other_slot == slot
+                    and row["StatusCode"] == 0
+                ):
+                    continue
+                self.assertNotIn(f"R{other_slot}", row)
+                self.assertNotIn(
+                    f"Phase{other_slot}",
+                    row,
+                )
+                self.assertNotIn(
+                    f"Current{other_slot}",
+                    row,
+                )
+            if row["StatusCode"] == 0:
+                self.assertAlmostEqual(
+                    row[f"R{slot}"],
+                    3.0,
+                )
+                self.assertAlmostEqual(
+                    row[f"Phase{slot}"],
+                    math.degrees(
+                        math.atan2(4.0, 3.0)
+                    ),
+                )
+                self.assertAlmostEqual(
+                    row[f"Current{slot}"],
+                    100e-12,
+                )
         self.assertEqual(
-            [row[f"Status{slot}"] for slot, row in enumerate(rows, 1)],
-            [
-                "NORMAL",
-                "OVER_COMPLIANCE",
-                "OVER_RANGE",
-                "OVER_COMPLIANCE",
-            ],
+            [row["StatusCode"] for row in rows],
+            expected_status_codes,
         )
         self.assertEqual(
             waits,
@@ -515,6 +525,128 @@ class LakeShore372ABackendTests(unittest.TestCase):
         self.assertEqual(
             ended["Excitation"],
             "Shunted",
+        )
+
+    def test_begin_sequence_reconfirms_shunt_after_idle_change(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        messages: list[tuple[str, dict]] = []
+        settings = default_settings()
+        settings["resource"] = "GPIB0::12::INSTR"
+        backend = self._backend(state)
+        context = self._context(messages)
+        backend.initialize(settings, context)
+        backend.apply_settings(settings, context)
+
+        # 模拟 Apply 后有人从仪表前面板解除 R1 分流。Begin 不能沿用旧状态，
+        # 必须重新写入并读回安全状态。
+        previous = state.intypes[1]
+        state.intypes[1] = (
+            *previous[:4],
+            0,
+            previous[5],
+        )
+        state.commands.clear()
+
+        backend.begin_sequence(context)
+
+        self.assertEqual(state.intypes[1][4], 1)
+        self.assertTrue(
+            any(
+                action == "write"
+                and command.startswith("INTYPE 1,")
+                and command.endswith(",1,2")
+                for action, command in state.commands
+            )
+        )
+        self.assertIn(
+            ("query", "INTYPE? 1"),
+            state.commands,
+        )
+
+    def test_invalid_measurement_marks_row_and_continues_scan(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        state.query_overrides["RDGR? 1"] = "not-a-number"
+        messages: list[tuple[str, dict]] = []
+        settings = _all_channels_settings()
+        settings["channels"]["r3"]["enabled"] = False
+        settings["channels"]["r4"]["enabled"] = False
+        backend = self._backend(state, [])
+        context = self._context(messages, [
+            *_samples_for_four_channels()[:4],
+        ])
+        backend.initialize(settings, context)
+        backend.apply_settings(settings, context)
+        backend.begin_sequence(context)
+
+        backend.measure(context)
+
+        rows = [
+            payload["values"]
+            for kind, payload in messages
+            if kind == "row"
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            rows[0],
+            {
+                "TemperatureAverage": 11.0,
+                "FieldAverage": 110.0,
+                "StatusCode": 3,
+            },
+        )
+        self.assertEqual(rows[1]["StatusCode"], 2)
+        self.assertNotIn("R2", rows[1])
+        self.assertNotIn("Phase2", rows[1])
+        self.assertNotIn("Current2", rows[1])
+        self.assertEqual(state.intypes[1][4], 1)
+        self.assertTrue(
+            any(
+                kind == "warning"
+                and payload["code"]
+                == "LS372_READING_INVALID"
+                and payload["context"] == "R1/input 1"
+                for kind, payload in messages
+            )
+        )
+
+    def test_uncertain_write_is_not_replayed_and_is_shunted(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        messages: list[tuple[str, dict]] = []
+        settings = default_settings()
+        settings["resource"] = "GPIB0::12::INSTR"
+        backend = self._backend(state, [])
+        context = self._context(messages)
+        backend.initialize(settings, context)
+        backend.apply_settings(settings, context)
+        backend.begin_sequence(context)
+        state.commands.clear()
+        state.failures["SCAN 1,0"] = 1
+
+        with self.assertRaises(ModuleError) as captured:
+            backend.measure(context)
+
+        self.assertEqual(
+            captured.exception.code,
+            "LS372_WRITE_UNCERTAIN",
+        )
+        self.assertEqual(
+            sum(
+                action == "write"
+                and command == "SCAN 1,0"
+                for action, command in state.commands
+            ),
+            1,
+        )
+        self.assertEqual(state.intypes[1][4], 1)
+        self.assertIn(
+            ("query", "INTYPE? 1"),
+            state.commands,
         )
 
     def test_transient_read_failure_reopens_and_retries(
@@ -1122,7 +1254,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b5",
+            "0.1.0b8",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(
@@ -1140,19 +1272,16 @@ class LakeShore372AManifestTests(unittest.TestCase):
                 "R1",
                 "Phase1",
                 "Current1",
-                "Status1",
                 "R2",
                 "Phase2",
                 "Current2",
-                "Status2",
                 "R3",
                 "Phase3",
                 "Current3",
-                "Status3",
                 "R4",
                 "Phase4",
                 "Current4",
-                "Status4",
+                "StatusCode",
             ],
         )
         self.assertFalse(

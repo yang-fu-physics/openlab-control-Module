@@ -29,6 +29,10 @@ from labcontrol.measurement.api import (
 from .constants import (
     CURRENT_EXCITATIONS,
     STATUS_BITS,
+    STATUS_CODE_INVALID_READING,
+    STATUS_CODE_NORMAL,
+    STATUS_CODE_OVER_COMPLIANCE,
+    STATUS_CODE_OVER_RANGE,
     compatible_resistance_range_indices,
     default_settings,
 )
@@ -306,9 +310,16 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> Mapping[str, Any]:
-        """确认已经 Apply，并标记本次 SEQ；此时仍保持全部激励分流。"""
+        """重新确认全部激励已分流，再标记本次 SEQ。
+
+        Apply 与 SEQ 开始之间可能经过较长的 Idle 时间，操作者也可能从仪表前面板改变
+        输入状态。因此不能仅沿用 Apply 时的安全结论；Begin Sequence 必须重新写入并
+        读回全部 Enabled 输入的分流状态。
+        """
 
         self._require_ready()
+        self.sequence_active = False
+        self._shunt_all(context)
         self.sequence_active = True
         status = {
             "Sequence": "Running",
@@ -353,6 +364,7 @@ class LakeShore372ABackend(ModuleBackend):
 
         input_channel = int(channel["input_channel"])
         failure: Exception | None = None
+        data_issue = False
         try:
             # 先以 shunted=True 重写完整配置，再切换 SCAN，最后才解除分流。即使上次
             # 测量中断，也不会直接在未知配置下打开激励。
@@ -396,34 +408,88 @@ class LakeShore372ABackend(ModuleBackend):
                     second,
                 )
             )
-            resistance = self._query_float(
-                f"RDGR? {input_channel}",
-                context,
-            )
-            quadrature = self._query_float(
-                f"QRDG? {input_channel}",
-                context,
-            )
-            power = self._query_float(
-                f"RDGPWR? {input_channel}",
-                context,
-            )
-            status_bits = self._query_status(
-                input_channel,
-                context,
-            )
-            phase = math.degrees(
-                # QRDG 是正交分量，RDGR 是同相电阻分量；atan2 保留正确象限。
-                math.atan2(
-                    quadrature,
-                    resistance,
+            try:
+                resistance = self._query_float(
+                    f"RDGR? {input_channel}",
+                    context,
                 )
-            )
-            current = self._excitation_current(
-                channel,
-                resistance,
-                quadrature,
-                power,
+                quadrature = self._query_float(
+                    f"QRDG? {input_channel}",
+                    context,
+                )
+                power = self._query_float(
+                    f"RDGPWR? {input_channel}",
+                    context,
+                )
+                status_bits = self._query_status(
+                    input_channel,
+                    context,
+                )
+                phase = math.degrees(
+                    # QRDG 是正交分量，RDGR 是同相电阻分量；atan2 保留正确象限。
+                    math.atan2(
+                        quadrature,
+                        resistance,
+                    )
+                )
+                current = self._excitation_current(
+                    channel,
+                    resistance,
+                    quadrature,
+                    power,
+                )
+            except ModuleError as exc:
+                # 查询已经成功返回、但测量值无法解析或无法计算时，仪表连接、当前输入
+                # 以及分流控制仍然是已知的。这属于当前通道的数据问题：保留温场快照，
+                # 输出显式 ERROR 状态行并报警，然后继续扫描后续通道。通信失败、设置
+                # 读回失败和安全状态失败不在这里降级，仍会终止 SEQ。
+                if exc.code not in {
+                    "LS372_INVALID_REPLY",
+                    "LS372_CURRENT_CALCULATION_FAILED",
+                }:
+                    raise
+                data_issue = True
+                warning_context = (
+                    f"R{slot}/input {input_channel}"
+                )
+                context.resolve_warning(
+                    "LS372_OVER_COMPLIANCE",
+                    warning_context,
+                )
+                context.resolve_warning(
+                    "LS372_OVER_RANGE",
+                    warning_context,
+                )
+                context.warning(
+                    f"R{slot} input {input_channel} returned "
+                    "an invalid measurement; this channel was "
+                    f"recorded as ERROR: {exc}",
+                    "LS372_READING_INVALID",
+                    warning_context,
+                )
+                context.emit_row({
+                    "TemperatureAverage": temperature,
+                    "FieldAverage": field,
+                    "StatusCode": (
+                        STATUS_CODE_INVALID_READING
+                    ),
+                })
+                self.last_values = {
+                    "slot": slot,
+                    "input_channel": input_channel,
+                    "status": "ERROR",
+                }
+                context.update_status({
+                    "Last Channel": (
+                        f"R{slot} / input {input_channel}"
+                    ),
+                    "Last Status": f"ERROR: {exc}",
+                })
+                return
+
+            context.resolve_warning(
+                "LS372_READING_INVALID",
+                f"R{slot}/input {input_channel}",
             )
             status, details = self._status(
                 status_bits
@@ -435,32 +501,58 @@ class LakeShore372ABackend(ModuleBackend):
                 details,
                 context,
             )
-            row = {
-                # manifest 为四个槽位预声明列。本行只填写当前槽位，其他 R/Phase/
-                # Current/Status 列由核心 DAT writer 留空。
+            status_code = {
+                "NORMAL": STATUS_CODE_NORMAL,
+                "OVER_RANGE": STATUS_CODE_OVER_RANGE,
+                "OVER_COMPLIANCE": (
+                    STATUS_CODE_OVER_COMPLIANCE
+                ),
+            }[status]
+            row: dict[str, Any] = {
+                # manifest 为四个槽位预声明测量列。本行只填写当前槽位，其他
+                # R/Phase/Current 列由核心 DAT writer 留空。非零状态表示本次读数
+                # 不可信，当前槽位也保持为空，只保留温场快照与故障分类。
                 "TemperatureAverage": temperature,
                 "FieldAverage": field,
-                f"R{slot}": resistance,
-                f"Phase{slot}": phase,
-                f"Current{slot}": current,
-                f"Status{slot}": status,
+                "StatusCode": status_code,
             }
+            if status_code == STATUS_CODE_NORMAL:
+                row.update({
+                    f"R{slot}": resistance,
+                    f"Phase{slot}": phase,
+                    f"Current{slot}": current,
+                })
             context.emit_row(row)
             self.last_values = {
                 "slot": slot,
                 "input_channel": input_channel,
-                "resistance": resistance,
-                "phase": phase,
-                "current": current,
                 "status": status,
             }
+            if status_code == STATUS_CODE_NORMAL:
+                self.last_values.update({
+                    "resistance": resistance,
+                    "phase": phase,
+                    "current": current,
+                })
             context.update_status({
                 "Last Channel": (
                     f"R{slot} / input {input_channel}"
                 ),
-                "Last Resistance (Ohm)": resistance,
-                "Last Phase (deg)": phase,
-                "Last Current (A)": current,
+                "Last Resistance (Ohm)": (
+                    resistance
+                    if status_code == STATUS_CODE_NORMAL
+                    else "-"
+                ),
+                "Last Phase (deg)": (
+                    phase
+                    if status_code == STATUS_CODE_NORMAL
+                    else "-"
+                ),
+                "Last Current (A)": (
+                    current
+                    if status_code == STATUS_CODE_NORMAL
+                    else "-"
+                ),
                 "Last Status": (
                     status
                     if not details
@@ -476,6 +568,7 @@ class LakeShore372ABackend(ModuleBackend):
             should_shunt = (
                 bool(settings["shunt_after_read"])
                 or failure is not None
+                or data_issue
             )
             if should_shunt:
                 cleanup_error = (
@@ -741,13 +834,31 @@ class LakeShore372ABackend(ModuleBackend):
         command: str,
         context: ModuleOperationContext,
     ) -> None:
-        """通过统一重试入口发送命令，禁止调用者绕过通信错误归一化。"""
+        """发送一次写命令；结果不确定时禁止自动重放。
 
-        self._call_with_retry(
-            command,
-            lambda transport: transport.write(command),
-            context,
-        )
+        VISA 在超时或断线时无法证明仪表是否已经执行命令。尤其是切换输入和解除分流
+        命令，盲目重发会把未知状态伪装成可恢复通信故障。因此写失败立即作为系统 Error
+        上报，并保留当前 transport 供外层安全清理路径直接尝试分流。
+        """
+
+        context.checkpoint()
+        transport = self.transport
+        if transport is None:
+            raise ModuleError(
+                f"Model 372 is disconnected before write "
+                f"{command}",
+                "LS372_COMMUNICATION_FAILED",
+                command,
+            )
+        try:
+            transport.write(command)
+        except Exception as exc:
+            raise ModuleError(
+                f"Model 372 write result is uncertain for "
+                f"{command}: {type(exc).__name__}: {exc}",
+                "LS372_WRITE_UNCERTAIN",
+                command,
+            ) from exc
 
     def _query_text(
         self,
@@ -780,11 +891,10 @@ class LakeShore372ABackend(ModuleBackend):
         ],
         context: ModuleOperationContext,
     ) -> Any:
-        """在固定次数内重连重试，并把最终失败升级为 ModuleError。
+        """重试只读查询，并把最终失败升级为 ModuleError。
 
-        本模块写命令都是绝对设置（不是递增/触发型命令），且关键设置随后都有查询读回；
-        因此短暂 I/O 失败后允许重发。重连只重新验证仪表身份，不声称恢复全部内部设置，
-        这也是 372A 仍需真机断线测试的原因。
+        查询失败不会改变仪表状态，因此允许在固定次数内重连后重试。写命令必须经过
+        :meth:`_write` 单次发送；不能把不确定写入交给本函数重放。
         """
 
         settings = (

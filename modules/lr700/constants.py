@@ -52,8 +52,15 @@ FILTERS: tuple[
     (2, "10 s", 10.0),
 )
 
-# GET 7 的 8 位 OVERLOADS 状态字。名称保留手册语义，DAT 中再归一化为
-# NORMAL / OVER_RANGE / OVERLOAD，完整位名称同时出现在 Status 和 Warning。
+# DAT 的 StatusCode 是本模块自有整数枚举。LR-700 没有 372A 的 current-source
+# compliance 状态，因此代码 2 在本模块表示 overload，而不是跨模块统一含义。
+STATUS_CODE_NORMAL = 0
+STATUS_CODE_OVER_RANGE = 1
+STATUS_CODE_OVERLOAD = 2
+STATUS_CODE_INVALID_READING = 3
+
+# GET 7 的 8 位 OVERLOADS 状态字。名称保留手册语义，完整位名称显示在 Warning 和
+# 状态页中；DAT 只写上面的整数状态码。
 OVERLOAD_BITS: tuple[tuple[int, str], ...] = (
     (1, "+dX overrange"),
     (2, "-dX overrange"),
@@ -115,6 +122,10 @@ __all__ = [
     "RESISTANCE_RANGES",
     "SAFE_EXCITATION_INDEX",
     "SAFE_EXCITATION_PERCENT",
+    "STATUS_CODE_INVALID_READING",
+    "STATUS_CODE_NORMAL",
+    "STATUS_CODE_OVERLOAD",
+    "STATUS_CODE_OVER_RANGE",
     "default_channel",
     "default_settings",
 ]

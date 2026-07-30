@@ -351,7 +351,7 @@ class LR700BackendTests(unittest.TestCase):
                 "FieldAverage",
                 "R1",
                 "X1",
-                "Status1",
+                "StatusCode",
             },
         )
         self.assertEqual(
@@ -359,9 +359,7 @@ class LR700BackendTests(unittest.TestCase):
             {
                 "TemperatureAverage",
                 "FieldAverage",
-                "R2",
-                "X2",
-                "Status2",
+                "StatusCode",
             },
         )
         self.assertAlmostEqual(rows[0]["R1"], 50.0)
@@ -374,8 +372,10 @@ class LR700BackendTests(unittest.TestCase):
             rows[0]["FieldAverage"],
             110.0,
         )
-        self.assertEqual(rows[0]["Status1"], "NORMAL")
-        self.assertEqual(rows[1]["Status2"], "OVERLOAD")
+        self.assertEqual(rows[0]["StatusCode"], 0)
+        self.assertEqual(rows[1]["StatusCode"], 2)
+        self.assertNotIn("R2", rows[1])
+        self.assertNotIn("X2", rows[1])
         self.assertEqual(waits, [2.0, 1.0] * 2)
         self.assertIn(
             ("write", "SELECT S=05"),
@@ -460,6 +460,85 @@ class LR700BackendTests(unittest.TestCase):
         ]
         self.assertIn("LR700_IO_RETRY", warning_codes)
         self.assertIn("LR700_IO_RETRY", resolve_codes)
+
+    def test_invalid_measurements_mark_rows_and_continue_scan(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        state.query_overrides["GET 0"] = "BROKEN"
+        messages: list[tuple[str, dict]] = []
+        settings = _two_slot_settings()
+        backend = self._backend(state, [])
+        context = self._context(messages, _samples(2))
+        backend.initialize(settings, context)
+        backend.apply_settings(settings, context)
+        backend.begin_sequence(context)
+
+        backend.measure(context)
+
+        rows = [
+            payload["values"]
+            for kind, payload in messages
+            if kind == "row"
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["StatusCode"], 3)
+        self.assertNotIn("R1", rows[0])
+        self.assertNotIn("X1", rows[0])
+        self.assertEqual(rows[1]["StatusCode"], 3)
+        self.assertNotIn("R2", rows[1])
+        self.assertNotIn("X2", rows[1])
+        self.assertEqual(state.excitation_index, 0)
+        self.assertEqual(state.excitation_percent, 5)
+        invalid_warnings = [
+            payload
+            for kind, payload in messages
+            if kind == "warning"
+            and payload["code"]
+            == "LR700_READING_INVALID"
+        ]
+        self.assertEqual(
+            {
+                payload["context"]
+                for payload in invalid_warnings
+            },
+            {
+                "R1 / sensor 5",
+                "R2 / sensor 12",
+            },
+        )
+
+    def test_cleanup_failure_keeps_safety_error_and_sensor_context(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        messages: list[tuple[str, dict]] = []
+        settings = default_settings()
+        settings["resource"] = "GPIB0::18::INSTR"
+        backend = self._backend(state, [])
+        context = self._context(messages, _samples(1))
+        backend.initialize(settings, context)
+        backend.apply_settings(settings, context)
+        backend.begin_sequence(context)
+        backend._best_effort_safe_state = (
+            lambda: "simulated cleanup failure"
+        )
+
+        with self.assertRaises(ModuleError) as captured:
+            backend.measure(context)
+
+        self.assertEqual(
+            captured.exception.code,
+            "LR700_SAFE_STATE_FAILED",
+        )
+        self.assertEqual(
+            captured.exception.context,
+            "sensor 1",
+        )
+        self.assertIn(
+            "after sensor 1",
+            str(captured.exception),
+        )
 
     def test_uncertain_write_is_not_replayed_and_cleanup_reopens(
         self,
@@ -737,6 +816,10 @@ class LR700BackendTests(unittest.TestCase):
             LR700Backend._status(16)[0],
             "OVERLOAD",
         )
+        self.assertEqual(
+            LR700Backend._status(16 | 64)[0],
+            "OVERLOAD",
+        )
         with self.assertRaises(ModuleError):
             LR700Backend._parse_measurement(
                 "+1.00000 M OHMR",
@@ -881,7 +964,7 @@ class LR700ManifestTests(unittest.TestCase):
         self.assertEqual(descriptor.id, "lr700")
         self.assertEqual(
             descriptor.version,
-            "0.1.0b1",
+            "0.1.0b4",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(
@@ -893,20 +976,19 @@ class LR700ManifestTests(unittest.TestCase):
             for column in descriptor.columns
         ]
         self.assertEqual(
-            names[:5],
+            names[:4],
             [
                 "TemperatureAverage",
                 "FieldAverage",
                 "R1",
                 "X1",
-                "Status1",
             ],
         )
         self.assertEqual(
             names[-3:],
-            ["R4", "X4", "Status4"],
+            ["R4", "X4", "StatusCode"],
         )
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 11)
         self.assertFalse(
             (MODULE / "requirements.lock").exists()
         )

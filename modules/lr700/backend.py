@@ -37,6 +37,10 @@ from .constants import (
     OVERLOAD_BITS,
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
+    STATUS_CODE_INVALID_READING,
+    STATUS_CODE_NORMAL,
+    STATUS_CODE_OVERLOAD,
+    STATUS_CODE_OVER_RANGE,
     default_settings,
 )
 
@@ -136,7 +140,7 @@ class LR700Backend(ModuleBackend):
     4. 等待切换/滤波稳定时间，获取第一份核心温场快照；
     5. 等待 dwell，获取第二份温场快照；
     6. 读取 R、X、过载字，并再次核对设置未被前面板改变；
-    7. 写一行只包含当前 Rn/Xn/Statusn 的稀疏数据；
+    7. 写一行只包含当前 Rn/Xn 和公共 StatusCode 的稀疏数据；
     8. 无论成功、Stop 或异常，都尝试恢复并确认最低激励。
     """
 
@@ -404,21 +408,29 @@ class LR700Backend(ModuleBackend):
                 before,
             )
             range_index = int(before["range_index"])
-            resistance = self._query_measurement(
-                "GET 0",
-                "R",
-                range_index,
-                context,
-            )
-            reactance = self._query_measurement(
-                "GET 1",
-                "X",
-                range_index,
-                context,
-            )
-            overload_bits = self._query_overloads(
-                context
-            )
+            data_failure: ModuleError | None = None
+            try:
+                resistance = self._query_measurement(
+                    "GET 0",
+                    "R",
+                    range_index,
+                    context,
+                )
+                reactance = self._query_measurement(
+                    "GET 1",
+                    "X",
+                    range_index,
+                    context,
+                )
+                overload_bits = self._query_overloads(
+                    context
+                )
+            except ModuleError as exc:
+                # 仅把已经收到但无法解析的 R/X/OVERLOAD 读数视为数据问题。GET 6
+                # 设置读回、通信耗尽和安全状态失败仍是系统问题，必须终止 SEQ。
+                if exc.code != "LR700_INVALID_REPLY":
+                    raise
+                data_failure = exc
             after = self._query_bridge_settings(
                 context
             )
@@ -428,6 +440,48 @@ class LR700Backend(ModuleBackend):
                 after,
             )
 
+            warning_context = (
+                f"R{slot} / sensor {input_channel}"
+            )
+            if data_failure is not None:
+                context.resolve_warning(
+                    "LR700_READING_WARNING",
+                    warning_context,
+                )
+                context.warning(
+                    f"LR-700 R{slot} / sensor "
+                    f"{input_channel} returned an invalid "
+                    "measurement; this channel was recorded "
+                    f"as ERROR: {data_failure}",
+                    "LR700_READING_INVALID",
+                    warning_context,
+                )
+                context.emit_row({
+                    "TemperatureAverage": temperature,
+                    "FieldAverage": field,
+                    "StatusCode": (
+                        STATUS_CODE_INVALID_READING
+                    ),
+                })
+                self.last_values = {
+                    "slot": slot,
+                    "input_channel": input_channel,
+                    "status": "ERROR",
+                }
+                context.update_status({
+                    "Last Slot / Sensor": (
+                        f"R{slot} / S{input_channel}"
+                    ),
+                    "Last Status": (
+                        f"ERROR: {data_failure}"
+                    ),
+                })
+                return
+
+            context.resolve_warning(
+                "LR700_READING_INVALID",
+                warning_context,
+            )
             status, details = self._status(
                 overload_bits
             )
@@ -438,26 +492,48 @@ class LR700Backend(ModuleBackend):
                 details,
                 context,
             )
-            context.emit_row({
+            status_code = {
+                "NORMAL": STATUS_CODE_NORMAL,
+                "OVER_RANGE": STATUS_CODE_OVER_RANGE,
+                "OVERLOAD": STATUS_CODE_OVERLOAD,
+            }[status]
+            row: dict[str, Any] = {
                 "TemperatureAverage": temperature,
                 "FieldAverage": field,
-                f"R{slot}": resistance,
-                f"X{slot}": reactance,
-                f"Status{slot}": status,
-            })
+                "StatusCode": status_code,
+            }
+            # OVER_RANGE/OVERLOAD 下桥读数不可信；保持当前 Rn/Xn 以及所有未测槽位
+            # 为空，状态码和温场快照足以说明这次测量尝试。
+            if status_code == STATUS_CODE_NORMAL:
+                row.update({
+                    f"R{slot}": resistance,
+                    f"X{slot}": reactance,
+                })
+            context.emit_row(row)
             self.last_values = {
                 "slot": slot,
                 "input_channel": input_channel,
-                "resistance": resistance,
-                "reactance": reactance,
                 "status": status,
             }
+            if status_code == STATUS_CODE_NORMAL:
+                self.last_values.update({
+                    "resistance": resistance,
+                    "reactance": reactance,
+                })
             context.update_status({
                 "Last Slot / Sensor": (
                     f"R{slot} / S{input_channel}"
                 ),
-                "Last Resistance (Ohm)": resistance,
-                "Last Reactance (Ohm)": reactance,
+                "Last Resistance (Ohm)": (
+                    resistance
+                    if status_code == STATUS_CODE_NORMAL
+                    else "-"
+                ),
+                "Last Reactance (Ohm)": (
+                    reactance
+                    if status_code == STATUS_CODE_NORMAL
+                    else "-"
+                ),
                 "Last Status": (
                     status
                     if not details
@@ -483,10 +559,11 @@ class LR700Backend(ModuleBackend):
             if cleanup_error is not None:
                 raise ModuleError(
                     "Could not confirm LR-700 minimum "
-                    f"excitation after sensor {sensor}: "
+                    f"excitation after sensor "
+                    f"{input_channel}: "
                     f"{cleanup_error}",
                     "LR700_SAFE_STATE_FAILED",
-                    f"sensor {sensor}",
+                    f"sensor {input_channel}",
                 ) from failure
 
     def end_sequence(

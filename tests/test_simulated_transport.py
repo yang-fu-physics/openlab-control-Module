@@ -50,7 +50,63 @@ class SimulatedTransportTests(unittest.TestCase):
             [next(name for name in row if name.startswith("R")) for row in rows],
             ["R1", "R2", "R3", "R4"],
         )
+        self.assertEqual(
+            [row["StatusCode"] for row in rows],
+            [0, 0, 0, 0],
+        )
+        self.assertTrue(
+            all(
+                not isinstance(value, str)
+                for row in rows
+                for value in row.values()
+            )
+        )
         self.assertEqual(final["Output"], "Off")
+
+    def test_threshold_warning_uses_module_specific_numeric_status(self) -> None:
+        messages: list[tuple[str, dict]] = []
+        context = ModuleOperationContext(
+            {
+                "temperature": {"current": 300.0},
+                "field": {"current": 0.0},
+            },
+            lambda kind, values: messages.append((kind, values)),
+        )
+        backend = SimulatedTransportBackend()
+        backend.initialize({"delay_seconds": 0.0}, context)
+        backend.apply_settings(
+            {
+                "delay_seconds": 0.0,
+                "noise_ohm": 0.0,
+                "warning_threshold_ohm": 0.0,
+            },
+            context,
+        )
+
+        backend.measure(context)
+
+        rows = [
+            payload["values"]
+            for kind, payload in messages
+            if kind == "row"
+        ]
+        self.assertEqual(
+            [row["StatusCode"] for row in rows],
+            [1, 1, 1, 1],
+        )
+        self.assertTrue(
+            all(
+                set(row) == {"StatusCode"}
+                for row in rows
+            )
+        )
+        self.assertTrue(
+            all(
+                not isinstance(value, str)
+                for row in rows
+                for value in row.values()
+            )
+        )
 
 
 if __name__ == "__main__":

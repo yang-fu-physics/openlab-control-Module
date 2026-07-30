@@ -95,8 +95,14 @@ RESISTANCE_RANGES: tuple[
     (22, "63.2 MOhm", 63.2e6),
 )
 
+# DAT 的 StatusCode 是模块自有枚举；0 固定表示正常，其余值只在本模块 README 中解释。
+STATUS_CODE_NORMAL = 0
+STATUS_CODE_OVER_RANGE = 1
+STATUS_CODE_OVER_COMPLIANCE = 2
+STATUS_CODE_INVALID_READING = 3
+
 # RDGST? 返回的 8 位状态字。bit 0 是电流源 compliance，后端会把它单独升级显示；
-# 其他位仍完整保存在 StatusDetails，不能只保留归一化后的 NORMAL/OVER_RANGE。
+# 其他位名称保留在 Warning 和状态页中，DAT 只写上面的整数状态码。
 STATUS_BITS: tuple[tuple[int, str], ...] = (
     (1, "CS_OVL"),
     (2, "VCM_OVL"),
@@ -188,6 +194,10 @@ __all__ = [
     "FREQUENCIES_HZ",
     "RESISTANCE_RANGES",
     "STATUS_BITS",
+    "STATUS_CODE_INVALID_READING",
+    "STATUS_CODE_NORMAL",
+    "STATUS_CODE_OVER_COMPLIANCE",
+    "STATUS_CODE_OVER_RANGE",
     "VOLTAGE_EXCITATIONS",
     "compatible_resistance_range_indices",
     "default_channel",

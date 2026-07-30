@@ -48,21 +48,32 @@ For every enabled sensor, the module:
 8. verifies `GET 6` again so a front-panel change cannot silently relabel data;
 9. emits one sparse DAT row for that sensor and restores minimum excitation.
 
-The fixed output columns are `TemperatureAverage`, `FieldAverage`, and
-`R1/X1/Status1` through `R4/X4/Status4`. Only the current logical slot's R, X,
-and Status fields are filled in each row. Temperature is normalized to kelvin
-and field to oersted before the two snapshots are averaged.
+The fixed output columns are `TemperatureAverage`, `FieldAverage`, `R1/X1`
+through `R4/X4`, and one common integer `StatusCode` column. Only the current
+logical slot's R and X fields are filled in each row; `StatusCode` describes
+that row.
+Temperature is normalized to kelvin and field to oersted before the two
+snapshots are averaged.
 
-`StatusN` is:
+The LR-700-specific status codes are:
 
-- `NORMAL` when `GET 7` returns zero;
-- `OVER_RANGE` for dX, R, or dR overrange bits;
-- `OVERLOAD` for common-mode, I-HIGH, or tuned-amplifier overload bits.
+- `0`: normal when `GET 7` returns zero;
+- `1`: dX, R, or dR overrange;
+- `2`: common-mode, I-HIGH, or tuned-amplifier overload;
+- `3`: invalid R/X/overload measurement reply.
 
-Non-zero status is a recoverable Warning and does not stop the SEQ. Invalid
-responses, exhausted read retries, ambiguous write failure, stale system
-snapshots, settings readback mismatch, or unconfirmed minimum excitation are
-Errors and stop the SEQ.
+If several conditions occur together, code 3 takes priority because the
+measurement reply cannot be trusted. For a valid `GET 7` word, any overload
+bit takes priority over simultaneous overrange bits, producing code 2.
+
+Non-zero status is a recoverable Warning and does not stop the SEQ. Every
+nonzero row retains the temperature/field averages and `StatusCode`, but leaves
+the current slot's R/X fields empty; all unmeasured slots are empty as well. A
+malformed reply uses code 3. The module raises a deduplicated Warning, restores
+minimum excitation, and continues with the next slot while the sensor and
+safety state remain known. Exhausted read retries, an ambiguous write failure,
+an invalid settings readback, a stale system snapshot, or unconfirmed minimum
+excitation are system Errors and stop the SEQ.
 
 ## Excitation safety boundary
 

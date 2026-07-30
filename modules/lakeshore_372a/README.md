@@ -42,15 +42,26 @@ two-snapshot averages.
 configured nominal excitation current. In voltage mode it is estimated from
 the reported excitation power and the dissipative resistance.
 
-`StatusN` is one of:
+The per-row `StatusCode` column contains integers only:
 
-- `NORMAL`;
-- `OVER_COMPLIANCE` for the Model 372 `CS OVL` status bit;
-- `OVER_RANGE` for any other non-zero `RDGST?` bit.
+- `0`: normal;
+- `1`: overrange from any non-compliance `RDGST?` bit;
+- `2`: current-source compliance from the `CS OVL` bit;
+- `3`: invalid/non-finite measurement reply or invalid current calculation.
+
+If several conditions occur together, code 3 takes priority because the
+measurement cannot be trusted; otherwise `CS OVL` takes priority over the
+other `RDGST?` bits, so a mixed status is code 2 rather than code 1.
 
 Over-range and over-compliance are recoverable module Warnings and therefore
-do not stop the SEQ. Exhausted GPIB retries, invalid/non-finite replies, stale
-system snapshots, or identity mismatch are Errors and stop the SEQ.
+do not stop the SEQ. Every nonzero status emits a sparse row containing the
+temperature/field averages and `StatusCode`, but leaves that slot's
+`R/Phase/Current` fields empty; all unmeasured slots are empty as well. A
+malformed/non-finite reply or invalid current calculation additionally shunts
+that input. The module raises a deduplicated Warning and continues with the
+next slot while channel and safety state remain known. Exhausted GPIB retries,
+an uncertain write, invalid settings readback, stale system snapshots, identity
+mismatch, or unconfirmed shunt are system Errors and stop the SEQ.
 
 ## Safety and first hardware test
 

@@ -9,6 +9,12 @@ from typing import Any
 from labcontrol.measurement.api import ModuleBackend, ModuleOperationContext
 
 
+# DAT 只保存可直接分析的整数状态码。0 是跨模块约定的正常值；1 的含义只属于
+# simulated_transport，用于演示模块如何把可恢复的超阈值数据与人类可读 Warning 分开。
+STATUS_CODE_NORMAL = 0
+STATUS_CODE_OVER_RANGE = 1
+
+
 class SimulatedTransportBackend(ModuleBackend):
     def __init__(self) -> None:
         self.connected = False
@@ -84,20 +90,29 @@ class SimulatedTransportBackend(ModuleBackend):
             channel = f"R{index}"
             value = self._resistance(index, context)
             self.last_values[channel] = value
-            warning = ""
             if abs(value) > threshold:
-                warning = "OVER_RANGE"
+                status_code = STATUS_CODE_OVER_RANGE
                 context.warning(
                     f"{channel} exceeded the configured warning threshold",
                     "OVER_RANGE",
                     channel,
                 )
             else:
+                status_code = STATUS_CODE_NORMAL
                 context.resolve_warning("OVER_RANGE", channel)
-            context.emit_row({channel: value, "Status": "OK", "Warning": warning})
+            row: dict[str, float | int] = {
+                "StatusCode": status_code,
+            }
+            if status_code == STATUS_CODE_NORMAL:
+                row[channel] = value
+            context.emit_row(row)
             context.update_status({
                 "Last Channel": channel,
-                "Last Resistance (Ohm)": value,
+                "Last Resistance (Ohm)": (
+                    value
+                    if status_code == STATUS_CODE_NORMAL
+                    else "—"
+                ),
             })
 
     def end_sequence(self, reason: str, context: ModuleOperationContext) -> Mapping[str, Any]:

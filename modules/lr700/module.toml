@@ -1,6 +1,6 @@
 id = "lr700"
 name = "Linear Research LR-700 + LR-720-16"
-version = "0.1.0b1"
+version = "0.1.0b4"
 api_version = "1.0"
 core_requires = ">=0.11.1,<0.12"
 frontend = "frontend:LR700Frontend"
@@ -27,18 +27,12 @@ name = "X1"
 unit = "Ohm"
 
 [[columns]]
-name = "Status1"
-
-[[columns]]
 name = "R2"
 unit = "Ohm"
 
 [[columns]]
 name = "X2"
 unit = "Ohm"
-
-[[columns]]
-name = "Status2"
 
 [[columns]]
 name = "R3"
@@ -49,9 +43,6 @@ name = "X3"
 unit = "Ohm"
 
 [[columns]]
-name = "Status3"
-
-[[columns]]
 name = "R4"
 unit = "Ohm"
 
@@ -60,4 +51,4 @@ name = "X4"
 unit = "Ohm"
 
 [[columns]]
-name = "Status4"
+name = "StatusCode"
