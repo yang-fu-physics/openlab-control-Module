@@ -1235,7 +1235,7 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b3",
+            "0.1.0b4",
         )
         self.assertEqual(
             [column.name for column in descriptor.columns],

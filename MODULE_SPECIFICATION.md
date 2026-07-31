@@ -3,8 +3,9 @@
 > - 文档状态：当前仓库的规范性开发基线
 > - 规范版本：1.0
 > - 适用接口：OpenLab Control Measurement Module API 1.0
-> - 基线日期：2026-07-29
-> - 参考实现：`lakeshore_372a`、`lr700`、`keithley_6221_2182a_delta`
+> - 基线日期：2026-07-31
+> - 参考实现：`lakeshore_372a`、`lr700`、`keithley_6221_2182a_delta`、
+>   `keithley_6221_2182a_delta_3706a`
 
 本文件用于统一后续 Measurement Module 的目录、清单、生命周期、数据、安全、界面、
 依赖、测试和发布方式。它不替代仪表手册，也不证明模块已经通过真实仪表验证。
@@ -36,15 +37,16 @@ Measurement Module 表示“一套完整测量方案”，可以拥有一个或�
 - Stop 结束本次模块运行状态，但不会 Disable 模块。温度和磁场保持由核心及其
   Device Plugin 负责；模块只处理自身输出、切换器和资源。
 
-## 2. 三个现有模块形成的参考模型
+## 2. 现有硬件模块形成的参考模型
 
 | 模块 | 仪表拓扑 | 配置方式 | SEQ 前准备 | DAT 行模型 | 模块安全状态 |
 | --- | --- | --- | --- | --- | --- |
 | Lake Shore 372A | 单台电阻桥及其输入扫描器 | R1-R4 各自保存输入、激励和量程 | 确认所有相关输入分流 | 稀疏宽表；每个通道一行，只填写本槽位的 R/Phase/Current，加整数 StatusCode | 所有相关输入 excitation shunted，并读回确认 |
 | LR-700 + LR-720-16 | 电阻桥加十六路复用器 | R1-R4 保存各自参数，但仪表参数是全局的，测量时逐通道应用 | 确认最低可验证激励 | 稀疏宽表；每个通道一行，只填写本槽位的 R/X，加整数 StatusCode | `20 uV × 5% = 1 uV` 最低激励，并读回确认 |
 | Keithley 6221 + 2182A + 可选 7001 | 电流源、纳伏表和切换器组成的多仪表触发链 | 可选“共享配置并持续 Armed”或“每通道独立配置并重新 ARM” | 共享模式 ARM 后可中断等待 3 s 并确认 Armed | 标准长表；整数 Channel + Resistance/Current/StdDev/SampleCount/StatusCode，每个通道一行 | Abort Delta、输出关闭、必要时打开路由，并查询确认 |
+| Keithley 6221 + 2182A + 可选 3706A | 与上一项相同，但切换器使用区分大小写的 TSP | 与 7001 版本相同 | 与 7001 版本相同 | 与 7001 版本相同，并保持独立 module ID/rawdata 文件 | Abort Delta、输出关闭、`channel.open("allslots")`，并用整机 closed-channel list 精确确认 |
 
-这三种实现说明下列差异是允许的：
+这些实现说明下列差异是允许的：
 
 - 单仪表、多路复用仪表和多仪表编排都可以由一个模块实现。
 - 通道设置可以是真正独立，也可以只是扫描计划，测量时再写入全局仪表参数。
@@ -591,7 +593,7 @@ Backend 拒绝。
 6. 分别在 settle、ARM、trigger、read 中执行 Pause/Stop；
 7. 断开 GPIB、关闭附件或制造超量程，核对 Warning/Error；
 8. 验证 Disable、应用退出和进程强制回收后的仪表实际状态；
-9. 多通道模块运行全部支持的通道数量；当前三个硬件模块为四通道；
+9. 多通道模块运行全部支持的通道数量；当前四个硬件模块为四通道；
 10. 长时间运行，并对照仪表本机记录、DAT、rawdata 和状态日志。
 
 记录仪表型号、固件、卡槽、接线、VISA implementation 和验证日期。只有完成计划内的

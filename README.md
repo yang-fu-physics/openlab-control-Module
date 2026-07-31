@@ -15,15 +15,20 @@ sensor inputs, and emits one sparse R/X/status row per enabled slot.
 and an optional 7001 for four-channel Delta measurements. It converts raw
 Delta voltage to resistance and stores the voltage sequence in a core-managed
 rawdata sidecar.
+`keithley_6221_2182a_delta_3706a` provides the same two Delta operating modes
+and data contract with an optional 3706/3706A switch mainframe. Its routing
+layer uses the 3700A case-sensitive TSP command set and verifies the complete
+closed-channel list before every trigger.
 
 The current `simulated_transport` 1.0.2 requires OpenLab Control 0.11.0 Beta 2
 or newer because it uses the live, interruptible measurement context.
 `lakeshore_372a` 0.1.0b8 requires OpenLab Control 0.11.1 or newer because its
 PyVISA runtime is supplied and version-checked by the core framework.
 `lr700` 0.1.0b4 has the same core requirement and shared PyVISA boundary.
-`keithley_6221_2182a_delta` 0.1.0b3 requires the rawdata API introduced in
-OpenLab Control 0.11.4 development builds. All hardware modules remain beta
-until verified with their real instruments.
+`keithley_6221_2182a_delta` 0.1.0b4 requires OpenLab Control 0.11.4 or newer
+for core-managed rawdata rows. `keithley_6221_2182a_delta_3706a` 0.1.0b1 has
+the same core requirement.
+All hardware modules remain beta until verified with their real instruments.
 
 ## Manual offline installation
 

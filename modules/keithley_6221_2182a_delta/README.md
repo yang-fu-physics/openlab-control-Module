@@ -1,8 +1,10 @@
 # Keithley 6221 + 2182A Delta + 7001
 
-Beta Measurement Module for a Keithley 6221 current source, a Keithley 2182A
+Version `0.1.0b4` is a Beta Measurement Module for a Keithley 6221 current
+source, a Keithley 2182A
 nanovoltmeter connected to the 6221 by RS-232 and Trigger Link, and an optional
 Keithley 7001 switch system controlled by a second GPIB resource.
+It requires OpenLab Control `>=0.11.4,<0.12` for core-managed rawdata rows.
 
 Before using Apply, manually enable the 2182A RS-232 interface at 19.2 kbaud,
 XON/XOFF flow control, and CR termination; configure the 6221 serial side to
