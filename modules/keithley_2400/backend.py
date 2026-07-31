@@ -1,0 +1,1065 @@
+"""Keithley Model 2400 电阻测量模块后端。
+
+模块把 2400 当作单通道 SMU 使用：恒流时读取 V/I，恒压时同样读取 V/I，最后统一
+计算 ``R = V / I``。模块不使用仪表的 AUTO OHMS 模式，因为用户需要显式控制源模式；
+这样 DAT 中的电压和电流也与实际本次读数一一对应。
+
+所有主动输出都被限制在一次 ``measure`` 调用内部。输出状态、源设置、compliance 和
+两线/四线设置必须由仪表读回确认；仅有 ``write`` 成功不视为配置完成。
+"""
+
+from __future__ import annotations
+
+import importlib
+import math
+import re
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from typing import Any, Protocol
+
+from labcontrol.measurement.api import (
+    ModuleBackend,
+    ModuleError,
+    ModuleOperationContext,
+    ModuleWarning,
+)
+
+from .constants import (
+    DEVICE_MAX_CURRENT_A,
+    DEVICE_MAX_VOLTAGE_V,
+    SENSE_2WIRE,
+    SENSE_4WIRE,
+    SOURCE_CURRENT,
+    SOURCE_VOLTAGE,
+    STATUS_CODE_COMPLIANCE,
+    STATUS_CODE_INVALID_READING,
+    STATUS_CODE_NORMAL,
+    STATUS_CODE_OVER_RANGE,
+    default_settings,
+)
+from .quantities import parse_quantity
+
+
+_READING_SENTINEL = 9.0e36
+_MEASURE_CLEANUP_RESERVE_SECONDS = 3.0
+
+
+class InstrumentTransport(Protocol):
+    """后端实际需要的最小 VISA 接口，便于测试注入内存仪表。"""
+
+    def write(self, command: str) -> None: ...
+
+    def query(self, command: str) -> str: ...
+
+    def close(self) -> None: ...
+
+
+TransportFactory = Callable[[str, float], InstrumentTransport]
+ResourceLister = Callable[[], tuple[str, ...]]
+Waiter = Callable[[ModuleOperationContext, float], None]
+
+
+class PyVisaTransport:
+    """只在独立 Measurement Module worker 内惰性打开 PyVISA。"""
+
+    def __init__(self, resource_name: str, timeout_seconds: float) -> None:
+        pyvisa = importlib.import_module("pyvisa")
+        self._manager = pyvisa.ResourceManager()
+        try:
+            self._instrument = self._manager.open_resource(resource_name)
+            self._instrument.timeout = max(1, int(timeout_seconds * 1000))
+            self._instrument.read_termination = "\n"
+            self._instrument.write_termination = "\n"
+        except Exception:
+            self._manager.close()
+            raise
+
+    @staticmethod
+    def list_resources() -> tuple[str, ...]:
+        pyvisa = importlib.import_module("pyvisa")
+        manager = pyvisa.ResourceManager()
+        try:
+            resources = tuple(str(item) for item in manager.list_resources())
+        finally:
+            manager.close()
+        return tuple(
+            sorted(
+                {item for item in resources if item.upper().startswith("GPIB")},
+                key=str.casefold,
+            )
+        )
+
+    def write(self, command: str) -> None:
+        self._instrument.write(command)
+
+    def query(self, command: str) -> str:
+        return str(self._instrument.query(command))
+
+    def close(self) -> None:
+        try:
+            self._instrument.close()
+        finally:
+            self._manager.close()
+
+
+class Keithley2400Backend(ModuleBackend):
+    """2400 的生命周期、读回确认、测量和安全关闭状态机。"""
+
+    def __init__(
+        self,
+        transport_factory: TransportFactory | None = None,
+        resource_lister: ResourceLister | None = None,
+        waiter: Waiter | None = None,
+    ) -> None:
+        self._transport_factory = transport_factory or PyVisaTransport
+        self._resource_lister = resource_lister or PyVisaTransport.list_resources
+        self._waiter = waiter or (
+            lambda context, seconds: context.interruptible_sleep(seconds)
+        )
+        self.transport: InstrumentTransport | None = None
+        self.desired_settings: dict[str, Any] = default_settings()
+        self.applied_settings: dict[str, Any] | None = None
+        self.available_resources: tuple[str, ...] = ()
+        self.identity = ""
+        self.sequence_active = False
+        self.last_status = "Idle"
+        self.last_resistance: float | None = None
+        self.last_voltage: float | None = None
+        self.last_current: float | None = None
+
+    def initialize(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """Enable 只加载设置并发现资源，绝不连接或改变 2400。"""
+
+        self.desired_settings = self._normalized_settings(
+            settings,
+            require_resource=False,
+            operation_timeout_seconds=context.operation_timeout_seconds,
+        )
+        try:
+            self.available_resources = tuple(
+                sorted(set(self._resource_lister()), key=str.casefold)
+            )
+            context.resolve_warning("K2400_RESOURCE_DISCOVERY_FAILED")
+        except Exception as exc:
+            self.available_resources = ()
+            context.warning(
+                "GPIB resource discovery failed: "
+                f"{type(exc).__name__}: {exc}",
+                "K2400_RESOURCE_DISCOVERY_FAILED",
+            )
+        self.applied_settings = None
+        self.identity = ""
+        self.sequence_active = False
+        self.last_status = "Initialized"
+        status = self._status()
+        context.update_status(status)
+        return status
+
+    def apply_settings(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """连接、识别、配置并确认输出关闭。
+
+        Apply 不使用 ``*RST``，避免清除操作员在前面板建立的其他现场设置。模块只写
+        完成本测量所需的 SCPI 字段，并逐项读回。
+        """
+
+        normalized = self._normalized_settings(
+            settings,
+            require_resource=True,
+            operation_timeout_seconds=context.operation_timeout_seconds,
+        )
+        self.desired_settings = deepcopy(normalized)
+        self.applied_settings = None
+        try:
+            if self.transport is not None:
+                self._set_output(False, context)
+                self._close_transport()
+            self._connect(normalized, context)
+            self._set_output(False, context)
+            self._write("*CLS", context)
+            self._configure(normalized, context)
+            self._set_output(False, context)
+            self._raise_if_instrument_error(context)
+        except Exception as exc:
+            cleanup = self._best_effort_output_off()
+            self._close_transport_silently()
+            if cleanup:
+                raise ModuleError(
+                    "2400 settings failed and output-off could not be confirmed: "
+                    f"{cleanup}",
+                    "K2400_SAFE_STATE_UNCONFIRMED",
+                    "apply_settings",
+                ) from exc
+            raise
+        self.applied_settings = deepcopy(normalized)
+        self.last_status = "Settings applied - output off"
+        status = self._status()
+        context.update_status(status)
+        return status
+
+    def begin_sequence(
+        self,
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """Run 开始时确认配置仍一致且输出关闭。"""
+
+        settings = self._require_applied()
+        self._set_output(False, context)
+        self._verify_configuration(settings, context)
+        self.sequence_active = True
+        self.last_status = "Sequence ready - output off"
+        status = self._status()
+        context.update_status(status)
+        return status
+
+    def measure(self, context: ModuleOperationContext) -> None:
+        """执行一次有严格清理边界的源-等待-读数事务。"""
+
+        settings = self._require_ready()
+        output_off = bool(
+            settings["output_off_between_measurements"]
+        )
+        voltage = 0.0
+        current = 0.0
+        compliance = False
+        try:
+            context.checkpoint()
+            self._verify_configuration(settings, context)
+            self._set_output(True, context)
+            self._waiter(context, float(settings["settle_seconds"]))
+            voltage, current = self._read_voltage_current(context)
+            compliance = self._read_compliance(settings, context)
+            context.checkpoint()
+        except Exception as exc:
+            cleanup = self._best_effort_output_off()
+            self.sequence_active = False
+            if cleanup:
+                raise ModuleError(
+                    "2400 measurement was interrupted and output-off could not "
+                    f"be confirmed: {cleanup}",
+                    "K2400_SAFE_STATE_UNCONFIRMED",
+                    "measure",
+                ) from exc
+            raise
+
+        # 默认在正式行之前严格关闭。选择行间保持时，仍在每次读取后查询输出，确认
+        # 它确实处于有意的 ON 状态；Stop/Error/completed/Disable 始终走关闭路径。
+        try:
+            if output_off:
+                self._set_output(False, context)
+            elif not self._query_switch("OUTP?", context):
+                raise ModuleError(
+                    "2400 output turned off unexpectedly while row-boundary "
+                    "retention was enabled",
+                    "K2400_OUTPUT_MISMATCH",
+                    "OUTP?",
+                )
+        except Exception as exc:
+            cleanup = self._best_effort_output_off()
+            self.sequence_active = False
+            if cleanup:
+                raise ModuleError(
+                    "2400 reading completed but a defined output state could "
+                    f"not be confirmed: {cleanup}",
+                    "K2400_SAFE_STATE_UNCONFIRMED",
+                    "measure",
+                ) from exc
+            raise
+        status_code, issue = self._classify_reading(
+            voltage,
+            current,
+            compliance,
+        )
+        row: dict[str, Any] = {"StatusCode": status_code}
+        if status_code == STATUS_CODE_NORMAL:
+            resistance = voltage / current
+            row.update(
+                {
+                    "Resistance": resistance,
+                    "Voltage": voltage,
+                    "Current": current,
+                }
+            )
+            context.resolve_warning("K2400_READING_WARNING")
+            self.last_resistance = resistance
+            self.last_voltage = voltage
+            self.last_current = current
+            self.last_status = (
+                "Normal - output off"
+                if output_off
+                else "Normal - output retained"
+            )
+        else:
+            context.warning(
+                f"Keithley 2400 reading is not valid: {issue}",
+                "K2400_READING_WARNING",
+            )
+            self.last_resistance = None
+            self.last_voltage = None
+            self.last_current = None
+            self.last_status = (
+                f"Data warning ({status_code}) - "
+                + ("output off" if output_off else "output retained")
+            )
+        context.emit_row(row)
+        context.update_status(self._status())
+
+    def end_sequence(
+        self,
+        reason: str,
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """completed、stopped 和 error 都关闭并确认输出。"""
+
+        self.sequence_active = False
+        self._set_output(False, context)
+        self.last_status = f"Sequence {reason} - output off"
+        status = self._status()
+        context.update_status(status)
+        return status
+
+    def abort(
+        self,
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """Disable/退出时确认输出关闭并释放 VISA session；可重复调用。"""
+
+        self.sequence_active = False
+        failure: Exception | None = None
+        try:
+            if self.transport is not None:
+                self._set_output(False, context)
+        except Exception as exc:
+            failure = exc
+        finally:
+            try:
+                self._close_transport()
+            except Exception as exc:
+                failure = failure or exc
+            self.applied_settings = None
+        self.last_status = (
+            "Disabled - safe state unconfirmed" if failure else "Disabled"
+        )
+        status = self._status()
+        context.update_status(status)
+        if failure is not None:
+            if isinstance(failure, ModuleError):
+                raise failure
+            raise ModuleError(
+                f"2400 shutdown failed: {type(failure).__name__}: {failure}",
+                "K2400_SHUTDOWN_FAILED",
+            ) from failure
+        return status
+
+    def read_status(
+        self,
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """只读查询当前输出和基本配置，不隐式连接或 Apply。"""
+
+        if self.transport is not None:
+            output = self._query_switch("OUTP?", context)
+            source = self._clean_token(self._query("SOUR:FUNC?", context))
+            sense = self._query_switch("SYST:RSEN?", context)
+            self.last_status = (
+                f"Connected / {source} / "
+                f"{'4-wire' if sense else '2-wire'} / "
+                f"output {'on' if output else 'off'}"
+            )
+        status = self._status()
+        context.update_status(status)
+        return status
+
+    def manual_action(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> Mapping[str, Any]:
+        """处理 Idle 时的资源刷新、只读连接测试和显式 Safe Off。"""
+
+        if action == "refresh_resources":
+            try:
+                self.available_resources = tuple(
+                    sorted(set(self._resource_lister()), key=str.casefold)
+                )
+            except Exception as exc:
+                raise ModuleWarning(
+                    "GPIB resource discovery failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    "K2400_RESOURCE_DISCOVERY_FAILED",
+                ) from exc
+            context.resolve_warning("K2400_RESOURCE_DISCOVERY_FAILED")
+        elif action == "test_connection":
+            candidate = payload.get("settings", self.desired_settings)
+            if not isinstance(candidate, Mapping):
+                raise ModuleError(
+                    "Test Connection settings must be a mapping",
+                    "K2400_INVALID_SETTINGS",
+                    "settings",
+                )
+            settings = self._normalized_settings(
+                candidate,
+                require_resource=True,
+                operation_timeout_seconds=context.operation_timeout_seconds,
+            )
+            self._test_connection(settings, context)
+            self.last_status = "Connection test passed (read-only)"
+        elif action == "safe_off":
+            if self.transport is not None:
+                self._set_output(False, context)
+            self.last_status = "Output off"
+        else:
+            return super().manual_action(action, payload, context) or {}
+        status = self._status()
+        context.update_status(status)
+        return status
+
+    def _connect(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> None:
+        resource = str(settings["resource"])
+        timeout = float(settings["io_timeout_seconds"])
+        try:
+            transport = self._transport_factory(resource, timeout)
+        except Exception as exc:
+            raise ModuleError(
+                f"Could not open 2400 at {resource}: "
+                f"{type(exc).__name__}: {exc}",
+                "K2400_CONNECTION_FAILED",
+                resource,
+            ) from exc
+        self.transport = transport
+        try:
+            identity = self._query("*IDN?", context)
+            self._validate_identity(identity)
+        except Exception:
+            self._close_transport_silently()
+            raise
+        self.identity = identity.strip()
+
+    def _test_connection(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> None:
+        resource = str(settings["resource"])
+        timeout = float(settings["io_timeout_seconds"])
+        # 已有同一会话时只做身份查询，避免 VISA implementation 拒绝第二个独占 session。
+        if self.transport is not None and self.applied_settings is not None:
+            if str(self.applied_settings["resource"]) == resource:
+                self._validate_identity(self._query("*IDN?", context))
+                return
+        try:
+            temporary = self._transport_factory(resource, timeout)
+        except Exception as exc:
+            raise ModuleError(
+                f"Could not open 2400 at {resource}: "
+                f"{type(exc).__name__}: {exc}",
+                "K2400_CONNECTION_FAILED",
+                resource,
+            ) from exc
+        try:
+            context.checkpoint()
+            self._validate_identity(str(temporary.query("*IDN?")).strip())
+            context.checkpoint()
+        except ModuleError:
+            raise
+        except Exception as exc:
+            raise ModuleError(
+                f"2400 identity query failed: {type(exc).__name__}: {exc}",
+                "K2400_IO_FAILED",
+                "*IDN?",
+            ) from exc
+        finally:
+            temporary.close()
+
+    @staticmethod
+    def _validate_identity(identity: str) -> None:
+        normalized = " ".join(identity.upper().replace(",", " ").split())
+        if "KEITHLEY" not in normalized or not re.search(
+            r"\bMODEL\s*2400\b|\b2400\b",
+            normalized,
+        ):
+            raise ModuleError(
+                f"Expected Keithley Model 2400, received {identity!r}",
+                "K2400_IDENTITY_MISMATCH",
+                "*IDN?",
+            )
+
+    def _configure(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> None:
+        mode = str(settings["source_mode"])
+        # 电阻必须由同一次触发得到的实际 V/I 计算。2400 手册明确规定 CONC OFF 时
+        # 只能启用一个测量函数，因此这里固定同时启用电压和电流；否则 FORM:ELEM 虽然
+        # 列出两个字段，未启用的那一项也不代表一次有效测量。
+        self._write("SENS:FUNC:CONC ON", context)
+        self._write("SENS:FUNC:OFF:ALL", context)
+        self._write("SENS:FUNC:ON 'VOLT:DC','CURR:DC'", context)
+        if mode == SOURCE_CURRENT:
+            self._write("SOUR:FUNC CURR", context)
+            self._write("SOUR:CURR:MODE FIX", context)
+            self._write("SOUR:CURR:RANG:AUTO ON", context)
+            self._write(
+                f"SOUR:CURR:LEV {self._scpi(settings['source_current'])}",
+                context,
+            )
+            self._write(
+                "SENS:VOLT:PROT "
+                f"{self._scpi(settings['voltage_compliance'])}",
+                context,
+            )
+            self._write("SENS:VOLT:RANG:AUTO ON", context)
+        else:
+            self._write("SOUR:FUNC VOLT", context)
+            self._write("SOUR:VOLT:MODE FIX", context)
+            self._write("SOUR:VOLT:RANG:AUTO ON", context)
+            self._write(
+                f"SOUR:VOLT:LEV {self._scpi(settings['source_voltage'])}",
+                context,
+            )
+            self._write(
+                "SENS:CURR:PROT "
+                f"{self._scpi(settings['current_compliance'])}",
+                context,
+            )
+            self._write("SENS:CURR:RANG:AUTO ON", context)
+        # 两个实际测量函数使用相同积分时间，避免一项仍沿用前面板旧值。
+        self._write(
+            f"SENS:VOLT:NPLC {self._scpi(settings['nplc'])}",
+            context,
+        )
+        self._write(
+            f"SENS:CURR:NPLC {self._scpi(settings['nplc'])}",
+            context,
+        )
+        self._write(
+            "SYST:RSEN ON"
+            if settings["sense_mode"] == SENSE_4WIRE
+            else "SYST:RSEN OFF",
+            context,
+        )
+        self._write("FORM:DATA ASC", context)
+        self._write("FORM:ELEM VOLT,CURR", context)
+        self._verify_configuration(settings, context)
+
+    def _verify_configuration(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> None:
+        mode = str(settings["source_mode"])
+        actual_source = self._clean_token(self._query("SOUR:FUNC?", context))
+        expected_source = "CURR" if mode == SOURCE_CURRENT else "VOLT"
+        if not actual_source.startswith(expected_source):
+            self._settings_mismatch("source_mode", expected_source, actual_source)
+
+        if mode == SOURCE_CURRENT:
+            self._expect_number(
+                "SOUR:CURR:LEV?",
+                float(settings["source_current"]),
+                "source_current",
+                context,
+            )
+            self._expect_number(
+                "SENS:VOLT:PROT?",
+                float(settings["voltage_compliance"]),
+                "voltage_compliance",
+                context,
+            )
+        else:
+            self._expect_number(
+                "SOUR:VOLT:LEV?",
+                float(settings["source_voltage"]),
+                "source_voltage",
+                context,
+            )
+            self._expect_number(
+                "SENS:CURR:PROT?",
+                float(settings["current_compliance"]),
+                "current_compliance",
+                context,
+            )
+        if not self._query_switch("SENS:FUNC:CONC?", context):
+            self._settings_mismatch(
+                "concurrent_measurements",
+                True,
+                False,
+            )
+        actual_functions = {
+            self._clean_token(item).split(":", 1)[0]
+            for item in self._query("SENS:FUNC:ON?", context).split(",")
+            if item.strip()
+        }
+        if actual_functions != {"VOLT", "CURR"}:
+            self._settings_mismatch(
+                "sense_functions",
+                "VOLT,CURR",
+                ",".join(sorted(actual_functions)),
+            )
+        for command, field in (
+            ("SENS:VOLT:NPLC?", "voltage_nplc"),
+            ("SENS:CURR:NPLC?", "current_nplc"),
+        ):
+            self._expect_number(
+                command,
+                float(settings["nplc"]),
+                field,
+                context,
+            )
+        remote = self._query_switch("SYST:RSEN?", context)
+        expected_remote = settings["sense_mode"] == SENSE_4WIRE
+        if remote != expected_remote:
+            self._settings_mismatch("sense_mode", expected_remote, remote)
+        elements = {
+            self._clean_token(item)
+            for item in self._query("FORM:ELEM?", context).split(",")
+        }
+        if elements != {"VOLT", "CURR"}:
+            self._settings_mismatch(
+                "data_elements",
+                "VOLT,CURR",
+                ",".join(sorted(elements)),
+            )
+
+    def _read_voltage_current(
+        self,
+        context: ModuleOperationContext,
+    ) -> tuple[float, float]:
+        reply = self._query("READ?", context)
+        parts = [item.strip() for item in reply.split(",") if item.strip()]
+        if len(parts) != 2:
+            raise ModuleError(
+                f"2400 READ? returned {reply!r}; expected VOLT,CURR",
+                "K2400_INVALID_RESPONSE",
+                "READ?",
+            )
+        try:
+            return float(parts[0]), float(parts[1])
+        except ValueError as exc:
+            raise ModuleError(
+                f"2400 READ? returned non-numeric data: {reply!r}",
+                "K2400_INVALID_RESPONSE",
+                "READ?",
+            ) from exc
+
+    def _read_compliance(
+        self,
+        settings: Mapping[str, Any],
+        context: ModuleOperationContext,
+    ) -> bool:
+        command = (
+            "SENS:VOLT:PROT:TRIP?"
+            if settings["source_mode"] == SOURCE_CURRENT
+            else "SENS:CURR:PROT:TRIP?"
+        )
+        return self._query_switch(command, context)
+
+    @staticmethod
+    def _classify_reading(
+        voltage: float,
+        current: float,
+        compliance: bool,
+    ) -> tuple[int, str]:
+        if compliance:
+            return STATUS_CODE_COMPLIANCE, "source reached compliance"
+        if (
+            not math.isfinite(voltage)
+            or not math.isfinite(current)
+            or abs(voltage) >= _READING_SENTINEL
+            or abs(current) >= _READING_SENTINEL
+        ):
+            return STATUS_CODE_OVER_RANGE, "instrument returned overrange data"
+        if abs(current) <= 1.0e-30:
+            return STATUS_CODE_INVALID_READING, "measured current is zero"
+        resistance = voltage / current
+        if not math.isfinite(resistance) or abs(resistance) >= _READING_SENTINEL:
+            return STATUS_CODE_OVER_RANGE, "calculated resistance is overrange"
+        return STATUS_CODE_NORMAL, ""
+
+    def _set_output(
+        self,
+        enabled: bool,
+        context: ModuleOperationContext,
+    ) -> None:
+        self._write("OUTP ON" if enabled else "OUTP OFF", context)
+        actual = self._query_switch("OUTP?", context)
+        if actual != enabled:
+            raise ModuleError(
+                "2400 output readback did not match the requested state",
+                "K2400_OUTPUT_MISMATCH",
+                "OUTP?",
+            )
+
+    def _best_effort_output_off(self) -> str | None:
+        """取消路径绕过 checkpoint 直接请求关闭，避免 Stop 阻止清理命令。"""
+
+        if self.transport is None:
+            return None
+        try:
+            self.transport.write("OUTP OFF")
+            actual = self._parse_switch(self.transport.query("OUTP?"), "OUTP?")
+            if actual:
+                return "OUTP? still reports ON"
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+        return None
+
+    def _raise_if_instrument_error(
+        self,
+        context: ModuleOperationContext,
+    ) -> None:
+        reply = self._query("SYST:ERR?", context)
+        matched = re.match(r"\s*([+-]?\d+)", reply)
+        if matched is None:
+            raise ModuleError(
+                f"2400 returned an invalid error-queue response: {reply!r}",
+                "K2400_INVALID_RESPONSE",
+                "SYST:ERR?",
+            )
+        if int(matched.group(1)) != 0:
+            raise ModuleError(
+                f"2400 reported an instrument error: {reply}",
+                "K2400_INSTRUMENT_ERROR",
+                "SYST:ERR?",
+            )
+
+    def _write(self, command: str, context: ModuleOperationContext) -> None:
+        transport = self._require_transport()
+        context.checkpoint()
+        try:
+            transport.write(command)
+        except Exception as exc:
+            raise ModuleError(
+                f"2400 write failed for {command!r}: "
+                f"{type(exc).__name__}: {exc}",
+                "K2400_IO_FAILED",
+                command,
+            ) from exc
+        context.checkpoint()
+
+    def _query(self, command: str, context: ModuleOperationContext) -> str:
+        transport = self._require_transport()
+        context.checkpoint()
+        try:
+            reply = str(transport.query(command)).strip()
+        except Exception as exc:
+            raise ModuleError(
+                f"2400 query failed for {command!r}: "
+                f"{type(exc).__name__}: {exc}",
+                "K2400_IO_FAILED",
+                command,
+            ) from exc
+        context.checkpoint()
+        if not reply:
+            raise ModuleError(
+                f"2400 returned an empty response for {command!r}",
+                "K2400_INVALID_RESPONSE",
+                command,
+            )
+        return reply
+
+    def _query_switch(
+        self,
+        command: str,
+        context: ModuleOperationContext,
+    ) -> bool:
+        return self._parse_switch(self._query(command, context), command)
+
+    @staticmethod
+    def _parse_switch(value: object, command: str) -> bool:
+        token = str(value).strip().strip('"').upper()
+        if token in {"1", "ON"}:
+            return True
+        if token in {"0", "OFF"}:
+            return False
+        raise ModuleError(
+            f"2400 returned invalid switch state {value!r}",
+            "K2400_INVALID_RESPONSE",
+            command,
+        )
+
+    def _expect_number(
+        self,
+        command: str,
+        expected: float,
+        field: str,
+        context: ModuleOperationContext,
+    ) -> None:
+        reply = self._query(command, context)
+        try:
+            actual = float(reply)
+        except ValueError as exc:
+            raise ModuleError(
+                f"2400 returned non-numeric readback {reply!r}",
+                "K2400_INVALID_RESPONSE",
+                command,
+            ) from exc
+        tolerance = max(1.0e-12, abs(expected) * 1.0e-6)
+        if not math.isfinite(actual) or abs(actual - expected) > tolerance:
+            self._settings_mismatch(field, expected, actual)
+
+    @staticmethod
+    def _settings_mismatch(field: str, expected: object, actual: object) -> None:
+        raise ModuleError(
+            f"2400 {field} readback mismatch: expected {expected!r}, "
+            f"received {actual!r}",
+            "K2400_SETTINGS_MISMATCH",
+            field,
+        )
+
+    @staticmethod
+    def _clean_token(value: object) -> str:
+        return str(value).strip().strip('"').strip("'").upper()
+
+    @staticmethod
+    def _scpi(value: object) -> str:
+        return f"{float(value):.12g}"
+
+    def _require_transport(self) -> InstrumentTransport:
+        if self.transport is None:
+            raise ModuleError(
+                "Keithley 2400 is not connected; Apply Settings first",
+                "K2400_NOT_CONNECTED",
+            )
+        return self.transport
+
+    def _require_applied(self) -> dict[str, Any]:
+        if self.applied_settings is None or self.transport is None:
+            raise ModuleError(
+                "Keithley 2400 settings have not been applied",
+                "K2400_NOT_APPLIED",
+            )
+        return deepcopy(self.applied_settings)
+
+    def _require_ready(self) -> dict[str, Any]:
+        settings = self._require_applied()
+        if not self.sequence_active:
+            raise ModuleError(
+                "Keithley 2400 sequence has not begun",
+                "K2400_SEQUENCE_NOT_ACTIVE",
+            )
+        return settings
+
+    def _close_transport(self) -> None:
+        transport = self.transport
+        self.transport = None
+        self.identity = ""
+        if transport is not None:
+            transport.close()
+
+    def _close_transport_silently(self) -> None:
+        try:
+            self._close_transport()
+        except Exception:
+            pass
+
+    def _status(self) -> dict[str, Any]:
+        return {
+            "Connection": "Connected" if self.transport is not None else "Disconnected",
+            "Resource": self.desired_settings.get("resource") or "Not selected",
+            "Identity": self.identity or "Not queried",
+            "Applied Settings": "Applied" if self.applied_settings is not None else "Not applied",
+            "Sequence": "Running" if self.sequence_active else "Idle",
+            "Output": (
+                "See Last Status" if self.transport is not None else "Unknown"
+            ),
+            "Last Status": self.last_status,
+            "Last Resistance (Ohm)": (
+                self.last_resistance if self.last_resistance is not None else "-"
+            ),
+            "Last Voltage (V)": (
+                self.last_voltage if self.last_voltage is not None else "-"
+            ),
+            "Last Current (A)": (
+                self.last_current if self.last_current is not None else "-"
+            ),
+            "Available GPIB Resources": list(self.available_resources),
+        }
+
+    def _normalized_settings(
+        self,
+        supplied: Mapping[str, Any],
+        *,
+        require_resource: bool,
+        operation_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        if not isinstance(supplied, Mapping):
+            raise ModuleError(
+                "Keithley 2400 settings must be a mapping",
+                "K2400_INVALID_SETTINGS",
+                "settings",
+            )
+        merged = default_settings()
+        for key in merged:
+            if key in supplied:
+                merged[key] = supplied[key]
+
+        resource = str(merged["resource"]).strip()
+        if require_resource and not resource:
+            raise ModuleError(
+                "Select or enter a GPIB VISA resource",
+                "K2400_INVALID_SETTINGS",
+                "resource",
+            )
+        if "\n" in resource or "\r" in resource:
+            raise ModuleError(
+                "VISA resource must be a single line",
+                "K2400_INVALID_SETTINGS",
+                "resource",
+            )
+        mode = str(merged["source_mode"]).strip().casefold()
+        if mode not in {SOURCE_CURRENT, SOURCE_VOLTAGE}:
+            raise ModuleError(
+                "source_mode must be current or voltage",
+                "K2400_INVALID_SETTINGS",
+                "source_mode",
+            )
+        sense = str(merged["sense_mode"]).strip().casefold()
+        if sense not in {SENSE_2WIRE, SENSE_4WIRE}:
+            raise ModuleError(
+                "sense_mode must be 2wire or 4wire",
+                "K2400_INVALID_SETTINGS",
+                "sense_mode",
+            )
+
+        source_current = self._quantity(
+            merged["source_current"], "A", "source_current"
+        )
+        voltage_compliance = self._quantity(
+            merged["voltage_compliance"], "V", "voltage_compliance"
+        )
+        source_voltage = self._quantity(
+            merged["source_voltage"], "V", "source_voltage"
+        )
+        current_compliance = self._quantity(
+            merged["current_compliance"], "A", "current_compliance"
+        )
+        if abs(source_current) > DEVICE_MAX_CURRENT_A:
+            self._invalid_range(
+                "source_current", -DEVICE_MAX_CURRENT_A, DEVICE_MAX_CURRENT_A
+            )
+        if abs(source_voltage) > DEVICE_MAX_VOLTAGE_V:
+            self._invalid_range(
+                "source_voltage", -DEVICE_MAX_VOLTAGE_V, DEVICE_MAX_VOLTAGE_V
+            )
+        if not 0 < voltage_compliance <= DEVICE_MAX_VOLTAGE_V:
+            self._invalid_range(
+                "voltage_compliance", 0, DEVICE_MAX_VOLTAGE_V
+            )
+        if not 0 < current_compliance <= DEVICE_MAX_CURRENT_A:
+            self._invalid_range(
+                "current_compliance", 0, DEVICE_MAX_CURRENT_A
+            )
+
+        io_timeout = self._finite_number(
+            merged["io_timeout_seconds"], "io_timeout_seconds"
+        )
+        nplc = self._finite_number(merged["nplc"], "nplc")
+        settle = self._finite_number(
+            merged["settle_seconds"], "settle_seconds"
+        )
+        if not 0.1 <= io_timeout <= 30.0:
+            self._invalid_range("io_timeout_seconds", 0.1, 30.0)
+        if not 0.01 <= nplc <= 10.0:
+            self._invalid_range("nplc", 0.01, 10.0)
+        if not 0.0 <= settle <= 3600.0:
+            self._invalid_range("settle_seconds", 0.0, 3600.0)
+        output_off = merged["output_off_between_measurements"]
+        if not isinstance(output_off, bool):
+            raise ModuleError(
+                "output_off_between_measurements must be true or false",
+                "K2400_INVALID_SETTINGS",
+                "output_off_between_measurements",
+            )
+        operation_timeout = self._finite_number(
+            operation_timeout_seconds,
+            "operation_timeout_seconds",
+        )
+        # 最坏路径逐项计数：Measure 包含 9 项配置读回、输出 ON/OFF 读回、READ 和
+        # compliance；Apply 包含连接识别、完整配置/读回、两次输出关闭和错误队列。
+        # 每次 I/O 都按耗尽 VISA timeout 计算，避免放行注定超过核心 deadline 的设置。
+        measure_estimate = (
+            settle + io_timeout * 15.0 + _MEASURE_CLEANUP_RESERVE_SECONDS
+        )
+        apply_estimate = io_timeout * 30.0 + _MEASURE_CLEANUP_RESERVE_SECONDS
+        estimated = max(measure_estimate, apply_estimate)
+        if estimated >= operation_timeout:
+            raise ModuleError(
+                "Keithley 2400 settle/I/O settings may exceed the core operation "
+                f"timeout ({estimated:.3g} s >= {operation_timeout:.3g} s)",
+                "K2400_INVALID_SETTINGS",
+                "operation_timeout_seconds",
+            )
+        return {
+            "resource": resource,
+            "io_timeout_seconds": io_timeout,
+            "source_mode": mode,
+            "source_current": source_current,
+            "voltage_compliance": voltage_compliance,
+            "source_voltage": source_voltage,
+            "current_compliance": current_compliance,
+            "sense_mode": sense,
+            "nplc": nplc,
+            "settle_seconds": settle,
+            "output_off_between_measurements": output_off,
+        }
+
+    @staticmethod
+    def _quantity(value: object, unit: str, field: str) -> float:
+        try:
+            return parse_quantity(value, expected_unit=unit)
+        except ValueError as exc:
+            raise ModuleError(
+                f"{field}: {exc}",
+                "K2400_INVALID_SETTINGS",
+                field,
+            ) from exc
+
+    @staticmethod
+    def _finite_number(value: object, field: str) -> float:
+        if isinstance(value, bool):
+            raise ModuleError(
+                f"{field} must be numeric",
+                "K2400_INVALID_SETTINGS",
+                field,
+            )
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(
+                f"{field} must be numeric",
+                "K2400_INVALID_SETTINGS",
+                field,
+            ) from exc
+        if not math.isfinite(result):
+            raise ModuleError(
+                f"{field} must be finite",
+                "K2400_INVALID_SETTINGS",
+                field,
+            )
+        return result
+
+    @staticmethod
+    def _invalid_range(field: str, minimum: float, maximum: float) -> None:
+        raise ModuleError(
+            f"{field} must be in ({minimum:g}, {maximum:g}] or the signed "
+            "equivalent where applicable",
+            "K2400_INVALID_SETTINGS",
+            field,
+        )
+
+
+__all__ = ["Keithley2400Backend", "PyVisaTransport"]
