@@ -75,10 +75,13 @@ system Errors and stop the SEQ. `Test Connections` always validates the settings
 currently shown in the module window; it does not silently use an older saved
 or Applied resource address.
 
-The initial current is zero and Apply rejects a zero reversal span. The default
-software limits are 100 uA and 10 V; they are conservative placeholders, not a
-hardware safety certification. This Beta version has protocol-state tests but has
-not been validated with the real instruments, switch card, DUT, cabling, or GPIB
+The initial current is zero and Apply rejects a zero reversal span. There is no
+user-configurable per-channel timeout and no module software current/compliance
+cap. Long `*OPC?` waits share the core's total Measure-operation deadline, with
+time reserved for safe cleanup. Current and compliance values are still checked
+against the 6221's documented command ranges; those device limits are not a DUT
+safety certification. This Beta version has protocol-state tests but has not
+been validated with the real instruments, switch card, DUT, cabling, or GPIB
 controller.
 
 The 2182A digital filter type is fixed to Moving because that is the filter type

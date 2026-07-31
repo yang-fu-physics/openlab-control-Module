@@ -15,7 +15,7 @@
 - 共享模式只在 ``begin_sequence`` ARM 一次，ARM 后等待至少 3 秒并查询确认；
 - 独立模式每次切换前 Abort/Clear，切换后重新配置和 ARM；
 - 3706A 的任何运行期通信或回读错误立即中止，不自动重发切换/触发命令；
-- compliance abort 和 cold switching 固定开启，通道设置不能绕过模块级上限；
+- compliance abort 和 cold switching 固定开启，通道设置必须落在仪表合法命令范围；
 - Stop/Error/Disable/SEQ 完成均 Abort、清零、关闭输出并打开 3706A 全部触点。
 
 本模块仍是 Beta。自动化测试只能验证命令状态机，不能证明真实开关卡接线、6221 实际
@@ -28,6 +28,7 @@ import importlib
 import math
 import re
 import statistics
+import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
@@ -76,6 +77,10 @@ class InstrumentTransport(Protocol):
 TransportFactory = Callable[[str, float], InstrumentTransport]
 ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleOperationContext, float], None]
+
+# 长时间 ``*OPC?`` 不再拥有可配置的单通道超时，而是共享本次 Measure 的核心总
+# 预算。提前预留两秒，使通信错误仍有机会在核心强制终止 worker 前执行安全关闭。
+_OPERATION_CLEANUP_RESERVE_SECONDS = 2.0
 
 
 class PyVisaTransport:
@@ -334,8 +339,16 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         打开触点之间的时间；协作 Stop 在 checkpoint 抛出的异常也走同一路径。
         """
 
+        operation_deadline = (
+            time.monotonic()
+            + float(context.operation_timeout_seconds)
+            - _OPERATION_CLEANUP_RESERVE_SECONDS
+        )
         try:
-            self._measure_impl(context)
+            self._measure_impl(
+                context,
+                operation_deadline,
+            )
         except Exception:
             self.sequence_active = False
             self.last_status = (
@@ -347,6 +360,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
     def _measure_impl(
         self,
         context: ModuleOperationContext,
+        operation_deadline: float,
     ) -> None:
         """实现正常测量路径，并逐通道产生一行 DAT 与 rawdata。"""
 
@@ -380,6 +394,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 self._trigger_and_read(
                     selected,
                     context,
+                    operation_deadline,
                 )
             )
             current = self._effective_current(selected)
@@ -1054,6 +1069,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self,
         settings: Mapping[str, Any],
         context: ModuleOperationContext,
+        operation_deadline: float,
     ) -> tuple[
         tuple[float, ...],
         tuple[str, ...],
@@ -1063,12 +1079,22 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
         self._verify_armed(context)
         self._write_6221("INIT:IMM", context)
+        completion_timeout = (
+            operation_deadline - time.monotonic()
+        )
+        if (
+            not math.isfinite(completion_timeout)
+            or completion_timeout <= 0
+        ):
+            raise ModuleError(
+                "The core Measure operation has no time left "
+                "for Delta acquisition",
+                "K6221_3706_MEASURE_TIMEOUT_UNSAFE",
+            )
         completion = self._query_6221(
             "*OPC?",
             context,
-            timeout_seconds=float(
-                settings["measurement_timeout_seconds"]
-            ),
+            timeout_seconds=completion_timeout,
         )
         if completion.strip() not in {"1", "+1"}:
             raise ModuleError(
@@ -1871,59 +1897,6 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             300.0,
             "switch_settle_seconds",
         )
-        try:
-            current_limit = abs(
-                parse_quantity(
-                    raw.get(
-                        "absolute_current_limit",
-                        defaults[
-                            "absolute_current_limit"
-                        ],
-                    ),
-                    expected_unit="A",
-                )
-            )
-            compliance_limit = abs(
-                parse_quantity(
-                    raw.get(
-                        "absolute_compliance_limit",
-                        defaults[
-                            "absolute_compliance_limit"
-                        ],
-                    ),
-                    expected_unit="V",
-                )
-            )
-        except ValueError as exc:
-            raise ModuleError(
-                f"Invalid module safety limit: {exc}",
-                "K6221_3706_INVALID_SETTINGS",
-                "safety_limits",
-            ) from exc
-        if not 0 < current_limit <= DEVICE_CURRENT_LIMIT_A:
-            raise ModuleError(
-                "absolute_current_limit must be above zero "
-                f"and at most {DEVICE_CURRENT_LIMIT_A:g} A",
-                "K6221_3706_INVALID_SETTINGS",
-                "absolute_current_limit",
-            )
-        if not (
-            DEVICE_COMPLIANCE_MIN_V
-            <= compliance_limit
-            <= DEVICE_COMPLIANCE_MAX_V
-        ):
-            raise ModuleError(
-                "absolute_compliance_limit must be from "
-                f"{DEVICE_COMPLIANCE_MIN_V:g} to "
-                f"{DEVICE_COMPLIANCE_MAX_V:g} V",
-                "K6221_3706_INVALID_SETTINGS",
-                "absolute_compliance_limit",
-            )
-        result["absolute_current_limit"] = current_limit
-        result["absolute_compliance_limit"] = (
-            compliance_limit
-        )
-
         raw_channels = raw.get(
             "channels",
             defaults["channels"],
@@ -2020,11 +1993,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 ]
             )
             for selected in active_settings:
-                self._validate_active_delta(
-                    selected,
-                    current_limit,
-                    compliance_limit,
-                )
+                self._validate_active_delta(selected)
             self._validate_measure_duration(
                 result,
                 enabled,
@@ -2197,24 +2166,11 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     "digital_filter_window_percent",
                 )
             ),
-            "measurement_timeout_seconds": self._number(
-                raw.get(
-                    "measurement_timeout_seconds",
-                    defaults[
-                        "measurement_timeout_seconds"
-                    ],
-                ),
-                1.0,
-                3600.0,
-                f"{prefix}.measurement_timeout_seconds",
-            ),
         }
 
     @staticmethod
     def _validate_active_delta(
         settings: Mapping[str, Any],
-        current_limit: float,
-        compliance_limit: float,
     ) -> None:
         high = float(settings["high_current"])
         low = float(settings["low_current"])
@@ -2224,20 +2180,6 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "current and negative Low current",
                 "K6221_3706_INVALID_SETTINGS",
                 "delta_current",
-            )
-        if high > current_limit or abs(low) > current_limit:
-            raise ModuleError(
-                "Delta current exceeds the module absolute "
-                "current limit",
-                "K6221_3706_SAFETY_LIMIT_EXCEEDED",
-                "absolute_current_limit",
-            )
-        if float(settings["compliance"]) > compliance_limit:
-            raise ModuleError(
-                "Voltage compliance exceeds the module absolute "
-                "compliance limit",
-                "K6221_3706_SAFETY_LIMIT_EXCEEDED",
-                "absolute_compliance_limit",
             )
         current = Keithley6221Delta3706ABackend._effective_current(
             settings
@@ -2269,32 +2211,6 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         enabled: list[str],
         operation_timeout_seconds: float,
     ) -> None:
-        active = (
-            [settings["shared"]]
-            if settings["mode"] == MODE_SHARED
-            else [
-                settings["independent"][key]
-                for key in enabled
-            ]
-        )
-        for selected in active:
-            estimate = self._estimated_channel_seconds(
-                selected
-            )
-            if estimate > (
-                float(
-                    selected[
-                        "measurement_timeout_seconds"
-                    ]
-                )
-                - 1.0
-            ):
-                raise ModuleError(
-                    f"Estimated Delta acquisition time "
-                    f"{estimate:.1f} s does not fit its "
-                    "single-channel timeout",
-                    "K6221_3706_MEASURE_TIMEOUT_UNSAFE",
-                )
         # operation_timeout_seconds 是每个生命周期调用各自的上限。共享模式的唯一
         # ARM 位于 begin_sequence，不能再次计入 Measure；独立模式则每个通道都在
         # Measure 内 ARM。Begin 与 Measure 必须分别证明能够在同一个调用上限内完成。
@@ -2305,7 +2221,8 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         )
         available = max(
             0.0,
-            operation_timeout_seconds - 2.0,
+            operation_timeout_seconds
+            - _OPERATION_CLEANUP_RESERVE_SECONDS,
         )
         if (
             not math.isfinite(operation_timeout_seconds)
@@ -2328,12 +2245,10 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             else ARM_SETTLE_SECONDS * len(enabled)
         )
         measurement_total = sum(
-            float(
-                (
-                    settings["shared"]
-                    if settings["mode"] == MODE_SHARED
-                    else settings["independent"][key]
-                )["measurement_timeout_seconds"]
+            self._estimated_channel_seconds(
+                settings["shared"]
+                if settings["mode"] == MODE_SHARED
+                else settings["independent"][key]
             )
             for key in enabled
         )
@@ -2356,7 +2271,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 f"Worst-case Measure time {worst_case:.1f} s "
                 "does not fit the core module operation timeout "
                 f"{operation_timeout_seconds:.1f} s; shorten "
-                "timeouts, disable channels, or increase "
+                "Delta count/delay, disable channels, or increase "
                 "[modules] operation_timeout_seconds and restart",
                 "K6221_3706_MEASURE_TIMEOUT_UNSAFE",
             )

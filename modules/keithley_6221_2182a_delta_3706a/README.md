@@ -116,12 +116,15 @@ resource address.
 
 ## Safety state and hardware validation
 
-The initial current is zero and Apply rejects a zero reversal span. The default
-software limits are 100 uA and 10 V. They are conservative placeholders, not a
-hardware safety certification. Apply, Stop, Error, completed SEQ, Disable, and
-application shutdown all request `SOUR:SWE:ABOR`, `SOUR:CLE`, then query
-`OUTP?` and `SOUR:CURR?`. When the 3706A is connected, they also open all slots
-and require an empty `channel.getclose("allslots")` result.
+The initial current is zero and Apply rejects a zero reversal span. There is no
+user-configurable per-channel timeout and no module software current/compliance
+cap. Long `*OPC?` waits share the core's total Measure-operation deadline, with
+time reserved for safe cleanup. Current and compliance values are still checked
+against the 6221's documented command ranges; those device limits are not a DUT
+safety certification. Apply, Stop, Error, completed SEQ, Disable, and application
+shutdown all request `SOUR:SWE:ABOR`, `SOUR:CLE`, then query `OUTP?` and
+`SOUR:CURR?`. When the 3706A is connected, they also open all slots and require
+an empty `channel.getclose("allslots")` result.
 
 If either instrument has stopped communicating, software cannot prove the
 physical output or relay state. Treat that as Safety Unconfirmed: inspect the

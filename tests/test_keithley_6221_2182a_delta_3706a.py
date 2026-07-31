@@ -79,6 +79,9 @@ class _FakeVisaState:
 
     def __init__(self) -> None:
         self.commands: list[tuple[str, str, str]] = []
+        self.query_timeouts: list[
+            tuple[str, float | None]
+        ] = []
         self.opened: list[tuple[str, float]] = []
         self.closed: list[str] = []
         self.failures: dict[tuple[str, str, str], int] = {}
@@ -254,7 +257,9 @@ class _Fake6221:
         command: str,
         timeout_seconds: float | None = None,
     ) -> str:
-        del timeout_seconds
+        self.state.query_timeouts.append(
+            (command, timeout_seconds)
+        )
         self.state.commands.append(
             (self.resource, "query", command)
         )
@@ -472,7 +477,6 @@ def _settings(
     settings = default_settings()
     settings["resource_6221"] = "GPIB0::12::INSTR"
     settings["resource_3706a"] = "GPIB0::7::INSTR"
-    settings["absolute_current_limit"] = "1m"
     settings["switch_settle_seconds"] = 0.0
     for index, channel in enumerate(
         settings["channels"].values(),
@@ -484,7 +488,6 @@ def _settings(
             "high_current": "10u",
             "low_current": "-10u",
             "count": 2,
-            "measurement_timeout_seconds": 20.0,
         }
     )
     for index in range(1, 5):
@@ -493,7 +496,6 @@ def _settings(
                 "high_current": f"{index * 10}u",
                 "low_current": f"-{index * 10}u",
                 "count": 2,
-                "measurement_timeout_seconds": 20.0,
             }
         )
     if independent:
@@ -746,9 +748,15 @@ class BackendTests(unittest.TestCase):
         state = _FakeVisaState()
         backend = self._backend(state)
         settings = _settings(channels=1)
+        # 旧版持久设置可以继续读取，但已删除的限制/超时键必须被忽略且不再输出。
+        settings["absolute_current_limit"] = "1n"
+        settings["absolute_compliance_limit"] = "100m"
+        settings["shared"][
+            "measurement_timeout_seconds"
+        ] = 1.0
 
-        # Measure 需要 20 + 5 秒；共享模式的 3 秒 ARM 属于 Begin，
-        # 不应重复加到 Measure。29 秒的每调用上限因此足够。
+        # 共享模式的 3 秒 ARM 只属于 Begin；Measure 使用设置推导出的采集时间，
+        # 不再读取或要求一个用户配置的单通道超时。29 秒的每调用上限足够。
         normalized = backend._normalized_settings(
             settings,
             require_6221=True,
@@ -758,6 +766,18 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(
             normalized["mode"],
             settings["mode"],
+        )
+        self.assertNotIn(
+            "absolute_current_limit",
+            normalized,
+        )
+        self.assertNotIn(
+            "absolute_compliance_limit",
+            normalized,
+        )
+        self.assertNotIn(
+            "measurement_timeout_seconds",
+            normalized["shared"],
         )
 
         with self.assertRaises(ModuleError) as captured:
@@ -770,6 +790,20 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(
             captured.exception.code,
             "K6221_3706_BEGIN_TIMEOUT_UNSAFE",
+        )
+
+        slow = _settings(channels=1)
+        slow["shared"]["delta_delay"] = "10"
+        with self.assertRaises(ModuleError) as captured:
+            backend._normalized_settings(
+                slow,
+                require_6221=True,
+                require_measurement=True,
+                operation_timeout_seconds=20.0,
+            )
+        self.assertEqual(
+            captured.exception.code,
+            "K6221_3706_MEASURE_TIMEOUT_UNSAFE",
         )
 
     def test_missing_3706a_falls_back_to_ch1_only(
@@ -837,6 +871,20 @@ class BackendTests(unittest.TestCase):
         backend.begin_sequence(context)
         self.assertTrue(state.armed)
         backend.measure(context)
+
+        completion_timeouts = [
+            timeout
+            for command, timeout in state.query_timeouts
+            if command == "*OPC?"
+        ]
+        self.assertEqual(len(completion_timeouts), 2)
+        self.assertTrue(
+            all(
+                timeout is not None
+                and 250.0 < timeout < 300.0
+                for timeout in completion_timeouts
+            )
+        )
 
         rows = [
             payload
@@ -1236,7 +1284,7 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
 
-    def test_zero_default_and_safety_limits_block_apply(
+    def test_zero_default_and_device_command_ranges_block_apply(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -1256,12 +1304,12 @@ class BackendTests(unittest.TestCase):
         )
 
         unsafe = _settings(channels=1)
-        unsafe["absolute_current_limit"] = "5u"
+        unsafe["shared"]["high_current"] = "200m"
         with self.assertRaises(ModuleError) as captured:
             backend.apply_settings(unsafe, context)
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_SAFETY_LIMIT_EXCEEDED",
+            "K6221_3706_INVALID_SETTINGS",
         )
 
 
@@ -1371,6 +1419,13 @@ class FrontendTests(unittest.TestCase):
         self.assertGreaterEqual(
             page.sizeHint().width(),
             1200,
+        )
+        current = frontend.settings()
+        self.assertNotIn("absolute_current_limit", current)
+        self.assertNotIn("absolute_compliance_limit", current)
+        self.assertNotIn(
+            "measurement_timeout_seconds",
+            current["shared"],
         )
         status_page.deleteLater()
         page.deleteLater()

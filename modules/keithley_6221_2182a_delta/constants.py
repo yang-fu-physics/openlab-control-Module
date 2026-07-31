@@ -1,8 +1,8 @@
-"""Keithley Delta 模块的协议常量和安全默认设置。
+"""Keithley Delta 模块的协议常量和无输出默认设置。
 
-默认设置不会产生非零电流。Enable 只发现资源并判断 7001 是否可用；Apply Settings
-也必须先通过后端的绝对电流与 compliance 上限检查。真实样品接入前仍需根据接线、
-热负载和允许功耗重新核对这些软件上限。
+默认设置不会产生非零电流。Enable 只发现资源并判断 7001 是否可用；模块不再维护
+用户可配置的软件电流或 compliance 上限，但仍会按仪表手册拒绝设备本身无法接受的
+命令范围。样品、接线和允许功耗的实验安全边界应在真实仪表上人工配置并核对。
 """
 
 from __future__ import annotations
@@ -66,7 +66,6 @@ def default_delta_settings() -> dict[str, Any]:
         "digital_filter_type": "moving",
         "digital_filter_count": 10,
         "digital_filter_window_percent": 0.01,
-        "measurement_timeout_seconds": 30.0,
     }
 
 
@@ -80,9 +79,6 @@ def default_settings() -> dict[str, Any]:
         "mode": MODE_SHARED,
         "io_timeout_seconds": 3.0,
         "switch_settle_seconds": 0.5,
-        # 未得到真实样品允许值前采用保守软件上限；后端不允许通道绕过。
-        "absolute_current_limit": "100u",
-        "absolute_compliance_limit": "10",
         "channels": {
             f"ch{index}": {
                 "enabled": index == 1,

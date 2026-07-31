@@ -270,46 +270,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         )
         layout.addWidget(operation)
 
-        safety = QGroupBox("Software Safety Limits", content)
-        safety_layout = QGridLayout(safety)
-        self.absolute_current_limit = _QuantityEdit("A")
-        self.absolute_compliance_limit = _QuantityEdit("V")
-        safety_layout.addWidget(
-            QLabel("Absolute |current| limit (A)"),
-            0,
-            0,
-        )
-        safety_layout.addWidget(
-            self.absolute_current_limit,
-            0,
-            1,
-        )
-        safety_layout.addWidget(
-            QLabel("Absolute compliance limit (V)"),
-            0,
-            2,
-        )
-        safety_layout.addWidget(
-            self.absolute_compliance_limit,
-            0,
-            3,
-        )
-        safety_note = QLabel(
-            "Compliance Abort and Cold Switching are always "
-            "ON. These software limits cannot be overridden "
-            "by a channel, but they do not replace DUT and "
-            "wiring safety review."
-        )
-        safety_note.setWordWrap(True)
-        safety_layout.addWidget(
-            safety_note,
-            1,
-            0,
-            1,
-            4,
-        )
-        layout.addWidget(safety)
-
         channels = QGroupBox(
             "Logical Channels",
             content,
@@ -430,21 +390,11 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         filter_window.setDecimals(3)
         filter_window.setSingleStep(0.01)
         filter_window.setSuffix(" %")
-        measurement_timeout = QDoubleSpinBox()
-        measurement_timeout.setRange(1.0, 3600.0)
-        measurement_timeout.setDecimals(1)
-        measurement_timeout.setSingleStep(1.0)
-        measurement_timeout.setSuffix(" s")
-
         left.addRow("High current (A)", high)
         left.addRow("Low current (A)", low)
         left.addRow("Voltage compliance (V)", compliance)
         left.addRow("Delta delay (s)", delay)
         left.addRow("Delta count", count)
-        left.addRow(
-            "Single-channel timeout",
-            measurement_timeout,
-        )
         right.addRow("2182A voltage range", voltage_range)
         right.addRow("2182A integration", nplc)
         right.addRow("2182A analog filter", analog_filter)
@@ -460,7 +410,10 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         note = QLabel(
             "Current and delay accept SI prefixes: 1m, "
             "100u, 1n, 1p. A zero current span is safe to "
-            "load but Apply will reject it before a SEQ."
+            "load but Apply will reject it before a SEQ. "
+            "There is no module software current/compliance "
+            "cap; 6221 Compliance Abort and Cold Switching "
+            "remain enabled."
         )
         note.setWordWrap(True)
         layout.addWidget(note, 1, 0, 1, 2)
@@ -477,9 +430,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "digital_filter_type": filter_type,
             "digital_filter_count": filter_count,
             "digital_filter_window_percent": filter_window,
-            "measurement_timeout_seconds": (
-                measurement_timeout
-            ),
         }
         return group, widgets
 
@@ -562,12 +512,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "switch_settle_seconds": (
                 self.switch_settle.value()
             ),
-            "absolute_current_limit": (
-                self.absolute_current_limit.text().strip()
-            ),
-            "absolute_compliance_limit": (
-                self.absolute_compliance_limit.text().strip()
-            ),
             "channels": {
                 key: {
                     "enabled": checkbox.isChecked(),
@@ -603,9 +547,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         filter_window = widgets[
             "digital_filter_window_percent"
         ]
-        timeout = widgets[
-            "measurement_timeout_seconds"
-        ]
         assert isinstance(high, QLineEdit)
         assert isinstance(low, QLineEdit)
         assert isinstance(compliance, QLineEdit)
@@ -618,7 +559,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         assert isinstance(filter_type, QComboBox)
         assert isinstance(filter_count, QSpinBox)
         assert isinstance(filter_window, QDoubleSpinBox)
-        assert isinstance(timeout, QDoubleSpinBox)
         return {
             "high_current": high.text().strip(),
             "low_current": low.text().strip(),
@@ -643,9 +583,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             ),
             "digital_filter_window_percent": (
                 filter_window.value()
-            ),
-            "measurement_timeout_seconds": (
-                timeout.value()
             ),
         }
 
@@ -677,12 +614,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         )
         self.switch_settle.setValue(
             float(merged["switch_settle_seconds"])
-        )
-        self.absolute_current_limit.set_quantity(
-            merged["absolute_current_limit"]
-        )
-        self.absolute_compliance_limit.set_quantity(
-            merged["absolute_compliance_limit"]
         )
         for key, checkbox in self.channel_enabled.items():
             checkbox.setChecked(
@@ -731,9 +662,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         filter_window = widgets[
             "digital_filter_window_percent"
         ]
-        timeout = widgets[
-            "measurement_timeout_seconds"
-        ]
         assert isinstance(count, QSpinBox)
         assert isinstance(voltage_range, QComboBox)
         assert isinstance(nplc, QSpinBox)
@@ -742,7 +670,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         assert isinstance(filter_type, QComboBox)
         assert isinstance(filter_count, QSpinBox)
         assert isinstance(filter_window, QDoubleSpinBox)
-        assert isinstance(timeout, QDoubleSpinBox)
         count.setValue(int(values["count"]))
         Keithley6221Delta3706AFrontend._select_data(
             voltage_range,
@@ -768,9 +695,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
                     "digital_filter_window_percent"
                 ]
             )
-        )
-        timeout.setValue(
-            float(values["measurement_timeout_seconds"])
         )
 
     def update_status(
@@ -928,8 +852,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             self.mode,
             self.io_timeout,
             self.switch_settle,
-            self.absolute_current_limit,
-            self.absolute_compliance_limit,
             *self.channel_enabled.values(),
             *self.shared_widgets.values(),
         ]
@@ -955,8 +877,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "mode",
             "io_timeout_seconds",
             "switch_settle_seconds",
-            "absolute_current_limit",
-            "absolute_compliance_limit",
         ):
             if key in supplied:
                 result[key] = supplied[key]
