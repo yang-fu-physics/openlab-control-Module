@@ -1,10 +1,11 @@
 # Keithley 6221 + 2182A Delta + 7001
 
-Version `0.1.0b4` is a Beta Measurement Module for a Keithley 6221 current
+Version `0.1.0b5` is a Beta Measurement Module for a Keithley 6221 current
 source, a Keithley 2182A
 nanovoltmeter connected to the 6221 by RS-232 and Trigger Link, and an optional
 Keithley 7001 switch system controlled by a second GPIB resource.
-It requires OpenLab Control `>=0.11.4,<0.12` for core-managed rawdata rows.
+It requires OpenLab Control `>=0.11.5,<0.12` for API 1.1 logical-slot
+scheduling and core-managed rawdata rows.
 
 Before using Apply, manually enable the 2182A RS-232 interface at 19.2 kbaud,
 XON/XOFF flow control, and CR termination; configure the 6221 serial side to
@@ -23,7 +24,9 @@ The module has two modes:
   the module aborts Delta and confirms zero/off state. After switching, it applies
   that channel's complete settings, arms, waits 3 seconds, verifies, and triggers.
 
-One Measure writes one DAT row per enabled logical channel. The DAT contains the
+The module declares `measurement_mode = "aligned_slots"`. The core calls it
+once for each enabled logical channel, aligns CH1-CH4 with other scanner
+modules, and writes one DAT row per channel. The DAT contains the
 numeric channel index (1-4), resistance converted from Delta voltage, effective
 reversal current, resistance standard deviation, sample count, and integer
 status code. The per-cycle Delta

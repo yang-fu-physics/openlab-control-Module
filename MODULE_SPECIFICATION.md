@@ -1,11 +1,12 @@
 # OpenLab Measurement Module 统一开发规范
 
 > - 文档状态：当前仓库的规范性开发基线
-> - 规范版本：1.0
-> - 适用接口：OpenLab Control Measurement Module API 1.0
+> - 规范版本：1.1
+> - 适用接口：OpenLab Control Measurement Module API 1.1
 > - 基线日期：2026-07-31
 > - 参考实现：`lakeshore_372a`、`lr700`、`keithley_6221_2182a_delta`、
->   `keithley_6221_2182a_delta_3706a`
+>   `keithley_6221_2182a_delta_3706a`、`keithley_2400`、
+>   `keithley_6517b`、`keithley_2614b`
 
 本文件用于统一后续 Measurement Module 的目录、清单、生命周期、数据、安全、界面、
 依赖、测试和发布方式。它不替代仪表手册，也不证明模块已经通过真实仪表验证。
@@ -28,8 +29,10 @@ Measurement Module 表示“一套完整测量方案”，可以拥有一个或�
   自动 Apply 已保存或随 SEQ 导入的设置。
 - `Apply Settings` 只由核心放在 Settings 页。模块窗口不得再提供第二个 Apply 按钮。
 - 模块窗口不能由用户直接关闭；Disable 成功后由核心隐藏。
-- 一个 `T Measure` 会并行调用所有 Enabled 模块；同一模块内部的生命周期调用串行执行。
-- 一个模块可以在一次 Measure 中按顺序产生多行，每行可对应一个通道。
+- 一个 `T Measure` 会先按所有扫描模块的逻辑槽位并集展开；每个逻辑通道槽位对应一行
+  DAT。同一槽位中的 Enabled 模块并行执行，同一模块内部的生命周期调用串行执行。
+- 每次 `measure(context)` 调用必须且只能产生一行。扫描模块由核心按槽位分别调用，
+  不得在一次调用中自行循环发出多行。
 - Warning 表示仍可安全继续且数据语义明确；核心继续 SEQ 并按
   `source + code + context` 去重。Error 中止 SEQ。
 - 测量数据问题只影响当前数据行并报告 Warning，不中止 SEQ。只有通信、进程、协议
@@ -41,16 +44,20 @@ Measurement Module 表示“一套完整测量方案”，可以拥有一个或�
 
 | 模块 | 仪表拓扑 | 配置方式 | SEQ 前准备 | DAT 行模型 | 模块安全状态 |
 | --- | --- | --- | --- | --- | --- |
-| Lake Shore 372A | 单台电阻桥及其输入扫描器 | R1-R4 各自保存输入、激励和量程 | 确认所有相关输入分流 | 稀疏宽表；每个通道一行，只填写本槽位的 R/Phase/Current，加整数 StatusCode | 所有相关输入 excitation shunted，并读回确认 |
-| LR-700 + LR-720-16 | 电阻桥加十六路复用器 | R1-R4 保存各自参数，但仪表参数是全局的，测量时逐通道应用 | 确认最低可验证激励 | 稀疏宽表；每个通道一行，只填写本槽位的 R/X，加整数 StatusCode | `20 uV × 5% = 1 uV` 最低激励，并读回确认 |
-| Keithley 6221 + 2182A + 可选 7001 | 电流源、纳伏表和切换器组成的多仪表触发链 | 可选“共享配置并持续 Armed”或“每通道独立配置并重新 ARM” | 共享模式 ARM 后可中断等待 3 s 并确认 Armed | 标准长表；整数 Channel + Resistance/Current/StdDev/SampleCount/StatusCode，每个通道一行 | Abort Delta、输出关闭、必要时打开路由，并查询确认 |
+| Lake Shore 372A | 单台电阻桥及其输入扫描器 | `aligned_slots`；R1-R4 各自保存输入、激励和量程 | 确认所有相关输入分流 | 每个启用逻辑槽位一行；只填写该槽位的 R/Phase/Current，加整数 StatusCode | 所有相关输入 excitation shunted，并读回确认 |
+| LR-700 + LR-720-16 | 电阻桥加十六路复用器 | `aligned_slots`；R1-R4 保存各自参数，但仪表参数是全局的 | 确认最低可验证激励 | 每个启用逻辑槽位一行；只填写该槽位的 R/X，加整数 StatusCode | `20 uV × 5% = 1 uV` 最低激励，并读回确认 |
+| Keithley 6221 + 2182A + 可选 7001 | 电流源、纳伏表和切换器组成的多仪表触发链 | `aligned_slots`；可选共享持续 Armed 或每通道重新 ARM | 共享模式 ARM 后可中断等待 3 s 并确认 Armed | 每个启用逻辑槽位一行；Channel + Resistance/Current/StdDev/SampleCount/StatusCode | Abort Delta、输出关闭、必要时打开路由，并查询确认 |
 | Keithley 6221 + 2182A + 可选 3706A | 与上一项相同，但切换器使用区分大小写的 TSP | 与 7001 版本相同 | 与 7001 版本相同 | 与 7001 版本相同，并保持独立 module ID/rawdata 文件 | Abort Delta、输出关闭、`channel.open("allslots")`，并用整机 closed-channel list 精确确认 |
+| Keithley 2400 | 单通道 SMU | `once_per_slot`；恒流/恒压和 2-wire/4-wire 可选 | 确认配置读回一致且输出为 OFF | 每个逻辑槽位重复测一次；Resistance/Voltage/Current/StatusCode | 默认每行前关闭；可选跨成功行保持输出；所有结束路径强制 OFF |
+| Keithley 6517B | 内置 V-source + electrometer | `once_per_slot`；固定恒压、两线 FVMI | standby、zero check ON，并确认 METER-CONNECT | 每个逻辑槽位重复测一次；Resistance/Voltage/Current/StatusCode | 默认每行后 standby + zero check；可选跨成功行保持输出；结束路径恢复安全状态 |
+| Keithley 2614B | 双通道 SMU A/B | `once_per_slot`；一次调用读取全部 Enabled SMU 通道 | 确认 A/B 均 OFF 和全部 Enabled 通道配置 | 每个逻辑槽位一行宽表；R1/V1/I1/StatusCode1 + R2/V2/I2/StatusCode2 | 默认每行后 A/B OFF；可选跨成功行保持输出；结束路径全部 OFF |
 
 这些实现说明下列差异是允许的：
 
 - 单仪表、多路复用仪表和多仪表编排都可以由一个模块实现。
 - 通道设置可以是真正独立，也可以只是扫描计划，测量时再写入全局仪表参数。
-- DAT 可以使用“稀疏宽表”或“按通道标准行”，但必须在开发开始时选定并保持固定。
+- DAT 可以使用“稀疏宽表”“按通道标准行”或“一次调用汇总多个内部通道的宽表”，但
+  必须在开发开始时选定并保持固定。
 - 安全状态不一定等于零输出；无法真正关闭输出的仪表必须定义并确认最低风险状态。
 - 可选附件在 Enable 阶段可以有明确的降级模式；运行中状态不确定时不得静默降级。
 
@@ -100,11 +107,12 @@ tests/
 id = "example_bridge"
 name = "Example Bridge"
 version = "0.1.0b1"
-api_version = "1.0"
-core_requires = ">=0.11.1,<0.12"
+api_version = "1.1"
+core_requires = ">=0.11.5,<0.12"
 frontend = "frontend:ExampleBridgeFrontend"
 backend = "backend:ExampleBridgeBackend"
 backend_type = "python"
+measurement_mode = "once_per_slot"
 dependencies = [
     "PyVISA>=1.16.2,<1.17",
 ]
@@ -124,7 +132,10 @@ name = "StatusCode"
 
 - `id` 必须匹配 `[a-z][a-z0-9_]*`，并在首次发布后保持不变。
 - `version` 必须是合法 PEP 440 版本；未经过真实仪表验证时使用 beta。
-- `api_version` 当前必须是 `"1.0"`。
+- `api_version` 当前必须是 `"1.1"`。
+- 正式模块必须显式声明 `measurement_mode = "once_per_slot"` 或 `"aligned_slots"`。
+  为了让尚未迁移的第三方模块仍可被检查，缺少该字段时核心会显示 Warning，并按
+  `once_per_slot` 处理；该兼容兜底不代表模块符合本仓库发布规范。
 - `core_requires` 必须覆盖实际使用的最早核心版本，不得为了方便写成无限制范围。
   使用 `raw_values` 的模块当前至少需要提供该 API 的核心版本。
 - `frontend` 和 `backend` 必须是 `文件名:类名`，不能包含路径；对应 `.py` 文件必须存在。
@@ -192,7 +203,7 @@ Backend 应显式区分以下状态：
 | `initialize(settings, context)` | 规范化 desired settings、发现资源、返回初始状态 | 自动 Apply 保存设置、打开非零输出、改变路由或量程 |
 | `apply_settings(settings, context)` | 后端完整验证方案、连接和识别仪表、建立并确认安全基线；立即生效的设置必须写入并读回，扫描计划可以延迟到 Measure | 信任前端校验、打开工作激励后留在样品上、失败后仍记录 applied |
 | `begin_sequence(context)` | 确认已 Apply、建立本 Run 临时状态；准备时间可 Pause/Stop | 依赖第一次 Measure 才发现基本设置无效 |
-| `measure(context)` | 按确定顺序执行；逐通道扫描参数在使用前写入并读回；用返回 Mapping 或 `emit_row` 产生固定 Schema 数据；每个测量单元有清理边界 | 直接写 DAT、重入同一模块、返回未声明列 |
+| `measure(context)` | 只测 `context.measurement_step.logical_slot` 对应的一次测量单元；逐通道参数在使用前写入并读回；用返回 Mapping 或一次 `emit_row` 产生恰好一行固定 Schema 数据 | 自行循环多个槽位、直接写 DAT、重入同一模块、返回未声明列 |
 | `end_sequence(reason, context)` | 对 completed/stopped/error 都处理本模块危险输出，清除运行态 | 自动 Disable 或假装未确认的安全动作成功 |
 | `abort(context)` | 幂等地进入安全状态并释放全部资源；即使安全动作失败也清理本机引用 | 把 worker 退出等同于仪表已安全 |
 | `read_status(context)` | 只读实际状态；无连接时明确报告 Unknown/Disconnected | 隐式连接、Apply、切换通道或打开输出 |
@@ -211,6 +222,27 @@ Enable 阶段允许为了确认“可选附件是否存在”而建立临时只�
 除上述明确的临时只读探测外，Enable 不应仅因加载了保存设置就连接主测量仪表。若某个
 模块确实必须在 Enable 保持只读主连接，必须在 README 说明原因、保证不发送设置或输出
 命令，并测试 Enable、Disable 和应用退出的全部资源释放路径。
+
+### 6.2 逻辑槽位与测量模式
+
+每个模块必须在 manifest 选择一种调度模式：
+
+- `once_per_slot`：模块没有需要与其他扫描模块对齐的外部扫描通道。核心在本次
+  `T Measure` 的每个逻辑槽位调用一次。2400、6517B，以及一次调用同时读取 A/B 的
+  2614B 都属于此类。如果本次 Run 没有任何 `aligned_slots` 模块，唯一逻辑槽位为 1，
+  因而这些模块只调用一次。
+- `aligned_slots`：模块拥有需要跨模块对齐的扫描槽位。`begin_sequence` 成功后，核心
+  调用一次 `measurement_slots(context)`；模块返回本次 Run 启用的唯一正整数槽位。
+  这些列表在 Run 内冻结，模块只能在重新 Apply 并开始下一次 Run 后改变它们。
+
+核心取所有 `aligned_slots` 列表的并集并按数值升序执行。例如 A 模块启用 `[1, 3, 4]`，
+B 模块启用 `[1, 2, 4]`，本次 `T Measure` 仍写 4 行：第 2 行只有 B 的扫描结果，第 3 行
+只有 A 的扫描结果；`once_per_slot` 模块四行都会重新测量。这里“一轮”只表示一个逻辑
+通道槽位，不表示整个 `T Measure`。
+
+同一槽位的参与模块并行完成后，核心把它们合入该槽位对应的一行。CH1–CH4 永远是四行，
+不会合成一行。未启用当前槽位的扫描模块只留下空列。Stop 若发生在槽位执行中，核心不写
+该槽位的半成品行；已经完成的前面槽位保持在 DAT 中。
 
 ## 7. 设置模型与校验
 
@@ -319,7 +351,8 @@ end_sequence 等每一次生命周期调用各自的总上限，不是整个 SEQ
 
 每种调用的最坏时长估算应按实际归属至少考虑：
 
-- Enabled 通道数；
+- 当前生命周期调用内实际测量的内部通道数；`aligned_slots` 每次只处理一个逻辑槽位，
+  不得把本次 `T Measure` 的全部槽位时间错误累加成单次调用时长；
 - 通道切换、pause、dwell、filter settle；
 - 该调用内的 ARM 等待和触发次数；
 - 采样 count 及单次采样上限；
@@ -336,25 +369,31 @@ end_sequence 等每一次生命周期调用各自的总上限，不是整个 SEQ
 
 模块必须在固定 manifest Schema 下选择并记录适合自己的行模型。常用模型包括但不限于：
 
-1. **单行/汇总行**：适用于没有通道概念，或一次 Measure 只产生一个固定汇总结果的
-   模块。可以直接从 `measure()` 返回一个 Mapping，也可以调用一次 `emit_row()`。
+1. **单行/汇总行**：适用于没有扫描槽位概念，或一次调用汇总固定内部通道的模块。
+   可以直接从 `measure()` 返回一个 Mapping，也可以调用一次 `emit_row()`。2614B
+   一次调用读取 A/B 并写宽表，属于这种 `once_per_slot` 模型。
 2. **稀疏宽表**：适用于 R1-R4 等固定语义槽位和已有分析流程。每个通道一行，只填写
    当前槽位的 `R1/X1` 等测量列，其他槽位留空；当一行只表示一个通道时，应共用一个
    整数 `StatusCode` 列，不应为每个槽位重复声明状态列。372A 和 LR-700 使用此模型。
 3. **按通道标准行**：适用于各通道结果字段完全相同的新模块。每行填写 `Channel` 和
    公共测量列。Keithley Delta 使用此模型。
 
-除非必须兼容既有数据，新的同构多通道模块应优先使用按通道标准行，避免通道数扩大时
-列数成倍增加。未属于当前行的清单列应省略或写 `None`；同一模块内必须保持一致。
+除非必须兼容既有数据，新的同构扫描模块应优先使用按通道标准行，避免通道数扩大时
+列数成倍增加。未属于当前逻辑槽位的清单列应省略或写 `None`；同一模块内必须保持一致。
 
 每个 `emit_row` 的值只能是 JSON 可表示的 `str/int/float/bool/None`，浮点数必须有限。
 不得发送未在清单声明的列。模块必须先完成该行的全部读取、换算和状态判断，再发送该行；
 发送后不能回头修改已经写盘的数据。
 
-`measure()` 返回的非空 Mapping 会被核心当作额外一行。多行模块必须使用
-`context.emit_row()`，并通常返回 `None`，避免无意再产生一行。所有请求、事件、状态和
-最终返回值都受 1 MiB IPC frame 上限约束；32,768 只是 raw 数值数量上限，不替代总字节
-限制。
+每次 `measure()` 调用必须恰好产生一行：返回一个非空 Mapping，或者调用一次
+`context.emit_row()` 并返回 `None`。两者同时使用、调用两次 `emit_row()` 或成功返回却
+没有行，都会成为 Error。多通道扫描由核心通过多次 `measure()` 调用展开，而不是允许
+一次调用输出多行。所有请求、事件、状态和最终返回值都受 1 MiB IPC frame 上限约束；
+32,768 只是 raw 数值数量上限，不替代总字节限制。
+
+一次 `T Measure` 最终写入的 DAT 行数等于本次逻辑槽位并集的大小；没有
+`aligned_slots` 模块时为 1。核心在每个槽位等待全部参与模块完成，把结果合到该槽位的
+同一行，因此仍严格保持“每个通道一行”。
 
 ### 10.2 多次采样
 
@@ -366,23 +405,26 @@ end_sequence 等每一次生命周期调用各自的总上限，不是整个 SEQ
 - 单个异常是 Warning 行、整个通道 Error，还是终止 SEQ；
 - 电压、电流、电阻等换算公式和符号约定。
 
-`StatusCode` 表示“本行数据质量”，必须是非负整数且每行都存在。`0` 在所有模块中固定
-表示正常；其他数值由模块根据仪表能力自行定义，不存在框架统一的 `ERROR` 数值。模块
-必须在 README 和测试中给出完整映射及多种故障同时出现时的优先级。状态码不得写
-`NORMAL`、`ERROR`、`OVER_RANGE` 等文本。框架 Warning/Error 表示“运行是否继续”，
-与 DAT 状态码不能互相替代。
+状态列表示对应正式结果的数据质量。一个 DAT 行只有一个测量结果组时必须声明
+`StatusCode`；一次调用汇总多个独立内部通道时，可以为每组声明 `StatusCode1`、
+`StatusCode2` 等编号列。每个实际测量的结果组都必须提供非负整数状态；Disabled 内部
+通道的整组列（包括编号状态列）留空。`0` 在所有模块中固定表示正常；其他数值由模块
+根据仪表能力自行定义，不存在框架统一的 `ERROR` 数值。模块必须在 README 和测试中
+给出完整映射及多种故障同时出现时的优先级。状态码不得写 `NORMAL`、`ERROR`、
+`OVER_RANGE` 等文本。框架 Warning/Error 表示“运行是否继续”，与 DAT 状态码不能互相替代。
 
-`StatusCode != 0` 表示本行没有可信的正式测量结果：当前通道的电阻、电压、相位、标准差
-等主结果列必须省略，使 DAT writer 写为空；稀疏表中其他未测通道也必须为空。通道编号、
-温场快照、设定电流、样本数和 rawdata 等诊断信息只有在含义仍然可信且 README 已说明时
-才可保留。若测量值本身仍然有效、只是需要提醒操作员，应保持 `StatusCode=0` 并单独调用
-`context.warning()`，不得一边写非零状态码一边保留看似有效的正式结果。
+某结果组的状态码非零表示该组没有可信的正式测量结果：对应电阻、电压、相位、标准差
+等主结果列必须省略，使 DAT writer 写为空；稀疏表中其他未测通道也必须为空。同一宽表
+行中的另一内部通道若正常，可以保留自己的结果。通道编号、温场快照、设定电流、样本数
+和 rawdata 等诊断信息只有在含义仍然可信且 README 已说明时才可保留。若测量值本身仍然
+有效、只是需要提醒操作员，应保持对应状态码为 0 并单独调用 `context.warning()`，不得
+一边写非零状态码一边保留看似有效的正式结果。
 
 ### 10.3 系统快照
 
 `context.system` 是本次生命周期调用开始时的快照。长时间测量需要新的温度/磁场时间点时，
-必须调用 `context.sample_system()`。核心还会在收到每个 `emit_row` 时附加当时的最新
-系统状态。
+必须调用 `context.sample_system()`。同一逻辑槽位的多个模块并行完成后，核心为最终合并
+行采集一次系统状态，避免同一 DAT 行包含互相矛盾的核心时间点。
 
 只有确实需要“两次温度/磁场平均”等派生结果时，模块才声明自己的
 `TemperatureAverage`/`FieldAverage` 列。模块必须验证角色、单位、时间新鲜度并统一换算，
@@ -403,7 +445,8 @@ context.emit_row(
 
 - 最多 32,768 个数值；
 - 只能包含有限 int/float，不能含 bool、文本、时间戳、通道名或对象；
-- 一次 `emit_row` 的 rawdata 行与同一次正式 DAT 行一一对应；
+- 一次 `emit_row` 的 rawdata 行与该模块在当前逻辑槽位的正式结果一一对应；多个模块
+  合并到同一 DAT 行时，各自仍写入独立的模块 rawdata sidecar 行；
 - 模块不得自行创建或追加 rawdata/DAT 文件；
 - 文件名、路径摘要、重建和写盘顺序全部由核心管理；
 - 完全不使用 rawdata 的模块不要发送空序列；已经承诺“每个正式行都有 rawdata 对应行”
@@ -427,17 +470,18 @@ K6221_SWITCHER_UNAVAILABLE
   协议状态无法建立、设置读回不一致、未知路由、触发状态不确定和无法确认安全状态。
 - **测量数据问题只 Warning，不中止 SEQ**：包括单点非数字/NaN/Infinity、超量程、
   compliance、样本数不符或单通道统计失败。模块必须丢弃不能写入的值，输出明确的
-  模块自有整数 `StatusCode`，使当前结果与所有未测通道保持为空，并在能够确认仪表和
-  路由仍安全时继续下一通道。
+  模块自有整数状态码，使对应结果组与所有未测通道保持为空，并在能够确认仪表和路由
+  仍安全时继续下一通道。
 - 如果数据异常已经扩展到无法判断报文边界、当前通道、路由、输出或仪表状态，它就不再
   是单纯数据问题，必须升级为系统 Error。
 - Stop 产生的协作取消不是 Error。
 - 仪表 overload/compliance 若仍能产生明确状态行，可以记录 StatusCode 并 Warning；具体
   继续策略必须写入 README 和测试。
 
-希望在当前 Measure 中继续下一个通道时，应调用 `context.warning()` 后继续控制流。
-直接抛出 `ModuleWarning` 会结束本次 backend 方法，适合资源刷新或整个手动动作无法完成
-但核心仍可继续的情况，不适合逐通道数据告警。
+当前逻辑槽位出现数据问题时，应调用 `context.warning()`，发送一行带非零状态码且正式
+测量值为空的结果，再正常返回；核心随后调度下一个槽位。直接抛出 `ModuleWarning` 会
+结束本次 backend 方法并令当前模块在该槽位留空，适合整个槽位无法形成状态行但仪表、
+路由和安全状态仍明确的情况。
 
 `update_status()`/生命周期返回值只能包含小型 JSON 数据，不得放 driver 对象、bytes、
 大数组或秘密。状态页应明确区分 Desired、Applied、Connected、Armed、Safe
@@ -497,12 +541,20 @@ set_sequence_running(running)
 Enable：不改变危险输出
 Apply：验证完整方案 → 先安全 → 写入应立即生效的设置并读回 → 再次安全
 Begin：确认安全/已 Apply → 建立运行态
-Measure：每个测量单元都形成独立事务；延迟扫描设置在使用前写入并读回
+Measure：每个测量单元独立读取并形成一行；延迟扫描设置在使用前写入并读回
 协作 Stop/系统 Error：立即 best-effort 安全 → worker 可用时由 end_sequence 严格确认
-数据 Warning：写明确状态行并恢复本测量单元安全状态 → 继续下一个测量单元
+数据 Warning：写明确状态行；按已配置的行边界输出策略处理 → 继续下一个测量单元
 Disable/退出：worker 可用时由 abort 严格确认 → 无条件释放本机资源
 worker 超时/崩溃/IPC 断开：不得宣称已安全 → 标记 Safety Unconfirmed 并要求人工确认
 ```
+
+主动输出模块可以提供 `output_off_between_measurements` 一类选项，但必须满足：默认值为
+安全的逐行关闭；取消后只允许在 SEQ 内两个已经完整收束的槽位之间保持有意输出，并且
+每行结束仍查询实际输出状态。数据 Warning 若路由、输出和协议状态仍明确，也按该选择
+保持或关闭；SEQ Pause 不隐式改变输出，所以取消逐行关闭时 Pause 期间同样保持。Stop、
+系统 Error、completed、Disable 和应用退出不受该选项影响，必须立即请求并确认模块安全
+状态。Frontend 必须明确提示这些行为，Backend 必须再次验证布尔类型，README 和测试
+必须覆盖默认与保持两条路径。
 
 对于电流源加切换器，通常必须先确认输出为零/Off，再切换路由；路由确认后才能 ARM 或
 Trigger。任何可能绕过模块已声明的全局电流、compliance、功率上限或仪表绝对合法
@@ -545,7 +597,8 @@ Trigger。任何可能绕过模块已声明的全局电流、compliance、功率
 - 延迟扫描设置在 Measure 使用前写入并读回；
 - Apply 任一步失败时不保留半应用状态；
 - 多通道模块覆盖一个、全部支持数量、Disabled 通道和固定顺序；
-- 无通道模块覆盖单行/汇总行；
+- `once_per_slot` 模块覆盖无扫描模块时的一次调用，以及与多槽位扫描模块并用时每行
+  重新调用；内部多通道汇总模块覆盖一个和全部 Enabled 内部通道；
 - `begin_sequence → measure × N → end_sequence`；
 - completed、stopped、error 三种 end reason；
 - Disable before Apply、重复 abort、close 异常和资源释放。
@@ -554,6 +607,8 @@ Trigger。任何可能绕过模块已声明的全局电流、compliance、功率
 
 - 在 switch/pause/dwell/filter/ARM/trigger/read 等每个等待点 Stop；
 - Pause 不消耗实验等待时间，恢复后继续；
+- 主动输出模块若允许跨成功行保持输出，测试 SEQ Pause 期间的明确保持行为；无论该
+  选项如何，Stop/Error/completed/Disable 都必须恢复并确认模块安全状态；
 - 每个生命周期调用的最坏时长分别校验，超限在连接前拒绝；
 - I/O timeout、worker timeout 和断开；
 - 可重试查询成功、查询重试耗尽；
@@ -562,7 +617,11 @@ Trigger。任何可能绕过模块已声明的全局电流、compliance、功率
 
 ### 15.4 数据和事件
 
-- 一次 Measure 的多行数量、顺序、稀疏列或 Channel 列；
+- manifest 显式声明正确的 `measurement_mode`；缺失时发现结果有 Warning 且核心按
+  `once_per_slot` 兜底；
+- `aligned_slots` 返回值、槽位并集、每槽位一行、Disabled 槽位空列，以及
+  `once_per_slot` 在每个槽位重复测量；
+- 单次调用无行、多行或“emit 后又 return”均被拒绝；
 - 单位换算、符号、平均和标准差定义；
 - Warning code/context 稳定、恢复时 resolve；
 - 系统 Error 终止；坏点、超量程、样本数等数据 Warning 写模块自有整数状态码、保持
@@ -632,13 +691,15 @@ Trigger。任何可能绕过模块已声明的全局电流、compliance、功率
 - [ ] 仪表面板及接线前置条件；
 - [ ] 模块可验证的安全状态与确认查询；
 - [ ] Enable 是否需要只读探测可选附件，以及缺失后的固定降级方式；
-- [ ] 是否有通道；若有，通道数量、独立配置或测量时扫描计划；
+- [ ] 显式选择 `once_per_slot` 或 `aligned_slots`；若为后者，定义逻辑槽位编号、
+  Enabled 槽位和 `measurement_slots()`；
+- [ ] 是否有内部通道；若有，通道数量、独立配置、宽表汇总或与逻辑槽位对齐方式；
 - [ ] 单行/汇总、稀疏宽表或按通道标准行；
 - [ ] 是否需要 rawdata，以及正式值、平均、标准差和异常样本规则；
 - [ ] 哪些属于数据 Warning，哪些属于系统 Error；
 - [ ] 每条命令是否可安全重试；
 - [ ] Pause/Stop 检查点和每个生命周期调用的最坏操作时长；
-- [ ] Warning、Error 和 StatusCode 的稳定代码及 README 映射；
+- [ ] Warning、Error 和单组 `StatusCode` 或宽表 `StatusCodeN` 的稳定代码及 README 映射；
 - [ ] 主动输出是否提供额外软件安全上限（若否，记录原因）、仪表绝对合法范围和人工
   应急步骤；
 - [ ] Settings 类型、旧版本迁移和 DAT Schema 兼容策略；

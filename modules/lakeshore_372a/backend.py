@@ -332,26 +332,48 @@ class LakeShore372ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> None:
-        """按 R1→R4 顺序测量 Enabled 通道，每个通道独立 emit 一行稀疏数据。"""
+        """只测量核心当前调度的一个逻辑槽位，并 emit 一行稀疏数据。"""
 
         self._require_ready()
         settings = self.applied_settings
+        step = context.measurement_step
+        if step is None or not 1 <= step.logical_slot <= 4:
+            raise ModuleError(
+                "Lake Shore 372A received an invalid logical slot",
+                "LS372_LOGICAL_SLOT_INVALID",
+            )
+        slot = step.logical_slot
+        channel = settings["channels"][f"r{slot}"]
+        if not channel["enabled"]:
+            raise ModuleError(
+                f"R{slot} is not enabled for this sequence",
+                "LS372_LOGICAL_SLOT_DISABLED",
+                f"r{slot}",
+            )
         self._validate_measure_duration(
             settings,
             context.operation_timeout_seconds,
         )
-        for slot in range(1, 5):
-            channel = settings["channels"][f"r{slot}"]
-            if not channel["enabled"]:
-                continue
-            # 通道之间的 checkpoint 使 Stop 不会开始下一个输入。
-            context.checkpoint()
-            self._measure_channel(
-                slot,
-                channel,
-                settings,
-                context,
-            )
+        context.checkpoint()
+        self._measure_channel(
+            slot,
+            channel,
+            settings,
+            context,
+        )
+
+    def measurement_slots(
+        self,
+        context: ModuleOperationContext,
+    ) -> tuple[int, ...]:
+        del context
+        self._require_ready()
+        assert self.applied_settings is not None
+        return tuple(
+            slot
+            for slot in range(1, 5)
+            if self.applied_settings["channels"][f"r{slot}"]["enabled"]
+        )
 
     def _measure_channel(
         self,
@@ -2030,8 +2052,15 @@ class LakeShore372ABackend(ModuleBackend):
     ) -> None:
         """要求估算时间至少比核心总截止时间短两秒，为 IPC 返回和分流清理留余量。"""
 
-        estimate = cls._estimated_measure_seconds(
-            settings
+        # 核心 API 1.1 会把每个槽位作为独立 worker 请求，因此总超时只需要容纳
+        # 最慢的一个槽位；状态页仍继续显示完整 T Measure 的总估算时间。
+        estimate = (
+            float(settings["pause_seconds"])
+            + float(settings["dwell_seconds"])
+            + 1.0
+            + float(settings["io_timeout_seconds"])
+            * int(settings["retry_attempts"])
+            + 5.0
         )
         timeout = float(operation_timeout_seconds)
         if (

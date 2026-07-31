@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
 from labcontrol.measurement.api import (  # noqa: E402
     ModuleError,
+    ModuleMeasurementStep,
     ModuleOperationContext,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
@@ -270,6 +271,7 @@ class LR700BackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
+        slot: int = 1,
     ) -> ModuleOperationContext:
         iterator = iter(samples or [])
         return ModuleOperationContext(
@@ -284,7 +286,23 @@ class LR700BackendTests(unittest.TestCase):
             ),
             lambda _timeout: "running",
             120.0,
-        )
+        ModuleMeasurementStep(slot, 1, 1),
+    )
+
+
+    @staticmethod
+    def _measure_enabled_slots(
+        backend,
+        context: ModuleOperationContext,
+    ) -> None:
+        slots = tuple(backend.measurement_slots(context))
+        for index, logical_slot in enumerate(slots, start=1):
+            context.measurement_step = ModuleMeasurementStep(
+                logical_slot,
+                index,
+                len(slots),
+            )
+            backend.measure(context)
 
     def test_initialize_discovers_without_connecting_or_writing(
         self,
@@ -332,7 +350,7 @@ class LR700BackendTests(unittest.TestCase):
             context,
         )
         backend.begin_sequence(context)
-        backend.measure(context)
+        self._measure_enabled_slots(backend, context)
         ended = backend.end_sequence(
             "completed",
             context,
@@ -474,7 +492,7 @@ class LR700BackendTests(unittest.TestCase):
         backend.apply_settings(settings, context)
         backend.begin_sequence(context)
 
-        backend.measure(context)
+        self._measure_enabled_slots(backend, context)
 
         rows = [
             payload["values"]
@@ -702,7 +720,7 @@ class LR700BackendTests(unittest.TestCase):
         self.assertIsNone(backend.transport)
         self.assertGreaterEqual(len(state.opened), 2)
 
-    def test_invalid_filter_timing_and_total_duration_fail_closed(
+    def test_invalid_filter_timing_and_per_slot_duration_fail_closed(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -731,8 +749,8 @@ class LR700BackendTests(unittest.TestCase):
         )
         duration_unsafe[
             "switch_settle_seconds"
-        ] = 20.0
-        duration_unsafe["dwell_seconds"] = 20.0
+        ] = 70.0
+        duration_unsafe["dwell_seconds"] = 70.0
         for channel in duration_unsafe[
             "channels"
         ].values():
@@ -964,7 +982,7 @@ class LR700ManifestTests(unittest.TestCase):
         self.assertEqual(descriptor.id, "lr700")
         self.assertEqual(
             descriptor.version,
-            "0.1.0b4",
+            "0.1.0b5",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(

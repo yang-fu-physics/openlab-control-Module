@@ -11,7 +11,10 @@ MODULE = ROOT / "modules" / "simulated_transport"
 sys.path.insert(0, str(CORE / "src"))
 
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
-from labcontrol.measurement.api import ModuleOperationContext  # noqa: E402
+from labcontrol.measurement.api import (  # noqa: E402
+    ModuleMeasurementStep,
+    ModuleOperationContext,
+)
 
 SimulatedTransportBackend = load_source_object(
     MODULE,
@@ -41,7 +44,17 @@ class SimulatedTransportTests(unittest.TestCase):
             context,
         )
         backend.begin_sequence(context)
-        backend.measure(context)
+        self.assertEqual(
+            backend.measurement_slots(context),
+            (1, 2, 3, 4),
+        )
+        for slot in range(1, 5):
+            context.measurement_step = ModuleMeasurementStep(
+                slot,
+                slot,
+                4,
+            )
+            backend.measure(context)
         final = backend.end_sequence("completed", context)
 
         rows = [payload["values"] for kind, payload in messages if kind == "row"]
@@ -83,7 +96,13 @@ class SimulatedTransportTests(unittest.TestCase):
             context,
         )
 
-        backend.measure(context)
+        for slot in range(1, 5):
+            context.measurement_step = ModuleMeasurementStep(
+                slot,
+                slot,
+                4,
+            )
+            backend.measure(context)
 
         rows = [
             payload["values"]

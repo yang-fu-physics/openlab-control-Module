@@ -6,7 +6,11 @@ import random
 from collections.abc import Mapping
 from typing import Any
 
-from labcontrol.measurement.api import ModuleBackend, ModuleOperationContext
+from labcontrol.measurement.api import (
+    ModuleBackend,
+    ModuleError,
+    ModuleOperationContext,
+)
 
 
 # DAT 只保存可直接分析的整数状态码。0 是跨模块约定的正常值；1 的含义只属于
@@ -81,39 +85,52 @@ class SimulatedTransportBackend(ModuleBackend):
         magnetoresistance = 0.01 * index * (field_oe / 10_000.0) ** 2
         return base + magnetoresistance + self.random.gauss(0.0, float(settings["noise_ohm"]))
 
+    def measurement_slots(
+        self,
+        context: ModuleOperationContext,
+    ) -> tuple[int, ...]:
+        del context
+        return (1, 2, 3, 4)
+
     def measure(self, context: ModuleOperationContext) -> None:
         settings = self._settings()
         threshold = float(settings["warning_threshold_ohm"])
         delay = max(0.0, float(settings["delay_seconds"]))
-        for index in range(1, 5):
-            context.interruptible_sleep(delay)
-            channel = f"R{index}"
-            value = self._resistance(index, context)
-            self.last_values[channel] = value
-            if abs(value) > threshold:
-                status_code = STATUS_CODE_OVER_RANGE
-                context.warning(
-                    f"{channel} exceeded the configured warning threshold",
-                    "OVER_RANGE",
-                    channel,
-                )
-            else:
-                status_code = STATUS_CODE_NORMAL
-                context.resolve_warning("OVER_RANGE", channel)
-            row: dict[str, float | int] = {
-                "StatusCode": status_code,
-            }
-            if status_code == STATUS_CODE_NORMAL:
-                row[channel] = value
-            context.emit_row(row)
-            context.update_status({
-                "Last Channel": channel,
-                "Last Resistance (Ohm)": (
-                    value
-                    if status_code == STATUS_CODE_NORMAL
-                    else "—"
-                ),
-            })
+        step = context.measurement_step
+        if step is None or step.logical_slot not in {1, 2, 3, 4}:
+            raise ModuleError(
+                "Simulated Transport received an invalid logical slot",
+                "SIMULATED_LOGICAL_SLOT_INVALID",
+            )
+        index = step.logical_slot
+        context.interruptible_sleep(delay)
+        channel = f"R{index}"
+        value = self._resistance(index, context)
+        self.last_values[channel] = value
+        if abs(value) > threshold:
+            status_code = STATUS_CODE_OVER_RANGE
+            context.warning(
+                f"{channel} exceeded the configured warning threshold",
+                "OVER_RANGE",
+                channel,
+            )
+        else:
+            status_code = STATUS_CODE_NORMAL
+            context.resolve_warning("OVER_RANGE", channel)
+        row: dict[str, float | int] = {
+            "StatusCode": status_code,
+        }
+        if status_code == STATUS_CODE_NORMAL:
+            row[channel] = value
+        context.emit_row(row)
+        context.update_status({
+            "Last Channel": channel,
+            "Last Resistance (Ohm)": (
+                value
+                if status_code == STATUS_CODE_NORMAL
+                else "—"
+            ),
+        })
 
     def end_sequence(self, reason: str, context: ModuleOperationContext) -> Mapping[str, Any]:
         self.sequence_active = False

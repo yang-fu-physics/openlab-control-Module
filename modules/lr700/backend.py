@@ -330,26 +330,49 @@ class LR700Backend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> None:
-        """按 R1→R4 扫描 Enabled 槽位，每个槽位 emit 一行稀疏结果。"""
+        """只测量核心当前调度的一个逻辑槽位，并 emit 一行稀疏结果。"""
 
         self._require_ready()
         settings = self.applied_settings
+        step = context.measurement_step
+        if step is None or not 1 <= step.logical_slot <= 4:
+            raise ModuleError(
+                "LR-700 received an invalid logical slot",
+                "LR700_LOGICAL_SLOT_INVALID",
+            )
+        slot = step.logical_slot
+        channel = settings["channels"][f"r{slot}"]
+        if not channel["enabled"]:
+            raise ModuleError(
+                f"R{slot} is not enabled for this sequence",
+                "LR700_LOGICAL_SLOT_DISABLED",
+                f"r{slot}",
+            )
         self._validate_measure_duration(
             settings,
             context.operation_timeout_seconds,
         )
-        for slot in range(1, 5):
-            channel = settings["channels"][f"r{slot}"]
-            if not channel["enabled"]:
-                continue
-            context.checkpoint()
-            self._measure_sensor(
-                slot,
-                int(channel["input_channel"]),
-                channel,
-                settings,
-                context,
-            )
+        context.checkpoint()
+        self._measure_sensor(
+            slot,
+            int(channel["input_channel"]),
+            channel,
+            settings,
+            context,
+        )
+
+    def measurement_slots(
+        self,
+        context: ModuleOperationContext,
+    ) -> tuple[int, ...]:
+        del context
+        self._require_ready()
+        assert self.applied_settings is not None
+        return tuple(
+            slot
+            for slot in range(1, 5)
+            if self.applied_settings["channels"][f"r{slot}"]["enabled"]
+        )
 
     def _measure_sensor(
         self,
@@ -1896,8 +1919,13 @@ class LR700Backend(ModuleBackend):
         settings: Mapping[str, Any],
         operation_timeout_seconds: float,
     ) -> None:
-        estimate = cls._estimated_measure_seconds(
-            settings
+        estimate = (
+            float(settings["switch_settle_seconds"])
+            + float(settings["dwell_seconds"])
+            + 2.0
+            + float(settings["io_timeout_seconds"])
+            * int(settings["retry_attempts"])
+            + 5.0
         )
         timeout = float(operation_timeout_seconds)
         if (

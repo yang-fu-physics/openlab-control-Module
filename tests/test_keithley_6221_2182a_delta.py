@@ -25,6 +25,7 @@ from labcontrol.extensions.loading import (  # noqa: E402
 )
 from labcontrol.measurement.api import (  # noqa: E402
     ModuleError,
+    ModuleMeasurementStep,
     ModuleOperationCancelled,
     ModuleOperationContext,
 )
@@ -502,6 +503,7 @@ def _settings(
 
 def _context(
     messages: list[tuple[str, dict]],
+    slot: int = 1,
 ) -> ModuleOperationContext:
     return ModuleOperationContext(
         {},
@@ -511,7 +513,22 @@ def _context(
         None,
         lambda _timeout: "running",
         300.0,
+        ModuleMeasurementStep(slot, 1, 1),
     )
+
+
+def _measure_enabled_slots(
+    backend,
+    context: ModuleOperationContext,
+) -> None:
+    slots = tuple(backend.measurement_slots(context))
+    for index, logical_slot in enumerate(slots, start=1):
+        context.measurement_step = ModuleMeasurementStep(
+            logical_slot,
+            index,
+            len(slots),
+        )
+        backend.measure(context)
 
 
 class QuantityTests(unittest.TestCase):
@@ -776,7 +793,7 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.armed)
         backend.begin_sequence(context)
         self.assertTrue(state.armed)
-        backend.measure(context)
+        _measure_enabled_slots(backend, context)
 
         completion_timeouts = [
             timeout
@@ -875,7 +892,7 @@ class BackendTests(unittest.TestCase):
         backend.apply_settings(settings, context)
         backend.begin_sequence(context)
         self.assertFalse(state.armed)
-        backend.measure(context)
+        _measure_enabled_slots(backend, context)
 
         rows = [
             payload["values"]
@@ -1084,6 +1101,7 @@ class BackendTests(unittest.TestCase):
             None,
             lambda _timeout: "stopping",
             300.0,
+            ModuleMeasurementStep(1, 1, 1),
         )
 
         with self.assertRaises(ModuleOperationCancelled):
@@ -1290,7 +1308,7 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b4",
+            "0.1.0b5",
         )
         self.assertEqual(
             [column.name for column in descriptor.columns],

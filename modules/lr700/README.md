@@ -32,8 +32,10 @@ The LR-700 settings are global rather than stored independently for all
 multiplexer channels. Therefore Apply Settings validates the complete desired
 scan configuration, connects through GPIB, verifies the documented `GET 6`
 protocol response, and leaves the bridge at minimum excitation. During
-Measure, the module applies and verifies the corresponding row after selecting
-each enabled sensor.
+Measure, this `aligned_slots` module is called once for the current enabled
+logical slot and applies and verifies only that corresponding sensor. The core
+aligns R1-R4 with the same slot numbers of other scanner modules and writes one
+DAT row per logical channel; one backend call never loops over all four slots.
 
 For every enabled sensor, the module:
 

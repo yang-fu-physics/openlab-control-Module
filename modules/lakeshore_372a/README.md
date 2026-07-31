@@ -18,7 +18,11 @@ computer; that operation is outside OpenLab Control.
 
 ## Measurement order
 
-For each enabled R1-R4 slot, the module:
+The module declares `measurement_mode = "aligned_slots"`. After
+`begin_sequence`, the core freezes the enabled R1-R4 logical slots and invokes
+this backend once for each current slot. When another scanner is enabled, R1 is
+aligned with its CH1, R2 with CH2, and so on; each logical channel remains one
+DAT row. For the current slot, the module:
 
 1. enables/configures the selected physical input (1-16) while keeping its
    excitation shunted;

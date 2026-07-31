@@ -20,6 +20,7 @@ from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
 from labcontrol.measurement.api import (  # noqa: E402
     ModuleError,
+    ModuleMeasurementStep,
     ModuleOperationCancelled,
     ModuleOperationContext,
 )
@@ -300,6 +301,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
+        slot: int = 1,
     ) -> ModuleOperationContext:
         iterator = iter(samples or [])
         return ModuleOperationContext(
@@ -314,7 +316,23 @@ class LakeShore372ABackendTests(unittest.TestCase):
             ),
             lambda _timeout: "running",
             120.0,
-        )
+        ModuleMeasurementStep(slot, 1, 1),
+    )
+
+
+    @staticmethod
+    def _measure_enabled_slots(
+        backend,
+        context: ModuleOperationContext,
+    ) -> None:
+        slots = tuple(backend.measurement_slots(context))
+        for index, logical_slot in enumerate(slots, start=1):
+            context.measurement_step = ModuleMeasurementStep(
+                logical_slot,
+                index,
+                len(slots),
+            )
+            backend.measure(context)
 
     def test_initialize_discovers_but_does_not_connect_or_apply(
         self,
@@ -407,7 +425,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             context,
         )
         backend.begin_sequence(context)
-        backend.measure(context)
+        self._measure_enabled_slots(backend, context)
         ended = backend.end_sequence(
             "completed",
             context,
@@ -582,7 +600,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         backend.apply_settings(settings, context)
         backend.begin_sequence(context)
 
-        backend.measure(context)
+        self._measure_enabled_slots(backend, context)
 
         rows = [
             payload["values"]
@@ -1254,7 +1272,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b8",
+            "0.1.0b9",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(

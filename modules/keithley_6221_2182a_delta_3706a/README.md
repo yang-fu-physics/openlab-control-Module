@@ -1,10 +1,10 @@
 # Keithley 6221 + 2182A Delta + 3706A
 
-Version `0.1.0b1` is a Beta Measurement Module for a Keithley 6221 current
+Version `0.1.0b2` is a Beta Measurement Module for a Keithley 6221 current
 source, a Keithley 2182A nanovoltmeter connected to the 6221 by RS-232 and
 Trigger Link, and an optional Keithley 3706A switch system controlled through a
-second GPIB resource. It requires OpenLab Control `>=0.11.4,<0.12` because
-every formal DAT row has a core-managed rawdata row.
+second GPIB resource. It requires OpenLab Control `>=0.11.5,<0.12` for API 1.1
+logical-slot scheduling and core-managed rawdata rows.
 
 Before using Apply, manually enable the 2182A RS-232 interface at 19.2 kbaud,
 XON/XOFF flow control, and CR termination; configure the 6221 serial side to
@@ -36,7 +36,9 @@ User's Manual*, part 3700AS-900-01 Rev. B (July 2016), together with the Series
 
 ## DAT and rawdata
 
-One Measure writes one DAT row per enabled logical channel. The fixed DAT
+The module declares `measurement_mode = "aligned_slots"`. The core invokes the
+backend once per enabled logical channel, aligns CH1-CH4 with other scanner
+modules, and keeps each logical channel as one DAT row. The fixed DAT
 columns are `Channel`, `Resistance`, `Current`, `StdDev`, `SampleCount`, and
 `StatusCode`. Resistance is each valid 2182A Delta voltage divided by the
 effective reversal current. The formal resistance is the arithmetic mean of all

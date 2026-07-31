@@ -19,15 +19,28 @@ rawdata sidecar.
 and data contract with an optional 3706/3706A switch mainframe. Its routing
 layer uses the 3700A case-sensitive TSP command set and verifies the complete
 closed-channel list before every trigger.
+`keithley_2400` uses one Model 2400 as a constant-current or constant-voltage
+source and measures two-wire or four-wire resistance. `keithley_6517b` uses
+the 6517B voltage source and ammeter for two-wire high-resistance measurements;
+it establishes and verifies the required internal METER-CONNECT path before
+any voltage is applied. `keithley_2614b` measures one or both SMU channels with
+independent constant-current/constant-voltage and two-wire/four-wire settings.
 
-The current `simulated_transport` 1.0.2 requires OpenLab Control 0.11.0 Beta 2
-or newer because it uses the live, interruptible measurement context.
-`lakeshore_372a` 0.1.0b8 requires OpenLab Control 0.11.1 or newer because its
-PyVISA runtime is supplied and version-checked by the core framework.
-`lr700` 0.1.0b4 has the same core requirement and shared PyVISA boundary.
-`keithley_6221_2182a_delta` 0.1.0b4 requires OpenLab Control 0.11.4 or newer
-for core-managed rawdata rows. `keithley_6221_2182a_delta_3706a` 0.1.0b1 has
-the same core requirement.
+All modules explicitly declare the Measurement Module API 1.1 scheduling mode.
+The scanner/switch modules use `aligned_slots`: one `T Measure` produces one DAT
+row per logical channel slot, and modules on the same slot run in parallel and
+share that row. The 2400, 6517B, and 2614B use `once_per_slot`, so they perform a
+fresh measurement in every logical channel row. If no scanner module is enabled,
+there is one logical slot and therefore one row. A missing mode declaration is
+shown as a compatibility warning and is treated as `once_per_slot`, but is not
+accepted for an official module release.
+
+The current `simulated_transport` 1.1.0, `lakeshore_372a` 0.1.0b9, `lr700`
+0.1.0b5, `keithley_6221_2182a_delta` 0.1.0b5, and
+`keithley_6221_2182a_delta_3706a` 0.1.0b2 require OpenLab Control 0.11.5 or
+newer for API 1.1 logical-slot scheduling.
+`keithley_2400`, `keithley_6517b`, and `keithley_2614b` 0.1.0b1 require
+OpenLab Control 0.11.5 or newer and use the framework-provided PyVISA runtime.
 All hardware modules remain beta until verified with their real instruments.
 
 ## Manual offline installation
@@ -58,7 +71,8 @@ temperature/field/monitor snapshot supplied by the core.
 - Validate manifest ID, API/core range, fixed columns, and source entry points.
 - Exercise initialize/apply/begin/measure/end/abort and every error path.
 - Verify Warning deduplication and Error termination.
-- Test multi-row output and parallel execution with another module.
+- Test explicit scheduling mode, slot union, one row per logical channel, and
+  same-slot parallel execution with another module.
 - Test bounded driver and framework timeouts plus forced worker cleanup.
 - Test the exact offline wheel set on the target Windows/Python architecture.
 - Increment `version` whenever shipped content or dependencies change.

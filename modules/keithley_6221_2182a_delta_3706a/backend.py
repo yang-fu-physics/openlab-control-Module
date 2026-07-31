@@ -332,7 +332,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self,
         context: ModuleOperationContext,
     ) -> None:
-        """顺序测量全部有效通道；异常返回核心前先直接请求本模块安全关闭。
+        """测量核心当前调度的一个通道；异常返回核心前先请求安全关闭。
 
         核心随后仍会调用 ``end_sequence("error"|"stopped")`` 做严格确认。这里的
         best-effort 不是替代该生命周期，而是缩短 3706A/6221 通信失败到 Abort、清零、
@@ -362,11 +362,24 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         context: ModuleOperationContext,
         operation_deadline: float,
     ) -> None:
-        """实现正常测量路径，并逐通道产生一行 DAT 与 rawdata。"""
+        """实现当前逻辑槽位的正常测量路径，产生一行 DAT 与 rawdata。"""
 
         settings = self._require_ready()
         channels = self._enabled_channels(settings)
-        for channel in channels:
+        step = context.measurement_step
+        if step is None or step.logical_slot < 1:
+            raise ModuleError(
+                "Delta module received an invalid logical slot",
+                "K6221_3706_LOGICAL_SLOT_INVALID",
+            )
+        scheduled = f"ch{step.logical_slot}"
+        if scheduled not in channels:
+            raise ModuleError(
+                f"{scheduled.upper()} is not enabled for this sequence",
+                "K6221_3706_LOGICAL_SLOT_DISABLED",
+                scheduled,
+            )
+        for channel in (scheduled,):
             context.checkpoint()
             selected = self._channel_settings(
                 settings,
@@ -453,6 +466,17 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             )
             context.update_status(self._status())
             context.checkpoint()
+
+    def measurement_slots(
+        self,
+        context: ModuleOperationContext,
+    ) -> tuple[int, ...]:
+        del context
+        settings = self._require_ready()
+        return tuple(
+            int(channel[2:])
+            for channel in self._enabled_channels(settings)
+        )
 
     def end_sequence(
         self,
