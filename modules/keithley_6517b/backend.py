@@ -1,4 +1,4 @@
-"""Keithley 6517B 恒压两线高电阻测量后端。
+﻿"""Keithley 6517B 恒压两线高电阻测量后端。
 
 本模块固定使用手册定义的 FVMI 接线。关键安全前置条件不是“命令已经发送”，而是：
 
@@ -20,10 +20,9 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
-from labcontrol.measurement.api import (
-    ModuleBackend,
+from labcontrol.module_api import (
     ModuleError,
-    ModuleOperationContext,
+    ModuleAPI,
     ModuleWarning,
 )
 
@@ -55,7 +54,7 @@ class InstrumentTransport(Protocol):
 
 TransportFactory = Callable[[str, float], InstrumentTransport]
 ResourceLister = Callable[[], tuple[str, ...]]
-Waiter = Callable[[ModuleOperationContext, float], None]
+Waiter = Callable[[ModuleAPI, float], None]
 
 
 class PyVisaTransport:
@@ -101,8 +100,15 @@ class PyVisaTransport:
             self._manager.close()
 
 
-class Keithley6517BBackend(ModuleBackend):
+class Keithley6517BBackend:
     """6517B 的连接、METER-CONNECT、测量和高压安全状态机。"""
+
+    columns = {
+        "Resistance": "Ohm",
+        "Voltage": "V",
+        "Current": "A",
+        "StatusCode": "",
+    }
 
     def __init__(
         self,
@@ -113,7 +119,7 @@ class Keithley6517BBackend(ModuleBackend):
         self._transport_factory = transport_factory or PyVisaTransport
         self._resource_lister = resource_lister or PyVisaTransport.list_resources
         self._waiter = waiter or (
-            lambda context, seconds: context.interruptible_sleep(seconds)
+            lambda api, seconds: api.sleep(seconds)
         )
         self.transport: InstrumentTransport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
@@ -130,62 +136,58 @@ class Keithley6517BBackend(ModuleBackend):
         self.last_voltage: float | None = None
         self.last_current: float | None = None
 
-    def initialize(
-        self,
-        settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> Mapping[str, Any]:
+    def open(self, api: ModuleAPI) -> Mapping[str, Any]:
         """Enable 只发现 GPIB；不连接、不改变 METER-CONNECT 或 V-source。"""
 
         self.desired_settings = self._normalized_settings(
-            settings,
+            default_settings(),
             require_resource=False,
-            operation_timeout_seconds=context.operation_timeout_seconds,
+            operation_timeout_seconds=api.timeout,
         )
         try:
             self.available_resources = tuple(
                 sorted(set(self._resource_lister()), key=str.casefold)
             )
-            context.resolve_warning("K6517B_RESOURCE_DISCOVERY_FAILED")
+            api.warn("K6517B_RESOURCE_DISCOVERY_FAILED", None)
         except Exception as exc:
             self.available_resources = ()
-            context.warning(
+            api.warn(
+                "K6517B_RESOURCE_DISCOVERY_FAILED",
                 "GPIB resource discovery failed: "
                 f"{type(exc).__name__}: {exc}",
-                "K6517B_RESOURCE_DISCOVERY_FAILED",
             )
         self.applied_settings = None
         self.identity = ""
         self.sequence_active = False
         self.last_status = "Initialized"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def apply_settings(
+    def configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """在 standby/zero-check 条件下配置并读回全部关键设置。"""
 
         normalized = self._normalized_settings(
             settings,
             require_resource=True,
-            operation_timeout_seconds=context.operation_timeout_seconds,
+            operation_timeout_seconds=api.timeout,
         )
         self.desired_settings = deepcopy(normalized)
         self.applied_settings = None
         try:
             if self.transport is not None:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
                 self._close_transport()
-            self._connect(normalized, context)
-            self._enter_safe_state(context)
-            self._write("*CLS", context)
-            self._configure(normalized, context)
-            self._enter_safe_state(context)
-            self._raise_if_instrument_error(context)
+            self._connect(normalized, api)
+            self._enter_safe_state(api)
+            self._write("*CLS", api)
+            self._configure(normalized, api)
+            self._enter_safe_state(api)
+            self._raise_if_instrument_error(api)
         except Exception as exc:
             cleanup = self._best_effort_safe_state()
             self._close_transport_silently()
@@ -194,31 +196,32 @@ class Keithley6517BBackend(ModuleBackend):
                     "6517B Apply failed and standby/zero-check could not be "
                     f"confirmed: {cleanup}",
                     "K6517B_SAFE_STATE_UNCONFIRMED",
-                    "apply_settings",
+                    "configure",
                 ) from exc
             raise
         self.applied_settings = deepcopy(normalized)
         self.last_status = "Settings applied - standby / zero check on"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def begin_sequence(
+    def _run_start(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         settings = self._require_applied()
-        self._enter_safe_state(context)
-        self._verify_configuration(settings, context)
+        self._enter_safe_state(api)
+        self._verify_configuration(settings, api)
         self.sequence_active = True
         self.last_status = "Sequence ready - standby / zero check on"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def measure(self, context: ModuleOperationContext) -> None:
+    def measure(self, slot: int, api: ModuleAPI) -> Mapping[str, Any]:
         """关闭 zero check、短时 operate、读数，然后严格恢复安全状态。"""
 
+        del slot
         settings = self._require_ready()
         output_off = bool(
             settings["output_off_between_measurements"]
@@ -228,35 +231,35 @@ class Keithley6517BBackend(ModuleBackend):
         reading_status = ""
         compliance = False
         try:
-            context.checkpoint()
-            self._verify_configuration(settings, context)
-            if output_off and not self._query_switch("SYST:ZCH?", context):
+            api.sleep(0)
+            self._verify_configuration(settings, api)
+            if output_off and not self._query_switch("SYST:ZCH?", api):
                 raise ModuleError(
                     "6517B zero check must be ON before a measurement",
                     "K6517B_ZERO_CHECK_MISMATCH",
                     "SYST:ZCH?",
                 )
-            self._set_zero_check(False, context)
+            self._set_zero_check(False, api)
             # METER-CONNECT 在真正打开高压的最后时刻再次验证，防止前面板在 Verify 后改动。
-            if not self._query_switch("SOUR:VOLT:MCON?", context):
+            if not self._query_switch("SOUR:VOLT:MCON?", api):
                 raise ModuleError(
                     "6517B METER-CONNECT is OFF; V-source LO is not connected "
                     "to Ammeter LO",
                     "K6517B_METER_CONNECT_REQUIRED",
                     "SOUR:VOLT:MCON?",
                 )
-            if self._query_switch("SOUR:CURR:RLIM:STAT?", context):
+            if self._query_switch("SOUR:CURR:RLIM:STAT?", api):
                 raise ModuleError(
                     "6517B resistive current limit is ON; the internal 1 MOhm "
                     "series resistor would be included in V/I",
                     "K6517B_RESISTIVE_LIMIT_MISMATCH",
                     "SOUR:CURR:RLIM:STAT?",
                 )
-            self._set_output(True, context)
-            self._waiter(context, float(settings["settle_seconds"]))
-            current, reading_status, voltage = self._read_measurement(context)
-            compliance = self._query_switch("SOUR:CURR:LIM:STAT?", context)
-            context.checkpoint()
+            self._set_output(True, api)
+            self._waiter(api, float(settings["settle_seconds"]))
+            current, reading_status, voltage = self._read_measurement(api)
+            compliance = self._query_switch("SOUR:CURR:LIM:STAT?", api)
+            api.sleep(0)
         except Exception as exc:
             cleanup = self._best_effort_safe_state()
             self.sequence_active = False
@@ -271,16 +274,16 @@ class Keithley6517BBackend(ModuleBackend):
 
         try:
             if output_off:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
             else:
-                if not self._query_switch("OUTP1?", context):
+                if not self._query_switch("OUTP1?", api):
                     raise ModuleError(
                         "6517B V-source unexpectedly entered standby while "
                         "row-boundary retention was enabled",
                         "K6517B_OUTPUT_MISMATCH",
                         "OUTP1?",
                     )
-                if self._query_switch("SYST:ZCH?", context):
+                if self._query_switch("SYST:ZCH?", api):
                     raise ModuleError(
                         "6517B zero check unexpectedly turned ON while "
                         "row-boundary retention was enabled",
@@ -315,7 +318,7 @@ class Keithley6517BBackend(ModuleBackend):
                     "Current": current,
                 }
             )
-            context.resolve_warning("K6517B_READING_WARNING")
+            api.warn("K6517B_READING_WARNING", None)
             self.last_resistance = resistance
             self.last_voltage = voltage
             self.last_current = current
@@ -325,9 +328,9 @@ class Keithley6517BBackend(ModuleBackend):
                 else "Normal - output retained / zero check off"
             )
         else:
-            context.warning(
-                f"Keithley 6517B reading is not valid: {issue}",
+            api.warn(
                 "K6517B_READING_WARNING",
+                f"Keithley 6517B reading is not valid: {issue}",
             )
             self.last_resistance = None
             self.last_voltage = None
@@ -340,30 +343,30 @@ class Keithley6517BBackend(ModuleBackend):
                     else "output retained / zero check off"
                 )
             )
-        context.emit_row(row)
-        context.update_status(self._status())
+        api.status(self._status())
+        return row
 
-    def end_sequence(
+    def _run_end(
         self,
         reason: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
-        self._enter_safe_state(context)
+        self._enter_safe_state(api)
         self.last_status = f"Sequence {reason} - standby / zero check on"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def abort(
+    def close(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
         failure: Exception | None = None
         try:
             if self.transport is not None:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
         except Exception as exc:
             failure = exc
         finally:
@@ -376,7 +379,7 @@ class Keithley6517BBackend(ModuleBackend):
             "Disabled - safe state unconfirmed" if failure else "Disabled"
         )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         if failure is not None:
             if isinstance(failure, ModuleError):
                 raise failure
@@ -386,18 +389,18 @@ class Keithley6517BBackend(ModuleBackend):
             ) from failure
         return status
 
-    def read_status(
+    def _read_status(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """只读实际 V-source、zero-check 和 METER-CONNECT 状态。"""
 
         if self.transport is not None:
-            output = self._query_switch("OUTP1?", context)
-            zero_check = self._query_switch("SYST:ZCH?", context)
-            meter_connect = self._query_switch("SOUR:VOLT:MCON?", context)
+            output = self._query_switch("OUTP1?", api)
+            zero_check = self._query_switch("SYST:ZCH?", api)
+            meter_connect = self._query_switch("SOUR:VOLT:MCON?", api)
             resistive_limit = self._query_switch(
-                "SOUR:CURR:RLIM:STAT?", context
+                "SOUR:CURR:RLIM:STAT?", api
             )
             self.last_resistive_limit = "On" if resistive_limit else "Off"
             self._record_safety_state(output, zero_check, meter_connect)
@@ -408,14 +411,14 @@ class Keithley6517BBackend(ModuleBackend):
                 f"resistive limit {'on' if resistive_limit else 'off'}"
             )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def manual_action(
+    def _action(
         self,
         action: str,
         payload: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         if action == "refresh_resources":
             try:
@@ -428,7 +431,7 @@ class Keithley6517BBackend(ModuleBackend):
                     f"{type(exc).__name__}: {exc}",
                     "K6517B_RESOURCE_DISCOVERY_FAILED",
                 ) from exc
-            context.resolve_warning("K6517B_RESOURCE_DISCOVERY_FAILED")
+            api.warn("K6517B_RESOURCE_DISCOVERY_FAILED", None)
         elif action == "test_connection":
             candidate = payload.get("settings", self.desired_settings)
             if not isinstance(candidate, Mapping):
@@ -440,24 +443,50 @@ class Keithley6517BBackend(ModuleBackend):
             settings = self._normalized_settings(
                 candidate,
                 require_resource=True,
-                operation_timeout_seconds=context.operation_timeout_seconds,
+                operation_timeout_seconds=api.timeout,
             )
-            self._test_connection(settings, context)
+            self._test_connection(settings, api)
             self.last_status = "Connection test passed (read-only)"
         elif action == "safe_off":
             if self.transport is not None:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
             self.last_status = "Standby / zero check on"
         else:
-            return super().manual_action(action, payload, context) or {}
+            raise ModuleError(
+                f"Unsupported action: {action}",
+                "UNSUPPORTED_ACTION",
+                action,
+            )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
+
+    def on_event(
+        self,
+        event: str,
+        data: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        if event == "run_start":
+            return self._run_start(api)
+        if event == "run_end":
+            return self._run_end(str(data.get("reason", "error")), api)
+        if event == "status":
+            return self._read_status(api)
+        if event == "action":
+            payload = data.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ModuleError(
+                    "Action payload must be a mapping",
+                    "K6517B_INVALID_ACTION",
+                )
+            return self._action(str(data.get("name", "")), payload, api)
+        return {}
 
     def _connect(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
@@ -471,7 +500,7 @@ class Keithley6517BBackend(ModuleBackend):
                 resource,
             ) from exc
         try:
-            identity = self._query("*IDN?", context)
+            identity = self._query("*IDN?", api)
             self._validate_identity(identity)
         except Exception:
             self._close_transport_silently()
@@ -481,13 +510,13 @@ class Keithley6517BBackend(ModuleBackend):
     def _test_connection(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
         if self.transport is not None and self.applied_settings is not None:
             if str(self.applied_settings["resource"]) == resource:
-                self._validate_identity(self._query("*IDN?", context))
+                self._validate_identity(self._query("*IDN?", api))
                 return
         try:
             temporary = self._transport_factory(resource, timeout)
@@ -499,9 +528,9 @@ class Keithley6517BBackend(ModuleBackend):
                 resource,
             ) from exc
         try:
-            context.checkpoint()
+            api.sleep(0)
             self._validate_identity(str(temporary.query("*IDN?")).strip())
-            context.checkpoint()
+            api.sleep(0)
         except ModuleError:
             raise
         except Exception as exc:
@@ -526,64 +555,64 @@ class Keithley6517BBackend(ModuleBackend):
     def _configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         range_value = SOURCE_RANGES[str(settings["source_range"])]
-        self._write(f"SOUR:VOLT:RANG {self._scpi(range_value)}", context)
+        self._write(f"SOUR:VOLT:RANG {self._scpi(range_value)}", api)
         self._write(
             f"SOUR:VOLT:LIM {self._scpi(settings['voltage_limit'])}",
-            context,
+            api,
         )
-        self._write("SOUR:VOLT:LIM:STAT ON", context)
+        self._write("SOUR:VOLT:LIM:STAT ON", api)
         self._write(
             f"SOUR:VOLT {self._scpi(settings['source_voltage'])}",
-            context,
+            api,
         )
         # RLIM ON 会在 V-SOURCE OUT HI 串入 1 MΩ；若不关闭，V/I 将包含该电阻，
         # 不能代表 DUT 本身。FVMI 模块因此固定关闭并在每次输出前读回确认。
-        self._write("SOUR:CURR:RLIM:STAT OFF", context)
+        self._write("SOUR:CURR:RLIM:STAT OFF", api)
         # 该命令就是手册 METER-CONNECT 菜单的远程等价物。
-        self._write("SOUR:VOLT:MCON ON", context)
-        self._write("SENS:FUNC 'CURR:DC'", context)
-        self._write("SENS:CURR:RANG:AUTO ON", context)
+        self._write("SOUR:VOLT:MCON ON", api)
+        self._write("SENS:FUNC 'CURR:DC'", api)
+        self._write("SENS:CURR:RANG:AUTO ON", api)
         self._write(
             f"SENS:CURR:NPLC {self._scpi(settings['nplc'])}",
-            context,
+            api,
         )
-        self._write("FORM:DATA ASC", context)
-        self._write("FORM:ELEM READ,STAT,VSOUR", context)
-        self._verify_configuration(settings, context)
+        self._write("FORM:DATA ASC", api)
+        self._write("FORM:ELEM READ,STAT,VSOUR", api)
+        self._verify_configuration(settings, api)
 
     def _verify_configuration(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         range_value = SOURCE_RANGES[str(settings["source_range"])]
         self._expect_number(
-            "SOUR:VOLT:RANG?", range_value, "source_range", context
+            "SOUR:VOLT:RANG?", range_value, "source_range", api
         )
         self._expect_number(
             "SOUR:VOLT?",
             float(settings["source_voltage"]),
             "source_voltage",
-            context,
+            api,
         )
         self._expect_number(
             "SOUR:VOLT:LIM?",
             float(settings["voltage_limit"]),
             "voltage_limit",
-            context,
+            api,
         )
-        if not self._query_switch("SOUR:VOLT:LIM:STAT?", context):
+        if not self._query_switch("SOUR:VOLT:LIM:STAT?", api):
             self._settings_mismatch("voltage_limit_state", True, False)
         resistive_limit = self._query_switch(
-            "SOUR:CURR:RLIM:STAT?", context
+            "SOUR:CURR:RLIM:STAT?", api
         )
         self.last_resistive_limit = "On" if resistive_limit else "Off"
         if resistive_limit:
             self._settings_mismatch("resistive_current_limit", False, True)
-        meter_connect = self._query_switch("SOUR:VOLT:MCON?", context)
+        meter_connect = self._query_switch("SOUR:VOLT:MCON?", api)
         self.last_meter_connect = "On" if meter_connect else "Off"
         if not meter_connect:
             raise ModuleError(
@@ -592,20 +621,20 @@ class Keithley6517BBackend(ModuleBackend):
                 "K6517B_METER_CONNECT_REQUIRED",
                 "SOUR:VOLT:MCON?",
             )
-        function = self._clean_token(self._query("SENS:FUNC?", context))
+        function = self._clean_token(self._query("SENS:FUNC?", api))
         if "CURR" not in function:
             self._settings_mismatch("sense_function", "CURR", function)
-        if not self._query_switch("SENS:CURR:RANG:AUTO?", context):
+        if not self._query_switch("SENS:CURR:RANG:AUTO?", api):
             self._settings_mismatch("current_autorange", True, False)
         self._expect_number(
             "SENS:CURR:NPLC?",
             float(settings["nplc"]),
             "nplc",
-            context,
+            api,
         )
         elements = {
             self._canonical_element(item)
-            for item in self._query("FORM:ELEM?", context).split(",")
+            for item in self._query("FORM:ELEM?", api).split(",")
         }
         if elements != {"READ", "STAT", "VSOUR"}:
             self._settings_mismatch(
@@ -616,9 +645,9 @@ class Keithley6517BBackend(ModuleBackend):
 
     def _read_measurement(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> tuple[float, str, float]:
-        reply = self._query("READ?", context)
+        reply = self._query("READ?", api)
         parts = [item.strip() for item in reply.split(",")]
         if len(parts) != 3:
             raise ModuleError(
@@ -668,16 +697,16 @@ class Keithley6517BBackend(ModuleBackend):
             return STATUS_CODE_OVER_RANGE, "calculated resistance is overrange"
         return STATUS_CODE_NORMAL, ""
 
-    def _enter_safe_state(self, context: ModuleOperationContext) -> None:
+    def _enter_safe_state(self, api: ModuleAPI) -> None:
         """无论第一步是否失败，都继续尝试第二个安全动作。"""
 
         failures: list[str] = []
         try:
-            self._set_output(False, context)
+            self._set_output(False, api)
         except Exception as exc:
             failures.append(f"standby: {type(exc).__name__}: {exc}")
         try:
-            self._set_zero_check(True, context)
+            self._set_zero_check(True, api)
         except Exception as exc:
             failures.append(f"zero check: {type(exc).__name__}: {exc}")
         if failures:
@@ -689,10 +718,10 @@ class Keithley6517BBackend(ModuleBackend):
     def _set_output(
         self,
         enabled: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        self._write("OUTP1 ON" if enabled else "OUTP1 OFF", context)
-        actual = self._query_switch("OUTP1?", context)
+        self._write("OUTP1 ON" if enabled else "OUTP1 OFF", api)
+        actual = self._query_switch("OUTP1?", api)
         self.last_output = "Operate" if actual else "Standby"
         if actual != enabled:
             raise ModuleError(
@@ -704,10 +733,10 @@ class Keithley6517BBackend(ModuleBackend):
     def _set_zero_check(
         self,
         enabled: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        self._write("SYST:ZCH ON" if enabled else "SYST:ZCH OFF", context)
-        actual = self._query_switch("SYST:ZCH?", context)
+        self._write("SYST:ZCH ON" if enabled else "SYST:ZCH OFF", api)
+        actual = self._query_switch("SYST:ZCH?", api)
         self.last_zero_check = "On" if actual else "Off"
         if actual != enabled:
             raise ModuleError(
@@ -752,9 +781,9 @@ class Keithley6517BBackend(ModuleBackend):
 
     def _raise_if_instrument_error(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        reply = self._query("SYST:ERR?", context)
+        reply = self._query("SYST:ERR?", api)
         matched = re.match(r"\s*([+-]?\d+)", reply)
         if matched is None:
             raise ModuleError(
@@ -769,9 +798,9 @@ class Keithley6517BBackend(ModuleBackend):
                 "SYST:ERR?",
             )
 
-    def _write(self, command: str, context: ModuleOperationContext) -> None:
+    def _write(self, command: str, api: ModuleAPI) -> None:
         transport = self._require_transport()
-        context.checkpoint()
+        api.sleep(0)
         try:
             transport.write(command)
         except Exception as exc:
@@ -781,11 +810,11 @@ class Keithley6517BBackend(ModuleBackend):
                 "K6517B_IO_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
 
-    def _query(self, command: str, context: ModuleOperationContext) -> str:
+    def _query(self, command: str, api: ModuleAPI) -> str:
         transport = self._require_transport()
-        context.checkpoint()
+        api.sleep(0)
         try:
             reply = str(transport.query(command)).strip()
         except Exception as exc:
@@ -795,7 +824,7 @@ class Keithley6517BBackend(ModuleBackend):
                 "K6517B_IO_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
         if not reply:
             raise ModuleError(
                 f"6517B returned an empty response for {command!r}",
@@ -807,9 +836,9 @@ class Keithley6517BBackend(ModuleBackend):
     def _query_switch(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> bool:
-        return self._parse_switch(self._query(command, context), command)
+        return self._parse_switch(self._query(command, api), command)
 
     @staticmethod
     def _parse_switch(value: object, command: str) -> bool:
@@ -840,9 +869,9 @@ class Keithley6517BBackend(ModuleBackend):
         command: str,
         expected: float,
         field: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        actual = self._numeric_element(self._query(command, context), command)
+        actual = self._numeric_element(self._query(command, api), command)
         tolerance = max(1.0e-12, abs(expected) * 1.0e-6)
         if not math.isfinite(actual) or abs(actual - expected) > tolerance:
             self._settings_mismatch(field, expected, actual)
@@ -1091,4 +1120,6 @@ class Keithley6517BBackend(ModuleBackend):
         )
 
 
-__all__ = ["Keithley6517BBackend", "PyVisaTransport"]
+Module = Keithley6517BBackend
+
+__all__ = ["Keithley6517BBackend", "Module", "PyVisaTransport"]

@@ -26,11 +26,11 @@ Model 2400 的绝对命令能力约为 ±210 V、±1.05 A，连续工作边界�
 - **Apply Settings**：连接并核对 `*IDN?`，先关闭输出，再写入并读回源模式、源值、
   compliance、NPLC 和 sense mode；固定启用 concurrent V/I measurement，并移除可能
   遗留的其他测量函数；结束时再次确认 `OUTP? = 0`。
-- **Measure**：本模块声明 `measurement_mode = "once_per_slot"`，所以核心在每个逻辑
-  通道行都重新调用一次；确认设置未被前面板改变，打开输出，等待 settle，并读取
+- **Measure**：本模块没有声明 `slots`，所以核心在每个逻辑槽位都调用一次
+  `measure(slot, api)`；确认设置未被前面板改变，打开输出，等待 settle，并读取
   电压/电流和 compliance。
-- **Stop / Error / completed**：关闭并确认输出，但模块保持 Enabled 和连接状态。
-- **Disable / 应用退出**：关闭并确认输出后释放 VISA session。
+- **Stop / Error / completed**：`run_end` 关闭并确认输出，但模块保持 Enabled 和连接状态。
+- **Disable / 应用退出**：`close(api)` 关闭并确认输出后释放 VISA session。
 
 任何无法确认输出已经关闭、设置读回不一致、通信中断或型号不匹配都属于框架 Error，
 会中止 SEQ。单次读数超量程、compliance 或无法计算电阻属于数据 Warning，写入状态行并

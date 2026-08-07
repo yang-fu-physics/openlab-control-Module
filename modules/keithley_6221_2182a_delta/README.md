@@ -4,8 +4,7 @@ Version `0.1.0b5` is a Beta Measurement Module for a Keithley 6221 current
 source, a Keithley 2182A
 nanovoltmeter connected to the 6221 by RS-232 and Trigger Link, and an optional
 Keithley 7001 switch system controlled by a second GPIB resource.
-It requires OpenLab Control `>=0.11.5,<0.12` for API 1.1 logical-slot
-scheduling and core-managed rawdata rows.
+It uses the core's optional logical-slot hook and core-managed rawdata rows.
 
 Before using Apply, manually enable the 2182A RS-232 interface at 19.2 kbaud,
 XON/XOFF flow control, and CR termination; configure the 6221 serial side to
@@ -16,7 +15,7 @@ communication settings.
 
 The module has two modes:
 
-- **Shared configuration / continuous Armed**: `begin_sequence` applies the
+- **Shared configuration / continuous Armed**: the `run_start` event applies the
   common settings, sends `SOUR:DELT:ARM`, waits at least 3 seconds, verifies the
   Armed state, and remains Armed until the SEQ ends. Each Measure switches the
   enabled channels and starts a finite Delta acquisition by software trigger.
@@ -24,7 +23,7 @@ The module has two modes:
   the module aborts Delta and confirms zero/off state. After switching, it applies
   that channel's complete settings, arms, waits 3 seconds, verifies, and triggers.
 
-The module declares `measurement_mode = "aligned_slots"`. The core calls it
+The module's dynamic `slots` property makes the core call it
 once for each enabled logical channel, aligns CH1-CH4 with other scanner
 modules, and writes one DAT row per channel. The DAT contains the
 numeric channel index (1-4), resistance converted from Delta voltage, effective
@@ -46,9 +45,9 @@ are:
 Edit the full 7001 addresses in that file and restart the application when the
 installed switching card or slot differs.
 
-If 7001 is blank or cannot be identified during Enable, the module raises a
+If 7001 is blank or cannot be identified during Apply, the module raises a
 deduplicated Warning and works as a direct CH1-only measurement. A 7001 failure
-after initialization is fatal: there is no automatic retry because an uncertain
+after successful Apply is fatal: there is no automatic retry because an uncertain
 route must not be followed by a current trigger.
 
 `StatusCode` is module-specific and contains no text:

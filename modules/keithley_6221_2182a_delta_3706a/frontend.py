@@ -32,9 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from labcontrol.measurement.frontend_api import (
-    ModuleFrontend,
-)
+from labcontrol.measurement.frontend_api import ModuleUIAPI
 
 from .constants import (
     FILTER_TYPES,
@@ -106,10 +104,18 @@ class _QuantityEdit(QLineEdit):
         )
 
 
-class Keithley6221Delta3706AFrontend(ModuleFrontend):
+class Keithley6221Delta3706AFrontend(QWidget):
     """Delta Settings/Status 页面与设置序列化适配器。"""
 
-    def create_settings_page(
+    def __init__(self, api: ModuleUIAPI) -> None:
+        super().__init__()
+        self.api = api
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_settings(self))
+        self.status_widget = self._build_status_widget()
+
+    def _build_settings(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -136,7 +142,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "Refresh GPIB"
         )
         self.refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "refresh_resources"
             )
         )
@@ -144,9 +150,9 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "Test Connections"
         )
         self.test_connection_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "test_connection",
-                {"settings": self.settings()},
+                {"settings": self.dump()},
             )
         )
         self.io_timeout = QDoubleSpinBox()
@@ -347,13 +353,11 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
 
         scroll.setWidget(content)
         outer.addWidget(scroll)
-        self._sequence_running = False
         self._switcher_available = True
-        self._connect_change_signals()
         self.mode.currentIndexChanged.connect(
             self._update_mode_page
         )
-        self.load_settings(default_settings())
+        self.load(default_settings())
         return page
 
     def _create_delta_group(
@@ -433,7 +437,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         }
         return group, widgets
 
-    def create_status_page(
+    def _build_status_widget(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -469,7 +473,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "Refresh GPIB"
         )
         self.status_refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "refresh_resources"
             )
         )
@@ -477,13 +481,13 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             "Refresh Status"
         )
         self.refresh_status_button.clicked.connect(
-            self.context.request_status_refresh
+            self.api.refresh
         )
         self.safe_off_button = QPushButton(
             "Safe Output Off"
         )
         self.safe_off_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "safe_off"
             )
         )
@@ -497,7 +501,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         layout.addStretch(1)
         return page
 
-    def settings(self) -> dict[str, Any]:
+    def dump(self) -> dict[str, Any]:
         """读取界面文本；SI 数值由 worker 后端统一解析和验证。"""
 
         return {
@@ -586,7 +590,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             ),
         }
 
-    def load_settings(
+    def load(
         self,
         settings: Mapping[str, Any],
     ) -> None:
@@ -697,7 +701,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             )
         )
 
-    def update_status(
+    def show_status(
         self,
         status: Mapping[str, Any],
     ) -> None:
@@ -736,21 +740,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             else:
                 label.setText(str(value))
 
-    def set_sequence_running(
-        self,
-        running: bool,
-    ) -> None:
-        self._sequence_running = running
-        for button in (
-            self.refresh_resources_button,
-            self.test_connection_button,
-            self.status_refresh_resources_button,
-            self.refresh_status_button,
-            self.safe_off_button,
-        ):
-            button.setEnabled(not running)
-        self._update_control_availability()
-
     def _update_mode_page(
         self,
         *_args: Any,
@@ -768,7 +757,7 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
                 index == 1 or self._switcher_available
             )
             self.channel_enabled[key].setEnabled(
-                available and not self._sequence_running
+                available
             )
             self.independent_tabs.setTabEnabled(
                 index - 1,
@@ -825,26 +814,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         combo.setMinimumContentsLength(24)
         return combo
 
-    def _connect_change_signals(self) -> None:
-        for widget in self._setting_widgets():
-            if isinstance(widget, QLineEdit):
-                widget.textChanged.connect(self._changed)
-            elif isinstance(widget, QComboBox):
-                widget.currentIndexChanged.connect(
-                    self._changed
-                )
-                if widget.isEditable():
-                    widget.currentTextChanged.connect(
-                        self._changed
-                    )
-            elif isinstance(widget, QCheckBox):
-                widget.toggled.connect(self._changed)
-            elif isinstance(
-                widget,
-                (QSpinBox, QDoubleSpinBox),
-            ):
-                widget.valueChanged.connect(self._changed)
-
     def _setting_widgets(self) -> list[QWidget]:
         widgets: list[QWidget] = [
             self.resource_6221,
@@ -859,9 +828,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
             widgets.extend(channel.values())
         # 同一个控件只应安装一个 QSignalBlocker/信号连接。
         return list(dict.fromkeys(widgets))
-
-    def _changed(self, *_args: Any) -> None:
-        self.settingsChanged.emit()
 
     @staticmethod
     def _merged_settings(
@@ -900,4 +866,6 @@ class Keithley6221Delta3706AFrontend(ModuleFrontend):
         return result
 
 
-__all__ = ["Keithley6221Delta3706AFrontend"]
+Frontend = Keithley6221Delta3706AFrontend
+
+__all__ = ["Frontend", "Keithley6221Delta3706AFrontend"]

@@ -6,11 +6,10 @@ as NI-VISA or Keysight VISA.
 
 ## Framework dependency status
 
-PyVISA 1.16.2 and typing_extensions 4.16.0 are shared framework dependencies
-provided directly by OpenLab Control. The manifest keeps compatible version
-ranges so an incompatible core is rejected before module source is imported,
-but this module has no additional dependency runtime, lock file, wheel folder,
-or Install Dependencies step.
+PyVISA and typing_extensions are shared framework dependencies provided directly
+by OpenLab Control and are not repeated in the module manifest. This module has
+no additional dependency runtime, lock file, wheel folder, or Install
+Dependencies step.
 
 The VISA vendor implementation itself is a system driver, not a Python wheel.
 Install and configure NI-VISA or Keysight VISA separately on the instrument
@@ -18,8 +17,8 @@ computer; that operation is outside OpenLab Control.
 
 ## Measurement order
 
-The module declares `measurement_mode = "aligned_slots"`. After
-`begin_sequence`, the core freezes the enabled R1-R4 logical slots and invokes
+The dynamic `slots` property returns the enabled R1-R4 logical slots.
+After `on_event("run_start", ...)`, the core freezes those slots and invokes
 this backend once for each current slot. When another scanner is enabled, R1 is
 aligned with its CH1, R2 with CH2, and so on; each logical channel remains one
 DAT row. For the current slot, the module:
@@ -69,8 +68,8 @@ mismatch, or unconfirmed shunt are system Errors and stop the SEQ.
 
 ## Safety and first hardware test
 
-- Enable loads settings and discovers resources only; it does not connect or
-  apply instrument settings.
+- Enable calls `open(api)` and discovers resources only; saved settings remain
+  in the UI and are not applied to the instrument.
 - Apply Settings verifies `*IDN?`, configures only the four selected physical
   inputs, reads every setting back, and leaves excitation shunted.
 - Each scan switch and excitation-shunt change is read back before a value is
@@ -87,8 +86,8 @@ mismatch, or unconfirmed shunt are system Errors and stop the SEQ.
   saved setting.
 - The estimated scan duration must fit inside the core module operation
   timeout.
-- End/Stop/Error shunts all enabled configured inputs. Disable/application
-  exit additionally closes the VISA resource manager.
+- The `run_end` event for completed/Stop/Error shunts all enabled configured
+  inputs. `close(api)` on Disable/application exit also releases VISA resources.
 
 Before connecting a sample, verify the GPIB address and commands with the
 instrument disconnected from sensitive sensors, then test the smallest safe

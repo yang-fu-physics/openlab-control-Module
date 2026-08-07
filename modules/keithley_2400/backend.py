@@ -1,4 +1,4 @@
-"""Keithley Model 2400 电阻测量模块后端。
+﻿"""Keithley Model 2400 电阻测量模块后端。
 
 模块把 2400 当作单通道 SMU 使用：恒流时读取 V/I，恒压时同样读取 V/I，最后统一
 计算 ``R = V / I``。模块不使用仪表的 AUTO OHMS 模式，因为用户需要显式控制源模式；
@@ -17,10 +17,9 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
-from labcontrol.measurement.api import (
-    ModuleBackend,
+from labcontrol.module_api import (
     ModuleError,
-    ModuleOperationContext,
+    ModuleAPI,
     ModuleWarning,
 )
 
@@ -56,7 +55,7 @@ class InstrumentTransport(Protocol):
 
 TransportFactory = Callable[[str, float], InstrumentTransport]
 ResourceLister = Callable[[], tuple[str, ...]]
-Waiter = Callable[[ModuleOperationContext, float], None]
+Waiter = Callable[[ModuleAPI, float], None]
 
 
 class PyVisaTransport:
@@ -102,8 +101,15 @@ class PyVisaTransport:
             self._manager.close()
 
 
-class Keithley2400Backend(ModuleBackend):
+class Keithley2400Backend:
     """2400 的生命周期、读回确认、测量和安全关闭状态机。"""
+
+    columns = {
+        "Resistance": "Ohm",
+        "Voltage": "V",
+        "Current": "A",
+        "StatusCode": "",
+    }
 
     def __init__(
         self,
@@ -114,7 +120,7 @@ class Keithley2400Backend(ModuleBackend):
         self._transport_factory = transport_factory or PyVisaTransport
         self._resource_lister = resource_lister or PyVisaTransport.list_resources
         self._waiter = waiter or (
-            lambda context, seconds: context.interruptible_sleep(seconds)
+            lambda api, seconds: api.sleep(seconds)
         )
         self.transport: InstrumentTransport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
@@ -127,42 +133,38 @@ class Keithley2400Backend(ModuleBackend):
         self.last_voltage: float | None = None
         self.last_current: float | None = None
 
-    def initialize(
-        self,
-        settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> Mapping[str, Any]:
-        """Enable 只加载设置并发现资源，绝不连接或改变 2400。"""
+    def open(self, api: ModuleAPI) -> Mapping[str, Any]:
+        """Enable 只发现资源，绝不连接或改变 2400。"""
 
         self.desired_settings = self._normalized_settings(
-            settings,
+            default_settings(),
             require_resource=False,
-            operation_timeout_seconds=context.operation_timeout_seconds,
+            operation_timeout_seconds=api.timeout,
         )
         try:
             self.available_resources = tuple(
                 sorted(set(self._resource_lister()), key=str.casefold)
             )
-            context.resolve_warning("K2400_RESOURCE_DISCOVERY_FAILED")
+            api.warn("K2400_RESOURCE_DISCOVERY_FAILED", None)
         except Exception as exc:
             self.available_resources = ()
-            context.warning(
+            api.warn(
+                "K2400_RESOURCE_DISCOVERY_FAILED",
                 "GPIB resource discovery failed: "
                 f"{type(exc).__name__}: {exc}",
-                "K2400_RESOURCE_DISCOVERY_FAILED",
             )
         self.applied_settings = None
         self.identity = ""
         self.sequence_active = False
         self.last_status = "Initialized"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def apply_settings(
+    def configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """连接、识别、配置并确认输出关闭。
 
@@ -173,20 +175,20 @@ class Keithley2400Backend(ModuleBackend):
         normalized = self._normalized_settings(
             settings,
             require_resource=True,
-            operation_timeout_seconds=context.operation_timeout_seconds,
+            operation_timeout_seconds=api.timeout,
         )
         self.desired_settings = deepcopy(normalized)
         self.applied_settings = None
         try:
             if self.transport is not None:
-                self._set_output(False, context)
+                self._set_output(False, api)
                 self._close_transport()
-            self._connect(normalized, context)
-            self._set_output(False, context)
-            self._write("*CLS", context)
-            self._configure(normalized, context)
-            self._set_output(False, context)
-            self._raise_if_instrument_error(context)
+            self._connect(normalized, api)
+            self._set_output(False, api)
+            self._write("*CLS", api)
+            self._configure(normalized, api)
+            self._set_output(False, api)
+            self._raise_if_instrument_error(api)
         except Exception as exc:
             cleanup = self._best_effort_output_off()
             self._close_transport_silently()
@@ -195,33 +197,34 @@ class Keithley2400Backend(ModuleBackend):
                     "2400 settings failed and output-off could not be confirmed: "
                     f"{cleanup}",
                     "K2400_SAFE_STATE_UNCONFIRMED",
-                    "apply_settings",
+                    "configure",
                 ) from exc
             raise
         self.applied_settings = deepcopy(normalized)
         self.last_status = "Settings applied - output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def begin_sequence(
+    def _run_start(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """Run 开始时确认配置仍一致且输出关闭。"""
 
         settings = self._require_applied()
-        self._set_output(False, context)
-        self._verify_configuration(settings, context)
+        self._set_output(False, api)
+        self._verify_configuration(settings, api)
         self.sequence_active = True
         self.last_status = "Sequence ready - output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def measure(self, context: ModuleOperationContext) -> None:
+    def measure(self, slot: int, api: ModuleAPI) -> Mapping[str, Any]:
         """执行一次有严格清理边界的源-等待-读数事务。"""
 
+        del slot
         settings = self._require_ready()
         output_off = bool(
             settings["output_off_between_measurements"]
@@ -230,13 +233,13 @@ class Keithley2400Backend(ModuleBackend):
         current = 0.0
         compliance = False
         try:
-            context.checkpoint()
-            self._verify_configuration(settings, context)
-            self._set_output(True, context)
-            self._waiter(context, float(settings["settle_seconds"]))
-            voltage, current = self._read_voltage_current(context)
-            compliance = self._read_compliance(settings, context)
-            context.checkpoint()
+            api.sleep(0)
+            self._verify_configuration(settings, api)
+            self._set_output(True, api)
+            self._waiter(api, float(settings["settle_seconds"]))
+            voltage, current = self._read_voltage_current(api)
+            compliance = self._read_compliance(settings, api)
+            api.sleep(0)
         except Exception as exc:
             cleanup = self._best_effort_output_off()
             self.sequence_active = False
@@ -253,8 +256,8 @@ class Keithley2400Backend(ModuleBackend):
         # 它确实处于有意的 ON 状态；Stop/Error/completed/Disable 始终走关闭路径。
         try:
             if output_off:
-                self._set_output(False, context)
-            elif not self._query_switch("OUTP?", context):
+                self._set_output(False, api)
+            elif not self._query_switch("OUTP?", api):
                 raise ModuleError(
                     "2400 output turned off unexpectedly while row-boundary "
                     "retention was enabled",
@@ -287,7 +290,7 @@ class Keithley2400Backend(ModuleBackend):
                     "Current": current,
                 }
             )
-            context.resolve_warning("K2400_READING_WARNING")
+            api.warn("K2400_READING_WARNING", None)
             self.last_resistance = resistance
             self.last_voltage = voltage
             self.last_current = current
@@ -297,9 +300,9 @@ class Keithley2400Backend(ModuleBackend):
                 else "Normal - output retained"
             )
         else:
-            context.warning(
-                f"Keithley 2400 reading is not valid: {issue}",
+            api.warn(
                 "K2400_READING_WARNING",
+                f"Keithley 2400 reading is not valid: {issue}",
             )
             self.last_resistance = None
             self.last_voltage = None
@@ -308,26 +311,26 @@ class Keithley2400Backend(ModuleBackend):
                 f"Data warning ({status_code}) - "
                 + ("output off" if output_off else "output retained")
             )
-        context.emit_row(row)
-        context.update_status(self._status())
+        api.status(self._status())
+        return row
 
-    def end_sequence(
+    def _run_end(
         self,
         reason: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """completed、stopped 和 error 都关闭并确认输出。"""
 
         self.sequence_active = False
-        self._set_output(False, context)
+        self._set_output(False, api)
         self.last_status = f"Sequence {reason} - output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def abort(
+    def close(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """Disable/退出时确认输出关闭并释放 VISA session；可重复调用。"""
 
@@ -335,7 +338,7 @@ class Keithley2400Backend(ModuleBackend):
         failure: Exception | None = None
         try:
             if self.transport is not None:
-                self._set_output(False, context)
+                self._set_output(False, api)
         except Exception as exc:
             failure = exc
         finally:
@@ -348,7 +351,7 @@ class Keithley2400Backend(ModuleBackend):
             "Disabled - safe state unconfirmed" if failure else "Disabled"
         )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         if failure is not None:
             if isinstance(failure, ModuleError):
                 raise failure
@@ -358,30 +361,30 @@ class Keithley2400Backend(ModuleBackend):
             ) from failure
         return status
 
-    def read_status(
+    def _read_status(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """只读查询当前输出和基本配置，不隐式连接或 Apply。"""
 
         if self.transport is not None:
-            output = self._query_switch("OUTP?", context)
-            source = self._clean_token(self._query("SOUR:FUNC?", context))
-            sense = self._query_switch("SYST:RSEN?", context)
+            output = self._query_switch("OUTP?", api)
+            source = self._clean_token(self._query("SOUR:FUNC?", api))
+            sense = self._query_switch("SYST:RSEN?", api)
             self.last_status = (
                 f"Connected / {source} / "
                 f"{'4-wire' if sense else '2-wire'} / "
                 f"output {'on' if output else 'off'}"
             )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def manual_action(
+    def _action(
         self,
         action: str,
         payload: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """处理 Idle 时的资源刷新、只读连接测试和显式 Safe Off。"""
 
@@ -396,7 +399,7 @@ class Keithley2400Backend(ModuleBackend):
                     f"{type(exc).__name__}: {exc}",
                     "K2400_RESOURCE_DISCOVERY_FAILED",
                 ) from exc
-            context.resolve_warning("K2400_RESOURCE_DISCOVERY_FAILED")
+            api.warn("K2400_RESOURCE_DISCOVERY_FAILED", None)
         elif action == "test_connection":
             candidate = payload.get("settings", self.desired_settings)
             if not isinstance(candidate, Mapping):
@@ -408,24 +411,52 @@ class Keithley2400Backend(ModuleBackend):
             settings = self._normalized_settings(
                 candidate,
                 require_resource=True,
-                operation_timeout_seconds=context.operation_timeout_seconds,
+                operation_timeout_seconds=api.timeout,
             )
-            self._test_connection(settings, context)
+            self._test_connection(settings, api)
             self.last_status = "Connection test passed (read-only)"
         elif action == "safe_off":
             if self.transport is not None:
-                self._set_output(False, context)
+                self._set_output(False, api)
             self.last_status = "Output off"
         else:
-            return super().manual_action(action, payload, context) or {}
+            raise ModuleError(
+                f"Unsupported action: {action}",
+                "UNSUPPORTED_ACTION",
+                action,
+            )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
+
+    def on_event(
+        self,
+        event: str,
+        data: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        """把四种可选核心通知收敛到模块内部实现。"""
+
+        if event == "run_start":
+            return self._run_start(api)
+        if event == "run_end":
+            return self._run_end(str(data.get("reason", "error")), api)
+        if event == "status":
+            return self._read_status(api)
+        if event == "action":
+            payload = data.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ModuleError(
+                    "Action payload must be a mapping",
+                    "K2400_INVALID_ACTION",
+                )
+            return self._action(str(data.get("name", "")), payload, api)
+        return {}
 
     def _connect(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
@@ -440,7 +471,7 @@ class Keithley2400Backend(ModuleBackend):
             ) from exc
         self.transport = transport
         try:
-            identity = self._query("*IDN?", context)
+            identity = self._query("*IDN?", api)
             self._validate_identity(identity)
         except Exception:
             self._close_transport_silently()
@@ -450,14 +481,14 @@ class Keithley2400Backend(ModuleBackend):
     def _test_connection(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
         # 已有同一会话时只做身份查询，避免 VISA implementation 拒绝第二个独占 session。
         if self.transport is not None and self.applied_settings is not None:
             if str(self.applied_settings["resource"]) == resource:
-                self._validate_identity(self._query("*IDN?", context))
+                self._validate_identity(self._query("*IDN?", api))
                 return
         try:
             temporary = self._transport_factory(resource, timeout)
@@ -469,9 +500,9 @@ class Keithley2400Backend(ModuleBackend):
                 resource,
             ) from exc
         try:
-            context.checkpoint()
+            api.sleep(0)
             self._validate_identity(str(temporary.query("*IDN?")).strip())
-            context.checkpoint()
+            api.sleep(0)
         except ModuleError:
             raise
         except Exception as exc:
@@ -499,69 +530,69 @@ class Keithley2400Backend(ModuleBackend):
     def _configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         mode = str(settings["source_mode"])
         # 电阻必须由同一次触发得到的实际 V/I 计算。2400 手册明确规定 CONC OFF 时
         # 只能启用一个测量函数，因此这里固定同时启用电压和电流；否则 FORM:ELEM 虽然
         # 列出两个字段，未启用的那一项也不代表一次有效测量。
-        self._write("SENS:FUNC:CONC ON", context)
-        self._write("SENS:FUNC:OFF:ALL", context)
-        self._write("SENS:FUNC:ON 'VOLT:DC','CURR:DC'", context)
+        self._write("SENS:FUNC:CONC ON", api)
+        self._write("SENS:FUNC:OFF:ALL", api)
+        self._write("SENS:FUNC:ON 'VOLT:DC','CURR:DC'", api)
         if mode == SOURCE_CURRENT:
-            self._write("SOUR:FUNC CURR", context)
-            self._write("SOUR:CURR:MODE FIX", context)
-            self._write("SOUR:CURR:RANG:AUTO ON", context)
+            self._write("SOUR:FUNC CURR", api)
+            self._write("SOUR:CURR:MODE FIX", api)
+            self._write("SOUR:CURR:RANG:AUTO ON", api)
             self._write(
                 f"SOUR:CURR:LEV {self._scpi(settings['source_current'])}",
-                context,
+                api,
             )
             self._write(
                 "SENS:VOLT:PROT "
                 f"{self._scpi(settings['voltage_compliance'])}",
-                context,
+                api,
             )
-            self._write("SENS:VOLT:RANG:AUTO ON", context)
+            self._write("SENS:VOLT:RANG:AUTO ON", api)
         else:
-            self._write("SOUR:FUNC VOLT", context)
-            self._write("SOUR:VOLT:MODE FIX", context)
-            self._write("SOUR:VOLT:RANG:AUTO ON", context)
+            self._write("SOUR:FUNC VOLT", api)
+            self._write("SOUR:VOLT:MODE FIX", api)
+            self._write("SOUR:VOLT:RANG:AUTO ON", api)
             self._write(
                 f"SOUR:VOLT:LEV {self._scpi(settings['source_voltage'])}",
-                context,
+                api,
             )
             self._write(
                 "SENS:CURR:PROT "
                 f"{self._scpi(settings['current_compliance'])}",
-                context,
+                api,
             )
-            self._write("SENS:CURR:RANG:AUTO ON", context)
+            self._write("SENS:CURR:RANG:AUTO ON", api)
         # 两个实际测量函数使用相同积分时间，避免一项仍沿用前面板旧值。
         self._write(
             f"SENS:VOLT:NPLC {self._scpi(settings['nplc'])}",
-            context,
+            api,
         )
         self._write(
             f"SENS:CURR:NPLC {self._scpi(settings['nplc'])}",
-            context,
+            api,
         )
         self._write(
             "SYST:RSEN ON"
             if settings["sense_mode"] == SENSE_4WIRE
             else "SYST:RSEN OFF",
-            context,
+            api,
         )
-        self._write("FORM:DATA ASC", context)
-        self._write("FORM:ELEM VOLT,CURR", context)
-        self._verify_configuration(settings, context)
+        self._write("FORM:DATA ASC", api)
+        self._write("FORM:ELEM VOLT,CURR", api)
+        self._verify_configuration(settings, api)
 
     def _verify_configuration(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         mode = str(settings["source_mode"])
-        actual_source = self._clean_token(self._query("SOUR:FUNC?", context))
+        actual_source = self._clean_token(self._query("SOUR:FUNC?", api))
         expected_source = "CURR" if mode == SOURCE_CURRENT else "VOLT"
         if not actual_source.startswith(expected_source):
             self._settings_mismatch("source_mode", expected_source, actual_source)
@@ -571,28 +602,28 @@ class Keithley2400Backend(ModuleBackend):
                 "SOUR:CURR:LEV?",
                 float(settings["source_current"]),
                 "source_current",
-                context,
+                api,
             )
             self._expect_number(
                 "SENS:VOLT:PROT?",
                 float(settings["voltage_compliance"]),
                 "voltage_compliance",
-                context,
+                api,
             )
         else:
             self._expect_number(
                 "SOUR:VOLT:LEV?",
                 float(settings["source_voltage"]),
                 "source_voltage",
-                context,
+                api,
             )
             self._expect_number(
                 "SENS:CURR:PROT?",
                 float(settings["current_compliance"]),
                 "current_compliance",
-                context,
+                api,
             )
-        if not self._query_switch("SENS:FUNC:CONC?", context):
+        if not self._query_switch("SENS:FUNC:CONC?", api):
             self._settings_mismatch(
                 "concurrent_measurements",
                 True,
@@ -600,7 +631,7 @@ class Keithley2400Backend(ModuleBackend):
             )
         actual_functions = {
             self._clean_token(item).split(":", 1)[0]
-            for item in self._query("SENS:FUNC:ON?", context).split(",")
+            for item in self._query("SENS:FUNC:ON?", api).split(",")
             if item.strip()
         }
         if actual_functions != {"VOLT", "CURR"}:
@@ -617,15 +648,15 @@ class Keithley2400Backend(ModuleBackend):
                 command,
                 float(settings["nplc"]),
                 field,
-                context,
+                api,
             )
-        remote = self._query_switch("SYST:RSEN?", context)
+        remote = self._query_switch("SYST:RSEN?", api)
         expected_remote = settings["sense_mode"] == SENSE_4WIRE
         if remote != expected_remote:
             self._settings_mismatch("sense_mode", expected_remote, remote)
         elements = {
             self._clean_token(item)
-            for item in self._query("FORM:ELEM?", context).split(",")
+            for item in self._query("FORM:ELEM?", api).split(",")
         }
         if elements != {"VOLT", "CURR"}:
             self._settings_mismatch(
@@ -636,9 +667,9 @@ class Keithley2400Backend(ModuleBackend):
 
     def _read_voltage_current(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> tuple[float, float]:
-        reply = self._query("READ?", context)
+        reply = self._query("READ?", api)
         parts = [item.strip() for item in reply.split(",") if item.strip()]
         if len(parts) != 2:
             raise ModuleError(
@@ -658,14 +689,14 @@ class Keithley2400Backend(ModuleBackend):
     def _read_compliance(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> bool:
         command = (
             "SENS:VOLT:PROT:TRIP?"
             if settings["source_mode"] == SOURCE_CURRENT
             else "SENS:CURR:PROT:TRIP?"
         )
-        return self._query_switch(command, context)
+        return self._query_switch(command, api)
 
     @staticmethod
     def _classify_reading(
@@ -692,10 +723,10 @@ class Keithley2400Backend(ModuleBackend):
     def _set_output(
         self,
         enabled: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        self._write("OUTP ON" if enabled else "OUTP OFF", context)
-        actual = self._query_switch("OUTP?", context)
+        self._write("OUTP ON" if enabled else "OUTP OFF", api)
+        actual = self._query_switch("OUTP?", api)
         if actual != enabled:
             raise ModuleError(
                 "2400 output readback did not match the requested state",
@@ -719,9 +750,9 @@ class Keithley2400Backend(ModuleBackend):
 
     def _raise_if_instrument_error(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        reply = self._query("SYST:ERR?", context)
+        reply = self._query("SYST:ERR?", api)
         matched = re.match(r"\s*([+-]?\d+)", reply)
         if matched is None:
             raise ModuleError(
@@ -736,9 +767,9 @@ class Keithley2400Backend(ModuleBackend):
                 "SYST:ERR?",
             )
 
-    def _write(self, command: str, context: ModuleOperationContext) -> None:
+    def _write(self, command: str, api: ModuleAPI) -> None:
         transport = self._require_transport()
-        context.checkpoint()
+        api.sleep(0)
         try:
             transport.write(command)
         except Exception as exc:
@@ -748,11 +779,11 @@ class Keithley2400Backend(ModuleBackend):
                 "K2400_IO_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
 
-    def _query(self, command: str, context: ModuleOperationContext) -> str:
+    def _query(self, command: str, api: ModuleAPI) -> str:
         transport = self._require_transport()
-        context.checkpoint()
+        api.sleep(0)
         try:
             reply = str(transport.query(command)).strip()
         except Exception as exc:
@@ -762,7 +793,7 @@ class Keithley2400Backend(ModuleBackend):
                 "K2400_IO_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
         if not reply:
             raise ModuleError(
                 f"2400 returned an empty response for {command!r}",
@@ -774,9 +805,9 @@ class Keithley2400Backend(ModuleBackend):
     def _query_switch(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> bool:
-        return self._parse_switch(self._query(command, context), command)
+        return self._parse_switch(self._query(command, api), command)
 
     @staticmethod
     def _parse_switch(value: object, command: str) -> bool:
@@ -796,9 +827,9 @@ class Keithley2400Backend(ModuleBackend):
         command: str,
         expected: float,
         field: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        reply = self._query(command, context)
+        reply = self._query(command, api)
         try:
             actual = float(reply)
         except ValueError as exc:
@@ -1062,4 +1093,6 @@ class Keithley2400Backend(ModuleBackend):
         )
 
 
-__all__ = ["Keithley2400Backend", "PyVisaTransport"]
+Module = Keithley2400Backend
+
+__all__ = ["Keithley2400Backend", "Module", "PyVisaTransport"]

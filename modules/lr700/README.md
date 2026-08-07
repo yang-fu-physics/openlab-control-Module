@@ -5,7 +5,7 @@ one LR-720-16 sixteen-sensor multiplexer through a VISA GPIB resource.
 
 ## Framework dependencies
 
-PyVISA is supplied and version-checked by OpenLab Control. This module has no
+PyVISA is supplied by OpenLab Control and is not repeated in the manifest. This module has no
 additional dependency runtime, `requirements.lock`, wheel directory, or
 `Install Dependencies` step. A system VISA implementation such as NI-VISA or
 Keysight VISA must still be installed and configured on the instrument
@@ -32,7 +32,7 @@ The LR-700 settings are global rather than stored independently for all
 multiplexer channels. Therefore Apply Settings validates the complete desired
 scan configuration, connects through GPIB, verifies the documented `GET 6`
 protocol response, and leaves the bridge at minimum excitation. During
-Measure, this `aligned_slots` module is called once for the current enabled
+Measure, this module's dynamic `slots` property makes it run once for the current enabled
 logical slot and applies and verifies only that corresponding sensor. The core
 aligns R1-R4 with the same slot numbers of other scanner modules and writes one
 DAT row per logical channel; one backend call never loops over all four slots.
@@ -89,12 +89,12 @@ VAREXC 1       -> 5%, or 1 uV full scale
 ```
 
 The module confirms this state during Apply, before sensor changes, after every
-sensor, and on completed/Stop/Error/Disable/exit paths. If it cannot read the
+sensor, on every completed/Stop/Error `run_end`, and in `close(api)`. If it cannot read the
 state back, it reports an Error instead of claiming the excitation is safe.
 Hardware interlocks and the laboratory's manual emergency procedure remain
 necessary.
 
-Enable only discovers resources and loads saved desired settings. Test
+Enable calls `open(api)` and only discovers resources; saved desired settings remain in the UI. Test
 Connection uses only `GET 6` and `GET 7`; it does not write settings. Loading a
 SEQ imports the module settings but does not Enable, connect, or Apply them.
 

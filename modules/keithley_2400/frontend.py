@@ -24,10 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from labcontrol.measurement.frontend_api import (
-    ModuleFrontend,
-    ModuleFrontendContext,
-)
+from labcontrol.measurement.frontend_api import ModuleUIAPI
 
 from .constants import (
     SENSE_2WIRE,
@@ -76,14 +73,18 @@ class _QuantityEdit(QLineEdit):
         self.setStyleSheet("" if valid else "border: 1px solid #b71c1c;")
 
 
-class Keithley2400Frontend(ModuleFrontend):
+class Keithley2400Frontend(QWidget):
     """单仪表设置页、只读状态页和设置序列化适配器。"""
 
-    def __init__(self, context: ModuleFrontendContext) -> None:
-        super().__init__(context)
-        self._sequence_running = False
+    def __init__(self, api: ModuleUIAPI) -> None:
+        super().__init__()
+        self.api = api
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_settings(self))
+        self.status_widget = self._build_status_widget()
 
-    def create_settings_page(
+    def _build_settings(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -104,12 +105,12 @@ class Keithley2400Frontend(ModuleFrontend):
         self.resource.setMinimumContentsLength(24)
         self.refresh_resources_button = QPushButton("Refresh GPIB")
         self.refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action("refresh_resources")
+            lambda: self.api.action("refresh_resources")
         )
         self.test_connection_button = QPushButton("Test Connection")
         self.test_connection_button.clicked.connect(
-            lambda: self.context.request_manual_action(
-                "test_connection", {"settings": self.settings()}
+            lambda: self.api.action(
+                "test_connection", {"settings": self.dump()}
             )
         )
         self.io_timeout = QDoubleSpinBox()
@@ -196,21 +197,10 @@ class Keithley2400Frontend(ModuleFrontend):
         outer.addWidget(scroll)
 
         self.source_mode.currentIndexChanged.connect(self._update_source_mode)
-        for widget in self._setting_widgets():
-            if isinstance(widget, QLineEdit):
-                widget.textChanged.connect(self._changed)
-            elif isinstance(widget, QComboBox):
-                widget.currentIndexChanged.connect(self._changed)
-                if widget.isEditable():
-                    widget.currentTextChanged.connect(self._changed)
-            elif isinstance(widget, QDoubleSpinBox):
-                widget.valueChanged.connect(self._changed)
-            elif isinstance(widget, QCheckBox):
-                widget.toggled.connect(self._changed)
-        self.load_settings(default_settings())
+        self.load(default_settings())
         return page
 
-    def create_status_page(
+    def _build_status_widget(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -219,11 +209,11 @@ class Keithley2400Frontend(ModuleFrontend):
         actions = QHBoxLayout()
         self.refresh_status_button = QPushButton("Refresh Status")
         self.refresh_status_button.clicked.connect(
-            self.context.request_status_refresh
+            self.api.refresh
         )
         self.safe_off_button = QPushButton("Safe Off")
         self.safe_off_button.clicked.connect(
-            lambda: self.context.request_manual_action("safe_off")
+            lambda: self.api.action("safe_off")
         )
         actions.addWidget(self.refresh_status_button)
         actions.addWidget(self.safe_off_button)
@@ -254,7 +244,7 @@ class Keithley2400Frontend(ModuleFrontend):
         layout.addStretch(1)
         return page
 
-    def settings(self) -> dict[str, Any]:
+    def dump(self) -> dict[str, Any]:
         """返回可保存到 TOML/JSON 的 desired settings；不代表已 Apply。"""
 
         return {
@@ -273,7 +263,7 @@ class Keithley2400Frontend(ModuleFrontend):
             ),
         }
 
-    def load_settings(self, settings: Mapping[str, Any]) -> None:
+    def load(self, settings: Mapping[str, Any]) -> None:
         """加载保存值或 SEQ companion；不会连接、Apply 或打开输出。"""
 
         merged = self._merged_settings(settings)
@@ -294,7 +284,7 @@ class Keithley2400Frontend(ModuleFrontend):
         del blockers
         self._update_source_mode()
 
-    def update_status(self, status: Mapping[str, Any]) -> None:
+    def show_status(self, status: Mapping[str, Any]) -> None:
         resources = status.get("Available GPIB Resources")
         if isinstance(resources, (list, tuple)):
             self._update_resources(tuple(str(item) for item in resources))
@@ -308,16 +298,6 @@ class Keithley2400Frontend(ModuleFrontend):
                 label.setText("Yes" if value else "No")
             else:
                 label.setText(str(value))
-
-    def set_sequence_running(self, running: bool) -> None:
-        self._sequence_running = running
-        for button in (
-            self.refresh_resources_button,
-            self.test_connection_button,
-            self.refresh_status_button,
-            self.safe_off_button,
-        ):
-            button.setEnabled(not running)
 
     def _update_source_mode(self, *_args: Any) -> None:
         current = self.source_mode.currentData() == SOURCE_CURRENT
@@ -373,9 +353,6 @@ class Keithley2400Frontend(ModuleFrontend):
             self.output_off_between_measurements,
         ]
 
-    def _changed(self, *_args: Any) -> None:
-        self.settingsChanged.emit()
-
     @staticmethod
     def _merged_settings(supplied: Mapping[str, Any]) -> dict[str, Any]:
         result = deepcopy(default_settings())
@@ -386,4 +363,6 @@ class Keithley2400Frontend(ModuleFrontend):
         return result
 
 
-__all__ = ["Keithley2400Frontend"]
+Frontend = Keithley2400Frontend
+
+__all__ = ["Frontend", "Keithley2400Frontend"]

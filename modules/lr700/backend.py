@@ -1,4 +1,4 @@
-"""Linear Research LR-700 + LR-720-16 Measurement Module 后端。
+﻿"""Linear Research LR-700 + LR-720-16 Measurement Module 后端。
 
 实现依据用户提供的 LR-700 v1.3 手册：
 
@@ -25,10 +25,9 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
-from labcontrol.measurement.api import (
-    ModuleBackend,
+from labcontrol.module_api import (
     ModuleError,
-    ModuleOperationContext,
+    ModuleAPI,
     ModuleWarning,
 )
 
@@ -60,7 +59,7 @@ TransportFactory = Callable[
     InstrumentTransport,
 ]
 ResourceLister = Callable[[], tuple[str, ...]]
-Waiter = Callable[[ModuleOperationContext, float], None]
+Waiter = Callable[[ModuleAPI, float], None]
 
 
 class PyVisaTransport:
@@ -129,7 +128,7 @@ class PyVisaTransport:
             self._manager.close()
 
 
-class LR700Backend(ModuleBackend):
+class LR700Backend:
     """LR-700 生命周期、四槽位扫描、读回验证和安全恢复状态机。
 
     每个 Enabled 传感器固定执行以下事务：
@@ -143,6 +142,20 @@ class LR700Backend(ModuleBackend):
     7. 写一行只包含当前 Rn/Xn 和公共 StatusCode 的稀疏数据；
     8. 无论成功、Stop 或异常，都尝试恢复并确认最低激励。
     """
+
+    columns = {
+        "TemperatureAverage": "K",
+        "FieldAverage": "Oe",
+        "R1": "Ohm",
+        "X1": "Ohm",
+        "R2": "Ohm",
+        "X2": "Ohm",
+        "R3": "Ohm",
+        "X3": "Ohm",
+        "R4": "Ohm",
+        "X4": "Ohm",
+        "StatusCode": "",
+    }
 
     _SETTINGS_RE = re.compile(
         r"^\s*(\d)R\s*,\s*(\d)E\s*,\s*(\d{1,3})%\s*,"
@@ -176,8 +189,8 @@ class LR700Backend(ModuleBackend):
         self._waiter = (
             waiter
             or (
-                lambda context, seconds:
-                context.interruptible_sleep(seconds)
+                lambda api, seconds:
+                api.sleep(seconds)
             )
         )
         self.transport: InstrumentTransport | None = None
@@ -188,19 +201,15 @@ class LR700Backend(ModuleBackend):
         self.last_values: dict[str, Any] = {}
         self.available_resources: tuple[str, ...] = ()
 
-    def initialize(
-        self,
-        settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> Mapping[str, Any]:
-        """Enable 只读取 desired settings 和枚举地址，不连接、不写 LR-700。"""
+    def open(self, api: ModuleAPI) -> Mapping[str, Any]:
+        """Enable 只枚举地址，不连接、不写 LR-700。"""
 
-        self._require_live_context(context)
+        self._require_live_context(api)
         self.desired_settings = self._normalized_settings(
-            settings,
+            default_settings(),
             require_resource=False,
             operation_timeout_seconds=(
-                context.operation_timeout_seconds
+                api.timeout
             ),
         )
         discovery_message = ""
@@ -238,13 +247,13 @@ class LR700Backend(ModuleBackend):
             "Last Reactance (Ohm)": "-",
             "Last Status": "-",
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def apply_settings(
+    def configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """连接并确认 LR-700 协议，然后把桥置于最低可确认激励。
 
@@ -257,7 +266,7 @@ class LR700Backend(ModuleBackend):
             settings,
             require_resource=True,
             operation_timeout_seconds=(
-                context.operation_timeout_seconds
+                api.timeout
             ),
         )
         self.desired_settings = deepcopy(desired)
@@ -266,7 +275,7 @@ class LR700Backend(ModuleBackend):
             float(desired["io_timeout_seconds"]),
         )
         try:
-            self._set_safe_state(context)
+            self._set_safe_state(api)
         except Exception as failure:
             cleanup_error = (
                 self._best_effort_safe_state()
@@ -294,18 +303,18 @@ class LR700Backend(ModuleBackend):
                 self._estimated_measure_seconds(desired)
             ),
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def begin_sequence(
+    def _run_start(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """开始 Run 前重新确认最低激励，防止 Idle 期间前面板改变输出。"""
 
         self._require_ready()
         try:
-            self._set_safe_state(context)
+            self._set_safe_state(api)
         except Exception as failure:
             cleanup_error = (
                 self._best_effort_safe_state()
@@ -323,24 +332,23 @@ class LR700Backend(ModuleBackend):
             "Sequence": "Running",
             "Excitation Safety": self._safe_state_text(),
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
     def measure(
         self,
-        context: ModuleOperationContext,
-    ) -> None:
-        """只测量核心当前调度的一个逻辑槽位，并 emit 一行稀疏结果。"""
+        slot: int,
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        """只测量核心当前调度的一个逻辑槽位，并返回一行稀疏结果。"""
 
         self._require_ready()
         settings = self.applied_settings
-        step = context.measurement_step
-        if step is None or not 1 <= step.logical_slot <= 4:
+        if not 1 <= slot <= 4:
             raise ModuleError(
                 "LR-700 received an invalid logical slot",
                 "LR700_LOGICAL_SLOT_INVALID",
             )
-        slot = step.logical_slot
         channel = settings["channels"][f"r{slot}"]
         if not channel["enabled"]:
             raise ModuleError(
@@ -350,22 +358,19 @@ class LR700Backend(ModuleBackend):
             )
         self._validate_measure_duration(
             settings,
-            context.operation_timeout_seconds,
+            api.timeout,
         )
-        context.checkpoint()
-        self._measure_sensor(
+        api.sleep(0)
+        return self._measure_sensor(
             slot,
             int(channel["input_channel"]),
             channel,
             settings,
-            context,
+            api,
         )
 
-    def measurement_slots(
-        self,
-        context: ModuleOperationContext,
-    ) -> tuple[int, ...]:
-        del context
+    @property
+    def slots(self) -> tuple[int, ...]:
         self._require_ready()
         assert self.applied_settings is not None
         return tuple(
@@ -380,19 +385,19 @@ class LR700Backend(ModuleBackend):
         input_channel: int,
         channel: Mapping[str, Any],
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> None:
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
         """执行一个逻辑槽位的完整事务，并在 finally 中确认最低激励。"""
 
         failure: Exception | None = None
         try:
-            self._set_safe_state(context)
+            self._set_safe_state(api)
             self._configure_sensor(
                 input_channel,
                 channel,
-                context,
+                api,
             )
-            context.update_status({
+            api.status({
                 "Excitation Safety": (
                     "Measurement excitation active on "
                     f"R{slot} / sensor {input_channel}"
@@ -402,17 +407,17 @@ class LR700Backend(ModuleBackend):
                 ),
             })
             self._waiter(
-                context,
+                api,
                 float(
                     settings["switch_settle_seconds"]
                 ),
             )
-            first = context.sample_system()
+            first = api.devices()
             self._waiter(
-                context,
+                api,
                 float(settings["dwell_seconds"]),
             )
-            second = context.sample_system()
+            second = api.devices()
             temperature, field = (
                 self._averaged_system_values(
                     first,
@@ -423,7 +428,7 @@ class LR700Backend(ModuleBackend):
             # 在读取数值前后都核对当前传感器和设置。LR-700 未被 LocalLockout，
             # 操作者仍可使用前面板；两次读回可避免把中途改变后的值写入错误通道。
             before = self._query_bridge_settings(
-                context
+                api
             )
             self._verify_channel_readback(
                 input_channel,
@@ -437,16 +442,16 @@ class LR700Backend(ModuleBackend):
                     "GET 0",
                     "R",
                     range_index,
-                    context,
+                    api,
                 )
                 reactance = self._query_measurement(
                     "GET 1",
                     "X",
                     range_index,
-                    context,
+                    api,
                 )
                 overload_bits = self._query_overloads(
-                    context
+                    api
                 )
             except ModuleError as exc:
                 # 仅把已经收到但无法解析的 R/X/OVERLOAD 读数视为数据问题。GET 6
@@ -455,7 +460,7 @@ class LR700Backend(ModuleBackend):
                     raise
                 data_failure = exc
             after = self._query_bridge_settings(
-                context
+                api
             )
             self._verify_channel_readback(
                 input_channel,
@@ -467,31 +472,28 @@ class LR700Backend(ModuleBackend):
                 f"R{slot} / sensor {input_channel}"
             )
             if data_failure is not None:
-                context.resolve_warning(
-                    "LR700_READING_WARNING",
-                    warning_context,
-                )
-                context.warning(
+                api.warn("LR700_READING_WARNING", None, warning_context)
+                api.warn(
+                    "LR700_READING_INVALID",
                     f"LR-700 R{slot} / sensor "
                     f"{input_channel} returned an invalid "
                     "measurement; this channel was recorded "
                     f"as ERROR: {data_failure}",
-                    "LR700_READING_INVALID",
                     warning_context,
                 )
-                context.emit_row({
+                row = {
                     "TemperatureAverage": temperature,
                     "FieldAverage": field,
                     "StatusCode": (
                         STATUS_CODE_INVALID_READING
                     ),
-                })
+                }
                 self.last_values = {
                     "slot": slot,
                     "input_channel": input_channel,
                     "status": "ERROR",
                 }
-                context.update_status({
+                api.status({
                     "Last Slot / Sensor": (
                         f"R{slot} / S{input_channel}"
                     ),
@@ -499,12 +501,9 @@ class LR700Backend(ModuleBackend):
                         f"ERROR: {data_failure}"
                     ),
                 })
-                return
+                return row
 
-            context.resolve_warning(
-                "LR700_READING_INVALID",
-                warning_context,
-            )
+            api.warn("LR700_READING_INVALID", None, warning_context)
             status, details = self._status(
                 overload_bits
             )
@@ -513,7 +512,7 @@ class LR700Backend(ModuleBackend):
                 input_channel,
                 status,
                 details,
-                context,
+                api,
             )
             status_code = {
                 "NORMAL": STATUS_CODE_NORMAL,
@@ -532,7 +531,6 @@ class LR700Backend(ModuleBackend):
                     f"R{slot}": resistance,
                     f"X{slot}": reactance,
                 })
-            context.emit_row(row)
             self.last_values = {
                 "slot": slot,
                 "input_channel": input_channel,
@@ -543,7 +541,7 @@ class LR700Backend(ModuleBackend):
                     "resistance": resistance,
                     "reactance": reactance,
                 })
-            context.update_status({
+            api.status({
                 "Last Slot / Sensor": (
                     f"R{slot} / S{input_channel}"
                 ),
@@ -563,16 +561,17 @@ class LR700Backend(ModuleBackend):
                     else f"{status}: {details}"
                 ),
             })
+            return row
         except Exception as exc:
             failure = exc
             raise
         finally:
-            # Stop 会让普通 context checkpoint 立即取消，因此清理路径直接使用带
+            # Stop 会让普通 api checkpoint 立即取消，因此清理路径直接使用带
             # VISA timeout 的底层 transport，不依赖协作上下文。
             cleanup_error = (
                 self._best_effort_safe_state()
             )
-            context.update_status({
+            api.status({
                 "Excitation Safety": (
                     self._safe_state_text()
                     if cleanup_error is None
@@ -589,17 +588,17 @@ class LR700Backend(ModuleBackend):
                     f"sensor {input_channel}",
                 ) from failure
 
-    def end_sequence(
+    def _run_end(
         self,
         reason: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """completed/stopped/error 都直接确认最低激励，模块仍保持 Enabled。"""
 
         error = self._best_effort_safe_state()
         self.sequence_active = False
         if error is not None:
-            context.update_status({
+            api.status({
                 "Sequence": reason.title(),
                 "Excitation Safety": (
                     "Minimum excitation unconfirmed"
@@ -614,12 +613,12 @@ class LR700Backend(ModuleBackend):
             "Sequence": reason.title(),
             "Excitation Safety": self._safe_state_text(),
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def abort(
+    def close(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """Disable/退出时先尽力确认最低激励，再无条件释放 VISA 句柄。"""
 
@@ -652,7 +651,7 @@ class LR700Backend(ModuleBackend):
                 )
             ),
         }
-        context.update_status(status)
+        api.status(status)
         if error is not None:
             raise ModuleError(
                 "LR-700 transport was released, but minimum "
@@ -661,9 +660,9 @@ class LR700Backend(ModuleBackend):
             )
         return status
 
-    def read_status(
+    def _read_status(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """只读 GET 6/GET 7；不会隐式 Apply、切换通道或改变激励。"""
 
@@ -679,8 +678,8 @@ class LR700Backend(ModuleBackend):
                     "Instrument state unknown"
                 ),
             }
-        bridge = self._query_bridge_settings(context)
-        bits = self._query_overloads(context)
+        bridge = self._query_bridge_settings(api)
+        bits = self._query_overloads(api)
         status, details = self._status(bits)
         result = {
             "Connection": "Connected",
@@ -712,14 +711,14 @@ class LR700Backend(ModuleBackend):
                 else f"{status}: {details}"
             ),
         }
-        context.update_status(result)
+        api.status(result)
         return result
 
-    def manual_action(
+    def _action(
         self,
         action: str,
         payload: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """处理资源刷新和只读连接测试；两者都不会保存或 Apply 设置。"""
 
@@ -740,7 +739,7 @@ class LR700Backend(ModuleBackend):
                 "Resource Discovery": "Completed",
                 "Last Action": "GPIB resources refreshed",
             }
-            context.update_status(status)
+            api.status(status)
             return status
 
         if action == "test_connection":
@@ -759,7 +758,7 @@ class LR700Backend(ModuleBackend):
                 candidate,
                 require_resource=True,
                 operation_timeout_seconds=(
-                    context.operation_timeout_seconds
+                    api.timeout
                 ),
             )
             transport: InstrumentTransport | None = None
@@ -803,7 +802,7 @@ class LR700Backend(ModuleBackend):
                 ),
                 "Protocol": self._protocol_text(bridge),
             }
-            context.update_status(status)
+            api.status(status)
             return status
 
         raise ModuleWarning(
@@ -811,6 +810,28 @@ class LR700Backend(ModuleBackend):
             "LR700_UNSUPPORTED_ACTION",
             action,
         )
+
+    def on_event(
+        self,
+        event: str,
+        data: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        if event == "run_start":
+            return self._run_start(api)
+        if event == "run_end":
+            return self._run_end(str(data.get("reason", "error")), api)
+        if event == "status":
+            return self._read_status(api)
+        if event == "action":
+            payload = data.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ModuleError(
+                    "Action payload must be a mapping",
+                    "LR700_INVALID_ACTION",
+                )
+            return self._action(str(data.get("name", "")), payload, api)
+        return {}
 
     def _connect(
         self,
@@ -854,7 +875,7 @@ class LR700Backend(ModuleBackend):
     def _write_absolute(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """发送一次绝对设置命令；写超时后不自动重放。
 
@@ -863,7 +884,7 @@ class LR700Backend(ModuleBackend):
         最低激励恢复路径处理安全状态。
         """
 
-        context.checkpoint()
+        api.sleep(0)
         transport = self.transport
         if transport is None:
             raise ModuleError(
@@ -886,7 +907,7 @@ class LR700Backend(ModuleBackend):
     def _query_text(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> str:
         """对只读 GET 命令做有限重连重试，并拒绝空串和仪表 ``ERROR``。"""
 
@@ -899,7 +920,7 @@ class LR700Backend(ModuleBackend):
         )
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
-            context.checkpoint()
+            api.sleep(0)
             transport = self.transport
             if transport is None:
                 try:
@@ -920,10 +941,7 @@ class LR700Backend(ModuleBackend):
                             "empty response"
                         )
                     elif reply.casefold() == "error":
-                        context.resolve_warning(
-                            "LR700_IO_RETRY",
-                            command,
-                        )
+                        api.warn("LR700_IO_RETRY", None, command)
                         raise ModuleError(
                             "LR-700 rejected the previous "
                             f"command while handling {command}",
@@ -931,29 +949,23 @@ class LR700Backend(ModuleBackend):
                             command,
                         )
                     else:
-                        context.resolve_warning(
-                            "LR700_IO_RETRY",
-                            command,
-                        )
+                        api.warn("LR700_IO_RETRY", None, command)
                         return reply
             if attempt < attempts:
-                context.warning(
+                api.warn(
+                    "LR700_IO_RETRY",
                     "LR-700 read failed; reopening and "
                     f"retrying ({attempt}/{attempts}): "
                     f"{type(last_error).__name__}: "
                     f"{last_error}",
-                    "LR700_IO_RETRY",
                     command,
                 )
-                self._waiter(context, 0.2)
+                self._waiter(api, 0.2)
                 try:
                     self._reopen_transport(settings)
                 except Exception as exc:
                     last_error = exc
-        context.resolve_warning(
-            "LR700_IO_RETRY",
-            command,
-        )
+        api.warn("LR700_IO_RETRY", None, command)
         assert last_error is not None
         raise ModuleError(
             f"LR-700 read failed after {attempts} "
@@ -995,7 +1007,7 @@ class LR700Backend(ModuleBackend):
         self,
         input_channel: int,
         channel: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """发送一套完整的当前传感器绝对设置，并用 GET 6 逐字段读回。"""
 
@@ -1020,9 +1032,9 @@ class LR700Backend(ModuleBackend):
         for command in commands:
             self._write_absolute(
                 command,
-                context,
+                api,
             )
-        bridge = self._query_bridge_settings(context)
+        bridge = self._query_bridge_settings(api)
         self._verify_channel_readback(
             input_channel,
             channel,
@@ -1044,15 +1056,15 @@ class LR700Backend(ModuleBackend):
 
     def _set_safe_state(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """通过普通受控 I/O 设置并读回最低激励。"""
 
         for command in self._safe_state_commands():
-            self._write_absolute(command, context)
-        bridge = self._query_bridge_settings(context)
+            self._write_absolute(command, api)
+        bridge = self._query_bridge_settings(api)
         self._verify_safe_state(bridge)
-        context.update_status({
+        api.status({
             "Excitation Safety": self._safe_state_text(),
         })
 
@@ -1150,10 +1162,10 @@ class LR700Backend(ModuleBackend):
 
     def _query_bridge_settings(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> dict[str, int]:
         return self._parse_bridge_settings(
-            self._query_text("GET 6", context)
+            self._query_text("GET 6", api)
         )
 
     @classmethod
@@ -1277,10 +1289,10 @@ class LR700Backend(ModuleBackend):
         command: str,
         expected_parameter: str,
         range_index: int,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> float:
         return self._parse_measurement(
-            self._query_text(command, context),
+            self._query_text(command, api),
             expected_parameter,
             range_index,
             command,
@@ -1366,10 +1378,10 @@ class LR700Backend(ModuleBackend):
 
     def _query_overloads(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> int:
         return self._parse_overloads(
-            self._query_text("GET 7", context)
+            self._query_text("GET 7", api)
         )
 
     @classmethod
@@ -1414,22 +1426,19 @@ class LR700Backend(ModuleBackend):
         input_channel: int,
         status: str,
         details: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         warning_context = (
             f"R{slot} / sensor {input_channel}"
         )
         if status == "NORMAL":
-            context.resolve_warning(
-                "LR700_READING_WARNING",
-                warning_context,
-            )
+            api.warn("LR700_READING_WARNING", None, warning_context)
             return
-        context.warning(
+        api.warn(
+            "LR700_READING_WARNING",
             f"LR-700 R{slot} / sensor "
             f"{input_channel}: {status}"
             + (f" ({details})" if details else ""),
-            "LR700_READING_WARNING",
             warning_context,
         )
 
@@ -1678,10 +1687,10 @@ class LR700Backend(ModuleBackend):
 
     @staticmethod
     def _require_live_context(
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         timeout = float(
-            context.operation_timeout_seconds
+            api.timeout
         )
         if not math.isfinite(timeout) or timeout <= 0:
             raise ModuleError(
@@ -1690,7 +1699,7 @@ class LR700Backend(ModuleBackend):
                 "LR700_INVALID_SETTINGS",
                 "operation_timeout_seconds",
             )
-        context.checkpoint()
+        api.sleep(0)
 
     @classmethod
     def _normalized_settings(
@@ -2024,8 +2033,11 @@ class LR700Backend(ModuleBackend):
         return value
 
 
+Module = LR700Backend
+
 __all__ = [
     "InstrumentTransport",
     "LR700Backend",
+    "Module",
     "PyVisaTransport",
 ]

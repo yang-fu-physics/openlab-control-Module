@@ -44,11 +44,11 @@
 - **Enable**：只加载设置和发现 GPIB，不连接。
 - **Apply Settings**：连接、核对 6517B 型号，进入 standby，打开 zero check，配置并
   读回 V-source limit、METER-CONNECT、current measurement 和数据格式。
-- **Measure**：本模块声明 `measurement_mode = "once_per_slot"`，所以核心在每个逻辑
-  通道行都重新调用一次；再次确认全部配置和 METER-CONNECT，关闭 zero check，进入
+- **Measure**：本模块没有声明 `slots`，所以核心在每个逻辑槽位都调用一次
+  `measure(slot, api)`；再次确认全部配置和 METER-CONNECT，关闭 zero check，进入
   operate，等待并读取。
-- **Stop / Error / completed**：standby + zero check ON，模块仍保持 Enabled。
-- **Disable / 应用退出**：确认上述安全状态后释放 VISA session。
+- **Stop / Error / completed**：`run_end` 恢复 standby + zero check ON，模块仍保持 Enabled。
+- **Disable / 应用退出**：`close(api)` 确认上述安全状态后释放 VISA session。
 
 通信或设置错误、METER-CONNECT 不确定、standby/zero-check 无法确认都属于框架 Error。
 单次读数 overrange、current compliance 或无法计算电阻属于 Warning，SEQ 继续。

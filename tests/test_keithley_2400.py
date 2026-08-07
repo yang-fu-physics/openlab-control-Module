@@ -16,13 +16,22 @@ sys.path.insert(0, str(CORE / "src"))
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
-from labcontrol.measurement.api import (  # noqa: E402
+from labcontrol.module_api import (  # noqa: E402
     ModuleError,
-    ModuleOperationCancelled,
-    ModuleOperationContext,
+    _ModuleOperationCancelled as ModuleOperationCancelled,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
-    ModuleFrontendContext,
+    ModuleUIAPI,
+)
+from module_contract import (  # noqa: E402
+    TestModuleAPI,
+    measure_module,
+    module_slots,
+    open_module,
+    read_status,
+    run_action,
+    run_end,
+    run_start,
 )
 from labcontrol.measurement.manifest import load_manifest  # noqa: E402
 from labcontrol.measurement.settings import (  # noqa: E402
@@ -211,8 +220,8 @@ class Keithley2400BackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         operation_state=None,
-    ) -> ModuleOperationContext:
-        return ModuleOperationContext(
+    ) -> TestModuleAPI:
+        return TestModuleAPI(
             {},
             lambda kind, values: messages.append((kind, values)),
             None,
@@ -234,16 +243,16 @@ class Keithley2400BackendTests(unittest.TestCase):
             waiter=(
                 (lambda _context, seconds: waits.append(seconds))
                 if waits is not None
-                else (lambda context, _seconds: context.checkpoint())
+                else (lambda context, _seconds: context.sleep(0))
             ),
         )
 
-    def test_initialize_only_discovers_resources(self) -> None:
+    def test_open_only_discovers_resources(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
 
-        status = backend.initialize(_settings(), self._context(messages))
+        status = open_module(backend, self._context(messages))
 
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
@@ -265,8 +274,8 @@ class Keithley2400BackendTests(unittest.TestCase):
             nplc=2.0,
         )
 
-        backend.initialize(settings, self._context(messages))
-        status = backend.apply_settings(settings, self._context(messages))
+        open_module(backend, self._context(messages))
+        status = backend.configure(settings, self._context(messages))
 
         self.assertFalse(state.output)
         self.assertEqual(state.source_func, "CURR")
@@ -293,12 +302,12 @@ class Keithley2400BackendTests(unittest.TestCase):
         backend = self._backend(state, waits)
         context = self._context(messages)
         settings = _settings(source_current="1m", settle_seconds=0.25)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         self.assertEqual(waits, [0.25])
         self.assertFalse(state.output)
@@ -328,12 +337,12 @@ class Keithley2400BackendTests(unittest.TestCase):
             source_voltage="1",
             current_compliance="1m",
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(payload for kind, payload in messages if kind == "row")
         self.assertEqual(row["values"], {"StatusCode": 2})
@@ -350,15 +359,15 @@ class Keithley2400BackendTests(unittest.TestCase):
             source_current="1m",
             output_off_between_measurements=False,
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
         self.assertTrue(state.output)
-        backend.measure(context)
+        measure_module(backend, context)
         self.assertTrue(state.output)
-        backend.end_sequence("completed", context)
+        run_end(backend, "completed", context)
 
         self.assertFalse(state.output)
         self.assertEqual(
@@ -373,12 +382,12 @@ class Keithley2400BackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_current="1m")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(payload for kind, payload in messages if kind == "row")
         self.assertEqual(row["values"], {"StatusCode": 1})
@@ -391,12 +400,12 @@ class Keithley2400BackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_voltage="1", source_mode="voltage")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(payload for kind, payload in messages if kind == "row")
         self.assertEqual(row["values"], {"StatusCode": 3})
@@ -415,12 +424,12 @@ class Keithley2400BackendTests(unittest.TestCase):
         )
         context = self._context(messages)
         settings = _settings(source_current="1m")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         with self.assertRaises(ModuleOperationCancelled):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(state.output)
         self.assertFalse(any(kind == "row" for kind, _ in messages))
@@ -431,15 +440,15 @@ class Keithley2400BackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_current="1m")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         state.failures["READ?"] = 1
         state.failures["OUTP OFF"] = 1
         state.query_overrides["OUTP?"] = "1"
 
         with self.assertRaisesRegex(ModuleError, "output-off could not be confirmed"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(any(kind == "row" for kind, _ in messages))
 
@@ -449,16 +458,16 @@ class Keithley2400BackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_current="1m")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         state.source_current = 2.0e-3
         output_on_before = sum(
             command == "OUTP ON" for kind, command in state.commands if kind == "write"
         )
 
         with self.assertRaisesRegex(ModuleError, "readback mismatch"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         output_on_after = sum(
             command == "OUTP ON" for kind, command in state.commands if kind == "write"
@@ -472,10 +481,10 @@ class Keithley2400BackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(_settings(), context)
+        open_module(backend, context)
 
         with self.assertRaisesRegex(ModuleError, "Expected Keithley Model 2400"):
-            backend.apply_settings(_settings(), context)
+            backend.configure(_settings(), context)
 
         self.assertEqual(state.closed, 1)
         self.assertIsNone(backend.transport)
@@ -486,24 +495,24 @@ class Keithley2400BackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(_settings(), context)
+        open_module(backend, context)
 
         with self.assertRaisesRegex(ModuleError, "instrument error"):
-            backend.apply_settings(_settings(), context)
+            backend.configure(_settings(), context)
 
         self.assertFalse(state.output)
         self.assertEqual(state.closed, 1)
 
-    def test_abort_is_idempotent_and_closes_transport(self) -> None:
+    def test_close_is_idempotent_and_closes_transport(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(_settings(), context)
-        backend.apply_settings(_settings(), context)
+        open_module(backend, context)
+        backend.configure(_settings(), context)
 
-        backend.abort(context)
-        backend.abort(context)
+        backend.close(context)
+        backend.close(context)
 
         self.assertFalse(state.output)
         self.assertEqual(state.closed, 1)
@@ -514,12 +523,12 @@ class Keithley2400BackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context([])
         with self.assertRaises(ModuleError) as current_error:
-            backend.initialize(_settings(source_current="2A"), context)
+            backend.configure(_settings(source_current="2A"), context)
         self.assertEqual(current_error.exception.context, "source_current")
 
-        short_context = ModuleOperationContext({}, lambda *_: None, None, None, 10.0)
+        short_context = TestModuleAPI({}, lambda *_: None, None, None, 10.0)
         with self.assertRaises(ModuleError) as timeout_error:
-            backend.initialize(
+            backend.configure(
                 _settings(settle_seconds=9.0, io_timeout_seconds=1.0),
                 short_context,
             )
@@ -535,12 +544,13 @@ class Keithley2400FrontendTests(unittest.TestCase):
         manifest = load_manifest(MODULE)
         self.assertEqual(manifest.id, "keithley_2400")
         self.assertEqual(
-            [column.name for column in manifest.columns],
+            list(Keithley2400Backend.columns),
             ["Resistance", "Voltage", "Current", "StatusCode"],
         )
-        frontend = Keithley2400Frontend(ModuleFrontendContext())
-        settings_page = frontend.create_settings_page()
-        status_page = frontend.create_status_page()
+        self.assertEqual(manifest.columns, ())
+        frontend = Keithley2400Frontend(ModuleUIAPI())
+        settings_page = frontend
+        status_page = frontend.status_widget
         self.assertIsInstance(settings_page, QWidget)
         self.assertIsInstance(status_page, QWidget)
         supplied = _settings(
@@ -552,8 +562,8 @@ class Keithley2400FrontendTests(unittest.TestCase):
             settle_seconds=0.75,
         )
 
-        frontend.load_settings(supplied)
-        saved = frontend.settings()
+        frontend.load(supplied)
+        saved = frontend.dump()
 
         self.assertEqual(saved["source_mode"], "voltage")
         self.assertAlmostEqual(
@@ -571,12 +581,12 @@ class Keithley2400FrontendTests(unittest.TestCase):
         self.assertTrue(frontend.source_voltage.isEnabled())
 
     def test_status_resource_refresh_preserves_manual_resource(self) -> None:
-        frontend = Keithley2400Frontend(ModuleFrontendContext())
-        settings_page = frontend.create_settings_page()
-        status_page = frontend.create_status_page()
+        frontend = Keithley2400Frontend(ModuleUIAPI())
+        settings_page = frontend
+        status_page = frontend.status_widget
         frontend.resource.setCurrentText("GPIB9::24::INSTR")
 
-        frontend.update_status(
+        frontend.show_status(
             {"Available GPIB Resources": ["GPIB0::24::INSTR"]}
         )
 

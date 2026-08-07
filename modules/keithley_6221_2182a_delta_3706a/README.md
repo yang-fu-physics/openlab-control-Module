@@ -3,8 +3,8 @@
 Version `0.1.0b2` is a Beta Measurement Module for a Keithley 6221 current
 source, a Keithley 2182A nanovoltmeter connected to the 6221 by RS-232 and
 Trigger Link, and an optional Keithley 3706A switch system controlled through a
-second GPIB resource. It requires OpenLab Control `>=0.11.5,<0.12` for API 1.1
-logical-slot scheduling and core-managed rawdata rows.
+second GPIB resource. It uses the core's optional logical-slot hook and
+core-managed rawdata rows.
 
 Before using Apply, manually enable the 2182A RS-232 interface at 19.2 kbaud,
 XON/XOFF flow control, and CR termination; configure the 6221 serial side to
@@ -24,7 +24,7 @@ User's Manual*, part 3700AS-900-01 Rev. B (July 2016), together with the Series
 
 ## Operating modes
 
-- **Shared configuration / continuous Armed**: `begin_sequence` applies the
+- **Shared configuration / continuous Armed**: the `run_start` event applies the
   common settings, sends `SOUR:DELT:ARM`, waits at least 3 seconds through the
   interruptible module context, verifies Armed state, and remains Armed until
   the SEQ ends. Each Measure switches enabled channels and starts a finite
@@ -36,7 +36,7 @@ User's Manual*, part 3700AS-900-01 Rev. B (July 2016), together with the Series
 
 ## DAT and rawdata
 
-The module declares `measurement_mode = "aligned_slots"`. The core invokes the
+The module's dynamic `slots` property makes the core invoke the
 backend once per enabled logical channel, aligns CH1-CH4 with other scanner
 modules, and keeps each logical channel as one DAT row. The fixed DAT
 columns are `Channel`, `Resistance`, `Current`, `StdDev`, `SampleCount`, and
@@ -84,9 +84,9 @@ relays. Missing, extra, duplicate, or malformed routes are fatal. A route write
 is never automatically replayed because it may already have reached the
 instrument.
 
-If the 3706A resource is blank or cannot be identified during Enable, the
-module raises a deduplicated Warning and fixes the current Enable session to
-direct CH1-only operation. A 3706A failure after successful Enable is fatal;
+If the 3706A resource is blank or cannot be identified during Apply, the
+module raises a deduplicated Warning and fixes the current applied settings to
+direct CH1-only operation. A 3706A failure after successful Apply is fatal;
 the module does not silently fall back while a route may be unknown.
 
 ## Data status and errors

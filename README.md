@@ -1,78 +1,125 @@
-# OpenLab Measurement Modules repository
+# OpenLab Control Measurement Modules
 
-This is the Git-ready layout for the single shared Measurement Module
-repository. Keep every independently installable module under `modules/<id>/`.
-The normative lifecycle, safety, data, dependency, UI, testing, and release
-rules for new modules are defined in
-[MODULE_SPECIFICATION.md](MODULE_SPECIFICATION.md).
-The included `simulated_transport` module is hardware-free and serves as the
-reference implementation and test fixture. `lakeshore_372a` is the first
-hardware module; it scans up to four selectable Model 372/372A inputs over
-GPIB and emits one sparse DAT row per enabled slot. `lr700` controls an
-LR-700 bridge with one LR-720-16 multiplexer, lets R1-R4 select four physical
-sensor inputs, and emits one sparse R/X/status row per enabled slot.
-`keithley_6221_2182a_delta` coordinates a 6221, its serial/Trigger-Link 2182A,
-and an optional 7001 for four-channel Delta measurements. It converts raw
-Delta voltage to resistance and stores the voltage sequence in a core-managed
-rawdata sidecar.
-`keithley_6221_2182a_delta_3706a` provides the same two Delta operating modes
-and data contract with an optional 3706/3706A switch mainframe. Its routing
-layer uses the 3700A case-sensitive TSP command set and verifies the complete
-closed-channel list before every trigger.
-`keithley_2400` uses one Model 2400 as a constant-current or constant-voltage
-source and measures two-wire or four-wire resistance. `keithley_6517b` uses
-the 6517B voltage source and ammeter for two-wire high-resistance measurements;
-it establishes and verifies the required internal METER-CONNECT path before
-any voltage is applied. `keithley_2614b` measures one or both SMU channels with
-independent constant-current/constant-voltage and two-wire/four-wire settings.
+这是 Measurement Module 的共享仓库。框架负责加载、进程隔离、Pause/Stop、操作总
+timeout、跨模块并行和 DAT 写入；模块负责仪表协议、通道、状态码和安全动作。
 
-All modules explicitly declare the Measurement Module API 1.1 scheduling mode.
-The scanner/switch modules use `aligned_slots`: one `T Measure` produces one DAT
-row per logical channel slot, and modules on the same slot run in parallel and
-share that row. The 2400, 6517B, and 2614B use `once_per_slot`, so they perform a
-fresh measurement in every logical channel row. If no scanner module is enabled,
-there is one logical slot and therefore one row. A missing mode declaration is
-shown as a compatibility warning and is treated as `once_per_slot`, but is not
-accepted for an official module release.
+## 最小模块
 
-The current `simulated_transport` 1.1.0, `lakeshore_372a` 0.1.0b9, `lr700`
-0.1.0b5, `keithley_6221_2182a_delta` 0.1.0b5, and
-`keithley_6221_2182a_delta_3706a` 0.1.0b2 require OpenLab Control 0.11.5 or
-newer for API 1.1 logical-slot scheduling.
-`keithley_2400`, `keithley_6517b`, and `keithley_2614b` 0.1.0b1 require
-OpenLab Control 0.11.5 or newer and use the framework-provided PyVISA runtime.
-All hardware modules remain beta until verified with their real instruments.
+```text
+modules/my_meter/
+├─ module.toml
+└─ backend.py
+```
 
-## Manual offline installation
+```toml
+name = "My Meter"
+version = "0.1.0"
+```
 
-1. Review the module source and `module.toml`. If the module declares
-   dependencies not supplied by the OpenLab Control framework, also review
-   its `requirements.lock` and wheels.
-2. Copy one complete module folder to `OpenLabControl/modules/<id>/`.
-3. Framework dependencies such as PySide6, PyVISA, packaging, QtAwesome, and
-   typing_extensions use the versions shipped by OpenLab Control. Do not
-   duplicate their wheels in each module.
-4. Only for additional third-party dependencies, include every required
-   Windows wheel under that module's `wheels/` folder (or the application's
-   shared `wheels/` folder). Restart OpenLab Control and use
-   `Install Dependencies` when the button is shown. Network fallback is
-   intentionally unavailable.
-5. Enable the module and approve the first-load trust prompt.
-6. Verify that saved settings are loaded but not applied until the operator
-   chooses `Apply Settings`.
+```python
+from labcontrol.module_api import ModuleAPI, ModuleError
 
-Never commit `module_data`, acquired DAT files, instrument addresses containing
-secrets, or generated `plugin_runtime` contents. A module owns its measurement
-instruments, runs its backend in one child process, and may only read the
-temperature/field/monitor snapshot supplied by the core.
 
-## Required release checks
+class Module:
+    columns = {"Resistance": "Ohm", "StatusCode": ""}
 
-- Validate manifest ID, API/core range, fixed columns, and source entry points.
-- Exercise initialize/apply/begin/measure/end/abort and every error path.
-- Verify Warning deduplication and Error termination.
-- Test explicit scheduling mode, slot union, one row per logical channel, and
-  same-slot parallel execution with another module.
-- Test bounded driver and framework timeouts plus forced worker cleanup.
-- Test the exact offline wheel set on the target Windows/Python architecture.
-- Increment `version` whenever shipped content or dependencies change.
+    def open(self, api: ModuleAPI):
+        self.instrument = open_instrument(timeout=3.0)
+
+    def measure(self, slot: int, api: ModuleAPI):
+        api.sleep(0)
+        return {
+            "Resistance": self.instrument.read(),
+            "StatusCode": 0,
+        }
+
+    def close(self, api: ModuleAPI):
+        self.instrument.output_off()
+        self.instrument.close()
+```
+
+不继承框架基类。目录名就是 ID，入口固定为 `backend:Module`。`columns` 是有序的
+`{列名: 单位}`。
+
+除此以外，作者可自由增加内部文件、类和相对导入；协议命令与仪表状态机不需要套用
+框架基类、Mixin 或固定目录层次。
+
+## 接口
+
+必需：
+
+- `open(api)`：Enable 时建立安全初始状态；不接收保存设置。
+- `measure(slot, api)`：返回一行 Mapping。
+- `close(api)`：Disable/退出时幂等地进入安全状态并释放资源。
+
+可选：
+
+- `configure(settings, api)`：用户明确 Apply 时调用。
+- `on_event(event, data, api)`：统一处理 `run_start`、`run_end`、`status`、`action`。
+- `slots`：正整数、正整数序列或动态 property。
+
+`run_end` 的 `data["reason"]` 为 `completed`、`stopped` 或 `error`。`action` 的 data 为
+`{"name": str, "payload": dict}`。
+
+## 槽位、行与 rawdata
+
+- `slots = 4` 等价于 `(1, 2, 3, 4)`。
+- 核心取所有模块槽位并集，每个槽位写一行；同槽位的不同模块并行。
+- 未声明 `slots` 的模块跟随每个槽位；所有模块都未声明时只有槽位 1。
+- 模块内部不循环发多行；当前槽位就是 `measure(slot, api)` 的 `slot`。
+- 未测量列省略；不要写文字占位。
+- 需要原始序列时返回 `(row, raw_values)`，否则直接返回 row。
+
+模块不直接写 DAT。数据异常时省略无效测量值，写模块自定义的数值状态码并调用
+`api.warn(...)`；通信、协议或安全状态无法确认时抛 `ModuleError` 或其他异常。
+
+## ModuleAPI
+
+- `api.sleep(seconds)`：Pause 不计时、Stop 可打断；`sleep(0)` 为检查点。
+- `api.devices()`：最新温度、磁场和 Monitor 快照副本。
+- `api.warn(code, message, key="")`：报告 Warning；`message=None` 解除。
+- `api.status(mapping)`：更新状态页。
+- `api.timeout`：核心给本次调用的总时限。
+
+每个 VISA/串口/厂商 SDK 调用必须自行设置有限 I/O timeout，并为输出关闭预留时间。
+
+## 可选界面
+
+`frontend.py` 中的 `Frontend` 是普通 QWidget，只需 `load(settings)` 和 `dump()`：
+
+```python
+from PySide6.QtWidgets import QWidget
+
+
+class Frontend(QWidget):
+    def __init__(self, api):
+        super().__init__()
+        self.api = api
+
+    def load(self, settings): ...
+    def dump(self): return {}
+```
+
+可选提供 `status_widget`、`show_status(mapping)`，并用 `api.action(...)` / `api.refresh()`
+向后端发请求。前端不连接仪表、不写文件、不控制温场，也不需要注册设置变化信号或
+Run 状态钩子；这些由核心处理。
+
+## 依赖
+
+PySide6、PyVISA、QtAwesome、packaging 和 typing_extensions 使用主框架版本，模块不得
+重复声明。只有额外库才写入 `dependencies`，并携带完整本地 wheel 与带 SHA-256 的
+精确 `requirements.lock`。安装不访问网络。
+
+## 安全与协议测试
+
+真实模块必须保留：
+
+- 身份、地址、量程、限流/限压、互锁与关键设置读回；
+- 仪表命令顺序、响应解析、写 timeout 不重放；
+- 正常、超量程、compliance、损坏响应和模块状态码；
+- Pause/Stop、三种 run_end、重复 close、异常清理和资源释放；
+- 槽位、空列、rawdata、有限数值和并行模块；
+- 设置保存/SEQ 导入不自动 Apply。
+
+当前硬件模块均未完成真机验证，仍按 Beta 对待。软件测试不能替代硬件保护、互锁和
+人工急停。

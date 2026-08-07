@@ -24,10 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from labcontrol.measurement.frontend_api import (
-    ModuleFrontend,
-    ModuleFrontendContext,
-)
+from labcontrol.measurement.frontend_api import ModuleUIAPI
 
 from .constants import (
     SOURCE_RANGE_1000_V,
@@ -69,14 +66,18 @@ class _QuantityEdit(QLineEdit):
         self.setStyleSheet("")
 
 
-class Keithley6517BFrontend(ModuleFrontend):
+class Keithley6517BFrontend(QWidget):
     """6517B desired settings 与只读安全状态显示。"""
 
-    def __init__(self, context: ModuleFrontendContext) -> None:
-        super().__init__(context)
-        self._sequence_running = False
+    def __init__(self, api: ModuleUIAPI) -> None:
+        super().__init__()
+        self.api = api
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_settings(self))
+        self.status_widget = self._build_status_widget()
 
-    def create_settings_page(
+    def _build_settings(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -97,12 +98,12 @@ class Keithley6517BFrontend(ModuleFrontend):
         self.resource.setMinimumContentsLength(24)
         self.refresh_resources_button = QPushButton("Refresh GPIB")
         self.refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action("refresh_resources")
+            lambda: self.api.action("refresh_resources")
         )
         self.test_connection_button = QPushButton("Test Connection")
         self.test_connection_button.clicked.connect(
-            lambda: self.context.request_manual_action(
-                "test_connection", {"settings": self.settings()}
+            lambda: self.api.action(
+                "test_connection", {"settings": self.dump()}
             )
         )
         self.io_timeout = QDoubleSpinBox()
@@ -189,21 +190,10 @@ class Keithley6517BFrontend(ModuleFrontend):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        for widget in self._setting_widgets():
-            if isinstance(widget, QLineEdit):
-                widget.textChanged.connect(self._changed)
-            elif isinstance(widget, QComboBox):
-                widget.currentIndexChanged.connect(self._changed)
-                if widget.isEditable():
-                    widget.currentTextChanged.connect(self._changed)
-            elif isinstance(widget, QDoubleSpinBox):
-                widget.valueChanged.connect(self._changed)
-            elif isinstance(widget, QCheckBox):
-                widget.toggled.connect(self._changed)
-        self.load_settings(default_settings())
+        self.load(default_settings())
         return page
 
-    def create_status_page(
+    def _build_status_widget(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -212,11 +202,11 @@ class Keithley6517BFrontend(ModuleFrontend):
         actions = QHBoxLayout()
         self.refresh_status_button = QPushButton("Refresh Status")
         self.refresh_status_button.clicked.connect(
-            self.context.request_status_refresh
+            self.api.refresh
         )
         self.safe_off_button = QPushButton("Standby + Zero Check")
         self.safe_off_button.clicked.connect(
-            lambda: self.context.request_manual_action("safe_off")
+            lambda: self.api.action("safe_off")
         )
         actions.addWidget(self.refresh_status_button)
         actions.addWidget(self.safe_off_button)
@@ -249,7 +239,7 @@ class Keithley6517BFrontend(ModuleFrontend):
         layout.addStretch(1)
         return page
 
-    def settings(self) -> dict[str, Any]:
+    def dump(self) -> dict[str, Any]:
         return {
             "resource": self.resource.currentText().strip(),
             "io_timeout_seconds": self.io_timeout.value(),
@@ -263,7 +253,7 @@ class Keithley6517BFrontend(ModuleFrontend):
             ),
         }
 
-    def load_settings(self, settings: Mapping[str, Any]) -> None:
+    def load(self, settings: Mapping[str, Any]) -> None:
         merged = self._merged_settings(settings)
         blockers = [QSignalBlocker(widget) for widget in self._setting_widgets()]
         self._select_resource(str(merged["resource"]))
@@ -278,7 +268,7 @@ class Keithley6517BFrontend(ModuleFrontend):
         )
         del blockers
 
-    def update_status(self, status: Mapping[str, Any]) -> None:
+    def show_status(self, status: Mapping[str, Any]) -> None:
         resources = status.get("Available GPIB Resources")
         if isinstance(resources, (list, tuple)):
             self._update_resources(tuple(str(item) for item in resources))
@@ -292,16 +282,6 @@ class Keithley6517BFrontend(ModuleFrontend):
                 label.setText("Yes" if value else "No")
             else:
                 label.setText(str(value))
-
-    def set_sequence_running(self, running: bool) -> None:
-        self._sequence_running = running
-        for button in (
-            self.refresh_resources_button,
-            self.test_connection_button,
-            self.refresh_status_button,
-            self.safe_off_button,
-        ):
-            button.setEnabled(not running)
 
     def _update_resources(self, resources: tuple[str, ...]) -> None:
         current = self.resource.currentText().strip()
@@ -338,9 +318,6 @@ class Keithley6517BFrontend(ModuleFrontend):
             self.output_off_between_measurements,
         ]
 
-    def _changed(self, *_args: Any) -> None:
-        self.settingsChanged.emit()
-
     @staticmethod
     def _merged_settings(supplied: Mapping[str, Any]) -> dict[str, Any]:
         result = deepcopy(default_settings())
@@ -351,4 +328,6 @@ class Keithley6517BFrontend(ModuleFrontend):
         return result
 
 
-__all__ = ["Keithley6517BFrontend"]
+Frontend = Keithley6517BFrontend
+
+__all__ = ["Frontend", "Keithley6517BFrontend"]

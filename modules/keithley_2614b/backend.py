@@ -1,4 +1,4 @@
-"""Keithley 2614B 双通道恒流/恒压电阻测量后端。
+﻿"""Keithley 2614B 双通道恒流/恒压电阻测量后端。
 
 2614B 使用 TSP 而不是传统 SCPI 子系统。模块不调用 ``reset()``，避免清除操作员在
 仪表上建立的其他现场设置；只配置 SMU A/B 完成本次测量所需的 source、limit、sense、
@@ -14,10 +14,9 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
-from labcontrol.measurement.api import (
-    ModuleBackend,
+from labcontrol.module_api import (
     ModuleError,
-    ModuleOperationContext,
+    ModuleAPI,
     ModuleWarning,
 )
 
@@ -58,7 +57,7 @@ class InstrumentTransport(Protocol):
 
 TransportFactory = Callable[[str, float], InstrumentTransport]
 ResourceLister = Callable[[], tuple[str, ...]]
-Waiter = Callable[[ModuleOperationContext, float], None]
+Waiter = Callable[[ModuleAPI, float], None]
 
 
 class PyVisaTransport:
@@ -104,8 +103,19 @@ class PyVisaTransport:
             self._manager.close()
 
 
-class Keithley2614BBackend(ModuleBackend):
+class Keithley2614BBackend:
     """SMU A/B 并行偏置、顺序读取和统一安全清理状态机。"""
+
+    columns = {
+        "R1": "Ohm",
+        "Voltage1": "V",
+        "Current1": "A",
+        "StatusCode1": "",
+        "R2": "Ohm",
+        "Voltage2": "V",
+        "Current2": "A",
+        "StatusCode2": "",
+    }
 
     def __init__(
         self,
@@ -116,7 +126,7 @@ class Keithley2614BBackend(ModuleBackend):
         self._transport_factory = transport_factory or PyVisaTransport
         self._resource_lister = resource_lister or PyVisaTransport.list_resources
         self._waiter = waiter or (
-            lambda context, seconds: context.interruptible_sleep(seconds)
+            lambda api, seconds: api.sleep(seconds)
         )
         self.transport: InstrumentTransport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
@@ -131,68 +141,64 @@ class Keithley2614BBackend(ModuleBackend):
         self.last_voltage: float | None = None
         self.last_current: float | None = None
 
-    def initialize(
-        self,
-        settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> Mapping[str, Any]:
+    def open(self, api: ModuleAPI) -> Mapping[str, Any]:
         """Enable 只加载 desired settings 并发现 GPIB 地址。"""
 
         self.desired_settings = self._normalized_settings(
-            settings,
+            default_settings(),
             require_resource=False,
-            operation_timeout_seconds=context.operation_timeout_seconds,
+            operation_timeout_seconds=api.timeout,
         )
         try:
             self.available_resources = tuple(
                 sorted(set(self._resource_lister()), key=str.casefold)
             )
-            context.resolve_warning("K2614B_RESOURCE_DISCOVERY_FAILED")
+            api.warn("K2614B_RESOURCE_DISCOVERY_FAILED", None)
         except Exception as exc:
             self.available_resources = ()
-            context.warning(
+            api.warn(
+                "K2614B_RESOURCE_DISCOVERY_FAILED",
                 "GPIB resource discovery failed: "
                 f"{type(exc).__name__}: {exc}",
-                "K2614B_RESOURCE_DISCOVERY_FAILED",
             )
         self.applied_settings = None
         self.identity = ""
         self.sequence_active = False
         self.last_status = "Initialized"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def apply_settings(
+    def configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """关闭两个通道，建立 HIGH_Z 基线，再配置所有 Enabled 通道。"""
 
         normalized = self._normalized_settings(
             settings,
             require_resource=True,
-            operation_timeout_seconds=context.operation_timeout_seconds,
+            operation_timeout_seconds=api.timeout,
         )
         self.desired_settings = deepcopy(normalized)
         self.applied_settings = None
         try:
             if self.transport is not None:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
                 self._close_transport()
-            self._connect(normalized, context)
-            self._enter_safe_state(context)
-            self._configure_high_impedance_off(context)
+            self._connect(normalized, api)
+            self._enter_safe_state(api)
+            self._configure_high_impedance_off(api)
             for key, smu, _number in CHANNELS:
                 if normalized["channels"][key]["enabled"]:
                     self._configure_channel(
                         key,
                         smu,
                         normalized["channels"][key],
-                        context,
+                        api,
                     )
-            self._enter_safe_state(context)
+            self._enter_safe_state(api)
         except Exception as exc:
             cleanup = self._best_effort_safe_state()
             self._close_transport_silently()
@@ -201,38 +207,39 @@ class Keithley2614BBackend(ModuleBackend):
                     "2614B Apply failed and both outputs could not be confirmed "
                     f"OFF: {cleanup}",
                     "K2614B_SAFE_STATE_UNCONFIRMED",
-                    "apply_settings",
+                    "configure",
                 ) from exc
             raise
         self.applied_settings = deepcopy(normalized)
         self.last_status = "Settings applied - SMU A/B output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def begin_sequence(
+    def _run_start(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         settings = self._require_applied()
-        self._enter_safe_state(context)
-        self._verify_high_impedance_off(context)
+        self._enter_safe_state(api)
+        self._verify_high_impedance_off(api)
         for key, smu, _number in self._enabled_channels(settings):
             self._verify_channel(
                 key,
                 smu,
                 settings["channels"][key],
-                context,
+                api,
             )
         self.sequence_active = True
         self.last_status = "Sequence ready - SMU A/B output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def measure(self, context: ModuleOperationContext) -> None:
+    def measure(self, slot: int, api: ModuleAPI) -> Mapping[str, Any]:
         """同时偏置 Enabled 通道，一次读取 A/B 全部列并只写一行。"""
 
+        del slot
         settings = self._require_ready()
         channels = self._enabled_channels(settings)
         output_off = bool(
@@ -240,25 +247,25 @@ class Keithley2614BBackend(ModuleBackend):
         )
         readings: list[tuple[str, int, float, float, bool]] = []
         try:
-            context.checkpoint()
+            api.sleep(0)
             if output_off:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
             for key, smu, _number in channels:
                 self._verify_channel(
                     key,
                     smu,
                     settings["channels"][key],
-                    context,
+                    api,
                     require_output_off=output_off,
                 )
             # 打开顺序固定为 A→B。任何一步失败都进入下面的直接双通道关闭路径。
             for key, smu, _number in channels:
-                self._set_channel_output(key, smu, True, context)
-            self._waiter(context, float(settings["settle_seconds"]))
+                self._set_channel_output(key, smu, True, api)
+            self._waiter(api, float(settings["settle_seconds"]))
             for key, smu, number in channels:
-                voltage, current, compliance = self._read_channel(smu, context)
+                voltage, current, compliance = self._read_channel(smu, api)
                 readings.append((key, number, voltage, current, compliance))
-                context.checkpoint()
+                api.sleep(0)
         except Exception as exc:
             cleanup = self._best_effort_safe_state()
             self.sequence_active = False
@@ -273,14 +280,14 @@ class Keithley2614BBackend(ModuleBackend):
 
         try:
             if output_off:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
             else:
                 # 行间保持不是“省略安全确认”。每次采样完成仍逐通道查询实际输出，
                 # 防止联锁或前面板动作已经关闭某一路却让状态页继续显示 retained。
                 for key, smu, _number in channels:
                     if not self._query_bool(
                         f"print({smu}.source.output == {smu}.OUTPUT_ON)",
-                        context,
+                        api,
                     ):
                         raise ModuleError(
                             f"2614B SMU {key.upper()} output turned off "
@@ -318,7 +325,7 @@ class Keithley2614BBackend(ModuleBackend):
                         f"Current{number}": current,
                     }
                 )
-                context.resolve_warning("K2614B_READING_WARNING", key)
+                api.warn("K2614B_READING_WARNING", None, key)
                 self.last_resistance = resistance
                 self.last_voltage = voltage
                 self.last_current = current
@@ -327,9 +334,9 @@ class Keithley2614BBackend(ModuleBackend):
                     + ("outputs off" if output_off else "outputs retained")
                 )
             else:
-                context.warning(
-                    f"Keithley 2614B {key.upper()} reading is not valid: {issue}",
+                api.warn(
                     "K2614B_READING_WARNING",
+                    f"Keithley 2614B {key.upper()} reading is not valid: {issue}",
                     key,
                 )
                 self.last_resistance = None
@@ -340,30 +347,30 @@ class Keithley2614BBackend(ModuleBackend):
                     + ("outputs off" if output_off else "outputs retained")
                 )
             self.last_channel = str(number)
-            context.update_status(self._status())
-        context.emit_row(row)
+            api.status(self._status())
+        return row
 
-    def end_sequence(
+    def _run_end(
         self,
         reason: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
-        self._enter_safe_state(context)
+        self._enter_safe_state(api)
         self.last_status = f"Sequence {reason} - SMU A/B output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def abort(
+    def close(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
         failure: Exception | None = None
         try:
             if self.transport is not None:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
         except Exception as exc:
             failure = exc
         finally:
@@ -376,7 +383,7 @@ class Keithley2614BBackend(ModuleBackend):
             "Disabled - output state unconfirmed" if failure else "Disabled"
         )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         if failure is not None:
             if isinstance(failure, ModuleError):
                 raise failure
@@ -386,29 +393,29 @@ class Keithley2614BBackend(ModuleBackend):
             ) from failure
         return status
 
-    def read_status(
+    def _read_status(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         if self.transport is not None:
             states: list[str] = []
             for key, smu, _number in CHANNELS:
                 enabled = self._query_bool(
                     f"print({smu}.source.output == {smu}.OUTPUT_ON)",
-                    context,
+                    api,
                 )
                 self.output_states[key] = "On" if enabled else "Off"
                 states.append(f"{smu.upper()} {'on' if enabled else 'off'}")
             self.last_status = "Connected / " + " / ".join(states)
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def manual_action(
+    def _action(
         self,
         action: str,
         payload: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         if action == "refresh_resources":
             try:
@@ -421,7 +428,7 @@ class Keithley2614BBackend(ModuleBackend):
                     f"{type(exc).__name__}: {exc}",
                     "K2614B_RESOURCE_DISCOVERY_FAILED",
                 ) from exc
-            context.resolve_warning("K2614B_RESOURCE_DISCOVERY_FAILED")
+            api.warn("K2614B_RESOURCE_DISCOVERY_FAILED", None)
         elif action == "test_connection":
             candidate = payload.get("settings", self.desired_settings)
             if not isinstance(candidate, Mapping):
@@ -433,24 +440,50 @@ class Keithley2614BBackend(ModuleBackend):
             settings = self._normalized_settings(
                 candidate,
                 require_resource=True,
-                operation_timeout_seconds=context.operation_timeout_seconds,
+                operation_timeout_seconds=api.timeout,
             )
-            self._test_connection(settings, context)
+            self._test_connection(settings, api)
             self.last_status = "Connection test passed (read-only)"
         elif action == "safe_off":
             if self.transport is not None:
-                self._enter_safe_state(context)
+                self._enter_safe_state(api)
             self.last_status = "SMU A/B output off"
         else:
-            return super().manual_action(action, payload, context) or {}
+            raise ModuleError(
+                f"Unsupported action: {action}",
+                "UNSUPPORTED_ACTION",
+                action,
+            )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
+
+    def on_event(
+        self,
+        event: str,
+        data: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        if event == "run_start":
+            return self._run_start(api)
+        if event == "run_end":
+            return self._run_end(str(data.get("reason", "error")), api)
+        if event == "status":
+            return self._read_status(api)
+        if event == "action":
+            payload = data.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ModuleError(
+                    "Action payload must be a mapping",
+                    "K2614B_INVALID_ACTION",
+                )
+            return self._action(str(data.get("name", "")), payload, api)
+        return {}
 
     def _connect(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
@@ -464,7 +497,7 @@ class Keithley2614BBackend(ModuleBackend):
                 resource,
             ) from exc
         try:
-            identity = self._query("*IDN?", context)
+            identity = self._query("*IDN?", api)
             self._validate_identity(identity)
         except Exception:
             self._close_transport_silently()
@@ -474,13 +507,13 @@ class Keithley2614BBackend(ModuleBackend):
     def _test_connection(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         resource = str(settings["resource"])
         timeout = float(settings["io_timeout_seconds"])
         if self.transport is not None and self.applied_settings is not None:
             if str(self.applied_settings["resource"]) == resource:
-                self._validate_identity(self._query("*IDN?", context))
+                self._validate_identity(self._query("*IDN?", api))
                 return
         try:
             temporary = self._transport_factory(resource, timeout)
@@ -492,9 +525,9 @@ class Keithley2614BBackend(ModuleBackend):
                 resource,
             ) from exc
         try:
-            context.checkpoint()
+            api.sleep(0)
             self._validate_identity(str(temporary.query("*IDN?")).strip())
-            context.checkpoint()
+            api.sleep(0)
         except ModuleError:
             raise
         except Exception as exc:
@@ -518,28 +551,28 @@ class Keithley2614BBackend(ModuleBackend):
 
     def _configure_high_impedance_off(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         for key, smu, _number in CHANNELS:
             self._write(
                 f"{smu}.source.offmode = {smu}.OUTPUT_HIGH_Z",
-                context,
+                api,
             )
             high_z = self._query_bool(
                 f"print({smu}.source.offmode == {smu}.OUTPUT_HIGH_Z)",
-                context,
+                api,
             )
             if not high_z:
                 self._settings_mismatch(f"{key}.offmode", "HIGH_Z", "other")
 
     def _verify_high_impedance_off(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         for key, smu, _number in CHANNELS:
             if not self._query_bool(
                 f"print({smu}.source.offmode == {smu}.OUTPUT_HIGH_Z)",
-                context,
+                api,
             ):
                 self._settings_mismatch(f"{key}.offmode", "HIGH_Z", "other")
 
@@ -548,84 +581,84 @@ class Keithley2614BBackend(ModuleBackend):
         key: str,
         smu: str,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        self._set_channel_output(key, smu, False, context)
+        self._set_channel_output(key, smu, False, api)
         self._write(
             f"{smu}.source.offmode = {smu}.OUTPUT_HIGH_Z",
-            context,
+            api,
         )
         mode = str(settings["source_mode"])
         if mode == SOURCE_CURRENT:
             self._write(
                 f"{smu}.source.func = {smu}.OUTPUT_DCAMPS",
-                context,
+                api,
             )
             self._write(
                 f"{smu}.source.autorangei = {smu}.AUTORANGE_ON",
-                context,
+                api,
             )
-            self._write(f"{smu}.source.leveli = 0", context)
+            self._write(f"{smu}.source.leveli = 0", api)
             self._write(
                 f"{smu}.source.limitv = {self._tsp(settings['voltage_limit'])}",
-                context,
+                api,
             )
         else:
             self._write(
                 f"{smu}.source.func = {smu}.OUTPUT_DCVOLTS",
-                context,
+                api,
             )
             self._write(
                 f"{smu}.source.autorangev = {smu}.AUTORANGE_ON",
-                context,
+                api,
             )
-            self._write(f"{smu}.source.levelv = 0", context)
+            self._write(f"{smu}.source.levelv = 0", api)
             self._write(
                 f"{smu}.source.limiti = {self._tsp(settings['current_limit'])}",
-                context,
+                api,
             )
         self._write(
             f"{smu}.measure.autorangev = {smu}.AUTORANGE_ON",
-            context,
+            api,
         )
         self._write(
             f"{smu}.measure.autorangei = {smu}.AUTORANGE_ON",
-            context,
+            api,
         )
         self._write(
             f"{smu}.measure.nplc = {self._tsp(settings['nplc'])}",
-            context,
+            api,
         )
         self._write(
             f"{smu}.sense = {smu}.SENSE_REMOTE"
             if settings["sense_mode"] == SENSE_4WIRE
             else f"{smu}.sense = {smu}.SENSE_LOCAL",
-            context,
+            api,
         )
         if mode == SOURCE_CURRENT:
             self._write(
                 f"{smu}.source.leveli = {self._tsp(settings['source_current'])}",
-                context,
+                api,
             )
         else:
             self._write(
                 f"{smu}.source.levelv = {self._tsp(settings['source_voltage'])}",
-                context,
+                api,
             )
-        self._verify_channel(key, smu, settings, context)
+        self._verify_channel(key, smu, settings, api)
 
     def _verify_channel(
         self,
         key: str,
         smu: str,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
         *,
         require_output_off: bool = True,
     ) -> None:
         output_on = self._query_bool(
             f"print({smu}.source.output == {smu}.OUTPUT_ON)",
-            context,
+            api,
         )
         self.output_states[key] = "On" if output_on else "Off"
         if require_output_off and output_on:
@@ -636,7 +669,7 @@ class Keithley2614BBackend(ModuleBackend):
             )
         if not self._query_bool(
             f"print({smu}.source.offmode == {smu}.OUTPUT_HIGH_Z)",
-            context,
+            api,
         ):
             self._settings_mismatch(f"{key}.offmode", "HIGH_Z", "other")
         mode = str(settings["source_mode"])
@@ -647,7 +680,7 @@ class Keithley2614BBackend(ModuleBackend):
         )
         if not self._query_bool(
             f"print({smu}.source.func == {expected_function})",
-            context,
+            api,
         ):
             self._settings_mismatch(f"{key}.source_mode", mode, "other")
         if mode == SOURCE_CURRENT:
@@ -655,13 +688,13 @@ class Keithley2614BBackend(ModuleBackend):
                 f"print({smu}.source.leveli)",
                 float(settings["source_current"]),
                 f"{key}.source_current",
-                context,
+                api,
             )
             self._expect_number(
                 f"print({smu}.source.limitv)",
                 float(settings["voltage_limit"]),
                 f"{key}.voltage_limit",
-                context,
+                api,
             )
             source_autorange = "autorangei"
         else:
@@ -669,18 +702,18 @@ class Keithley2614BBackend(ModuleBackend):
                 f"print({smu}.source.levelv)",
                 float(settings["source_voltage"]),
                 f"{key}.source_voltage",
-                context,
+                api,
             )
             self._expect_number(
                 f"print({smu}.source.limiti)",
                 float(settings["current_limit"]),
                 f"{key}.current_limit",
-                context,
+                api,
             )
             source_autorange = "autorangev"
         if not self._query_bool(
             f"print({smu}.source.{source_autorange} == {smu}.AUTORANGE_ON)",
-            context,
+            api,
         ):
             self._settings_mismatch(
                 f"{key}.{source_autorange}", "AUTORANGE_ON", "other"
@@ -688,7 +721,7 @@ class Keithley2614BBackend(ModuleBackend):
         for measure_range in ("autorangev", "autorangei"):
             if not self._query_bool(
                 f"print({smu}.measure.{measure_range} == {smu}.AUTORANGE_ON)",
-                context,
+                api,
             ):
                 self._settings_mismatch(
                     f"{key}.measure.{measure_range}",
@@ -699,11 +732,11 @@ class Keithley2614BBackend(ModuleBackend):
             f"print({smu}.measure.nplc)",
             float(settings["nplc"]),
             f"{key}.nplc",
-            context,
+            api,
         )
         remote = self._query_bool(
             f"print({smu}.sense == {smu}.SENSE_REMOTE)",
-            context,
+            api,
         )
         expected_remote = settings["sense_mode"] == SENSE_4WIRE
         if remote != expected_remote:
@@ -714,13 +747,13 @@ class Keithley2614BBackend(ModuleBackend):
     def _read_channel(
         self,
         smu: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> tuple[float, float, bool]:
         # 两个测量函数处于同一条 TSP 请求，减少主机往返；返回顺序固定为 V、I、limit。
         reply = self._query(
             f"print({smu}.measure.v(), {smu}.measure.i(), "
             f"{smu}.source.compliance)",
-            context,
+            api,
         )
         parts = [item for item in _MEASUREMENT_SPLIT.split(reply.strip()) if item]
         if len(parts) != 3:
@@ -769,16 +802,16 @@ class Keithley2614BBackend(ModuleBackend):
         key: str,
         smu: str,
         enabled: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         self._write(
             f"{smu}.source.output = "
             f"{smu}.{'OUTPUT_ON' if enabled else 'OUTPUT_OFF'}",
-            context,
+            api,
         )
         actual = self._query_bool(
             f"print({smu}.source.output == {smu}.OUTPUT_ON)",
-            context,
+            api,
         )
         self.output_states[key] = "On" if actual else "Off"
         if actual != enabled:
@@ -789,11 +822,11 @@ class Keithley2614BBackend(ModuleBackend):
                 key,
             )
 
-    def _enter_safe_state(self, context: ModuleOperationContext) -> None:
+    def _enter_safe_state(self, api: ModuleAPI) -> None:
         failures: list[str] = []
         for key, smu, _number in CHANNELS:
             try:
-                self._set_channel_output(key, smu, False, context)
+                self._set_channel_output(key, smu, False, api)
             except Exception as exc:
                 failures.append(f"{smu}: {type(exc).__name__}: {exc}")
         if failures:
@@ -824,9 +857,9 @@ class Keithley2614BBackend(ModuleBackend):
                 failures.append(f"{smu}: {type(exc).__name__}: {exc}")
         return "; ".join(failures) or None
 
-    def _write(self, command: str, context: ModuleOperationContext) -> None:
+    def _write(self, command: str, api: ModuleAPI) -> None:
         transport = self._require_transport()
-        context.checkpoint()
+        api.sleep(0)
         try:
             transport.write(command)
         except Exception as exc:
@@ -836,11 +869,11 @@ class Keithley2614BBackend(ModuleBackend):
                 "K2614B_IO_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
 
-    def _query(self, command: str, context: ModuleOperationContext) -> str:
+    def _query(self, command: str, api: ModuleAPI) -> str:
         transport = self._require_transport()
-        context.checkpoint()
+        api.sleep(0)
         try:
             reply = str(transport.query(command)).strip()
         except Exception as exc:
@@ -850,7 +883,7 @@ class Keithley2614BBackend(ModuleBackend):
                 "K2614B_IO_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
         if not reply:
             raise ModuleError(
                 f"2614B returned an empty response for {command!r}",
@@ -862,12 +895,12 @@ class Keithley2614BBackend(ModuleBackend):
     def _query_bool(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> bool:
-        return self._parse_bool(self._query(command, context), command)
+        return self._parse_bool(self._query(command, api), command)
 
     @staticmethod
-    def _parse_bool(value: object, context: str) -> bool:
+    def _parse_bool(value: object, api: str) -> bool:
         token = str(value).strip().strip('"').casefold()
         if token in {"true", "1", "on"}:
             return True
@@ -876,7 +909,7 @@ class Keithley2614BBackend(ModuleBackend):
         raise ModuleError(
             f"2614B returned invalid boolean {value!r}",
             "K2614B_INVALID_RESPONSE",
-            context,
+            api,
         )
 
     def _expect_number(
@@ -884,9 +917,9 @@ class Keithley2614BBackend(ModuleBackend):
         command: str,
         expected: float,
         field: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        reply = self._query(command, context)
+        reply = self._query(command, api)
         try:
             actual = float(reply)
         except ValueError as exc:
@@ -1220,4 +1253,6 @@ class Keithley2614BBackend(ModuleBackend):
         )
 
 
-__all__ = ["Keithley2614BBackend", "PyVisaTransport"]
+Module = Keithley2614BBackend
+
+__all__ = ["Keithley2614BBackend", "Module", "PyVisaTransport"]

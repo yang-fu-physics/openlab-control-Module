@@ -16,13 +16,22 @@ sys.path.insert(0, str(CORE / "src"))
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
-from labcontrol.measurement.api import (  # noqa: E402
+from labcontrol.module_api import (  # noqa: E402
     ModuleError,
-    ModuleOperationCancelled,
-    ModuleOperationContext,
+    _ModuleOperationCancelled as ModuleOperationCancelled,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
-    ModuleFrontendContext,
+    ModuleUIAPI,
+)
+from module_contract import (  # noqa: E402
+    TestModuleAPI,
+    measure_module,
+    module_slots,
+    open_module,
+    read_status,
+    run_action,
+    run_end,
+    run_start,
 )
 from labcontrol.measurement.manifest import load_manifest  # noqa: E402
 from labcontrol.measurement.settings import (  # noqa: E402
@@ -191,8 +200,8 @@ def _settings(**updates) -> dict:
 
 class Keithley6517BBackendTests(unittest.TestCase):
     @staticmethod
-    def _context(messages: list[tuple[str, dict]]) -> ModuleOperationContext:
-        return ModuleOperationContext(
+    def _context(messages: list[tuple[str, dict]]) -> TestModuleAPI:
+        return TestModuleAPI(
             {},
             lambda kind, values: messages.append((kind, values)),
             None,
@@ -211,16 +220,16 @@ class Keithley6517BBackendTests(unittest.TestCase):
             waiter=(
                 (lambda _context, seconds: waits.append(seconds))
                 if waits is not None
-                else (lambda context, _seconds: context.checkpoint())
+                else (lambda context, _seconds: context.sleep(0))
             ),
         )
 
-    def test_initialize_discovers_without_connection_or_high_voltage_writes(self) -> None:
+    def test_open_discovers_without_connection_or_high_voltage_writes(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
 
-        status = backend.initialize(_settings(), self._context(messages))
+        status = open_module(backend, self._context(messages))
 
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
@@ -232,9 +241,9 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context(messages)
         settings = _settings(source_voltage="50V", voltage_limit="75V", nplc=2.0)
-        backend.initialize(settings, context)
+        open_module(backend, context)
 
-        status = backend.apply_settings(settings, context)
+        status = backend.configure(settings, context)
 
         self.assertTrue(state.meter_connect)
         self.assertFalse(state.resistive_limit)
@@ -253,13 +262,13 @@ class Keithley6517BBackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(_settings(), context)
-        backend.apply_settings(_settings(), context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(_settings(), context)
+        run_start(backend, context)
         state.resistive_limit = True
 
         with self.assertRaisesRegex(ModuleError, "resistive_current_limit"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(state.output)
         self.assertTrue(state.zero_check)
@@ -270,10 +279,10 @@ class Keithley6517BBackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(_settings(), context)
+        open_module(backend, context)
 
         with self.assertRaisesRegex(ModuleError, "METER-CONNECT"):
-            backend.apply_settings(_settings(), context)
+            backend.configure(_settings(), context)
 
         self.assertFalse(state.output)
         self.assertTrue(state.zero_check)
@@ -287,12 +296,12 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(state, waits)
         context = self._context(messages)
         settings = _settings(source_voltage="100", voltage_limit="100", settle_seconds=2.0)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         self.assertEqual(waits, [2.0])
         self.assertFalse(state.output)
@@ -310,12 +319,12 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_voltage="100")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(payload for kind, payload in messages if kind == "row")
         self.assertEqual(row["values"], {"StatusCode": 2})
@@ -332,17 +341,17 @@ class Keithley6517BBackendTests(unittest.TestCase):
             voltage_limit="100",
             output_off_between_measurements=False,
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
         self.assertTrue(state.output)
         self.assertFalse(state.zero_check)
-        backend.measure(context)
+        measure_module(backend, context)
         self.assertTrue(state.output)
         self.assertFalse(state.zero_check)
-        backend.end_sequence("completed", context)
+        run_end(backend, "completed", context)
 
         self.assertFalse(state.output)
         self.assertTrue(state.zero_check)
@@ -358,12 +367,12 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_voltage="100")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(payload for kind, payload in messages if kind == "row")
         self.assertEqual(row["values"], {"StatusCode": 1})
@@ -376,9 +385,9 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_voltage="10")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         state.meter_connect = False
         operate_count = sum(
             command == "OUTP1 ON"
@@ -387,7 +396,7 @@ class Keithley6517BBackendTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ModuleError, "METER-CONNECT"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             operate_count,
@@ -414,13 +423,13 @@ class Keithley6517BBackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]] = []
         context = self._context(messages)
         settings = _settings(source_voltage="10")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
         with self.assertRaises(ModuleOperationCancelled):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(state.output)
         self.assertTrue(state.zero_check)
@@ -432,16 +441,16 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         context = self._context(messages)
         settings = _settings(source_voltage="10")
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
         state.failures["READ?"] = 1
         state.failures["OUTP1 OFF"] = 1
         state.query_overrides["OUTP1?"] = "1"
 
         with self.assertRaisesRegex(ModuleError, "could not be confirmed"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(any(kind == "row" for kind, _ in messages))
 
@@ -450,17 +459,17 @@ class Keithley6517BBackendTests(unittest.TestCase):
         state.identity = "KEITHLEY,MODEL 6514,0,1"
         backend = self._backend(state)
         context = self._context([])
-        backend.initialize(_settings(), context)
+        open_module(backend, context)
         with self.assertRaisesRegex(ModuleError, "Expected Keithley Model 6517B"):
-            backend.apply_settings(_settings(), context)
+            backend.configure(_settings(), context)
         self.assertEqual(state.closed, 1)
 
         state2 = _FakeState()
         state2.error_reply = '-222,"Data out of range"'
         backend2 = self._backend(state2)
-        backend2.initialize(_settings(), context)
+        open_module(backend2, context)
         with self.assertRaisesRegex(ModuleError, "instrument error"):
-            backend2.apply_settings(_settings(), context)
+            backend2.configure(_settings(), context)
         self.assertFalse(state2.output)
         self.assertTrue(state2.zero_check)
         self.assertEqual(state2.closed, 1)
@@ -469,10 +478,10 @@ class Keithley6517BBackendTests(unittest.TestCase):
         backend = self._backend(_FakeState())
         context = self._context([])
         with self.assertRaises(ModuleError) as range_error:
-            backend.initialize(_settings(source_voltage="101V"), context)
+            backend.configure(_settings(source_voltage="101V"), context)
         self.assertEqual(range_error.exception.context, "source_voltage")
         with self.assertRaises(ModuleError) as limit_error:
-            backend.initialize(
+            backend.configure(
                 _settings(source_voltage="50V", voltage_limit="40V"),
                 context,
             )
@@ -483,22 +492,22 @@ class Keithley6517BBackendTests(unittest.TestCase):
             source_voltage="600V",
             voltage_limit="700V",
         )
-        backend.initialize(accepted, context)
+        backend.configure(accepted, context)
 
-        short = ModuleOperationContext({}, lambda *_: None, None, None, 20.0)
+        short = TestModuleAPI({}, lambda *_: None, None, None, 20.0)
         with self.assertRaises(ModuleError) as timeout_error:
-            backend.initialize(_settings(io_timeout_seconds=1.0), short)
+            backend.configure(_settings(io_timeout_seconds=1.0), short)
         self.assertEqual(timeout_error.exception.context, "operation_timeout_seconds")
 
-    def test_abort_is_idempotent_and_keeps_confirmed_safe_state(self) -> None:
+    def test_close_is_idempotent_and_keeps_confirmed_safe_state(self) -> None:
         state = _FakeState()
         backend = self._backend(state)
         context = self._context([])
-        backend.initialize(_settings(), context)
-        backend.apply_settings(_settings(), context)
+        open_module(backend, context)
+        backend.configure(_settings(), context)
 
-        backend.abort(context)
-        backend.abort(context)
+        backend.close(context)
+        backend.close(context)
 
         self.assertFalse(state.output)
         self.assertTrue(state.zero_check)
@@ -514,12 +523,13 @@ class Keithley6517BFrontendTests(unittest.TestCase):
         manifest = load_manifest(MODULE)
         self.assertEqual(manifest.id, "keithley_6517b")
         self.assertEqual(
-            [column.name for column in manifest.columns],
+            list(Keithley6517BBackend.columns),
             ["Resistance", "Voltage", "Current", "StatusCode"],
         )
-        frontend = Keithley6517BFrontend(ModuleFrontendContext())
-        settings_page = frontend.create_settings_page()
-        status_page = frontend.create_status_page()
+        self.assertEqual(manifest.columns, ())
+        frontend = Keithley6517BFrontend(ModuleUIAPI())
+        settings_page = frontend
+        status_page = frontend.status_widget
         supplied = _settings(
             source_range="1000v",
             source_voltage="500V",
@@ -528,8 +538,8 @@ class Keithley6517BFrontendTests(unittest.TestCase):
             settle_seconds=5.0,
         )
 
-        frontend.load_settings(supplied)
-        saved = frontend.settings()
+        frontend.load(supplied)
+        saved = frontend.dump()
 
         self.assertIsInstance(settings_page, QWidget)
         self.assertIsInstance(status_page, QWidget)
@@ -539,12 +549,12 @@ class Keithley6517BFrontendTests(unittest.TestCase):
         self.assertAlmostEqual(saved["settle_seconds"], 5.0)
 
     def test_resource_refresh_preserves_manual_address(self) -> None:
-        frontend = Keithley6517BFrontend(ModuleFrontendContext())
-        settings_page = frontend.create_settings_page()
-        status_page = frontend.create_status_page()
+        frontend = Keithley6517BFrontend(ModuleUIAPI())
+        settings_page = frontend
+        status_page = frontend.status_widget
         frontend.resource.setCurrentText("GPIB9::27::INSTR")
 
-        frontend.update_status(
+        frontend.show_status(
             {"Available GPIB Resources": ["GPIB0::27::INSTR"]}
         )
 

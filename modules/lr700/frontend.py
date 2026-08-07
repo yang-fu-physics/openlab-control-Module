@@ -28,9 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from labcontrol.measurement.frontend_api import (
-    ModuleFrontend,
-)
+from labcontrol.measurement.frontend_api import ModuleUIAPI
 
 from .constants import (
     EXCITATIONS,
@@ -49,10 +47,18 @@ class _SettingsPage(QWidget):
         return QSize(1180, 700)
 
 
-class LR700Frontend(ModuleFrontend):
+class LR700Frontend(QWidget):
     """LR-700 Settings/Status 页和设置序列化适配器。"""
 
-    def create_settings_page(
+    def __init__(self, api: ModuleUIAPI) -> None:
+        super().__init__()
+        self.api = api
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_settings(self))
+        self.status_widget = self._build_status_widget()
+
+    def _build_settings(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -81,7 +87,7 @@ class LR700Frontend(ModuleFrontend):
             "Refresh GPIB"
         )
         self.refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "refresh_resources"
             )
         )
@@ -280,25 +286,9 @@ class LR700Frontend(ModuleFrontend):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        # 所有编辑统一发 settingsChanged。保存、Apply 确认和 Run 期间冲突检查仍由
-        # 核心窗口处理，模块前端不直接调用 worker。
-        for widget in self._setting_widgets():
-            if isinstance(widget, QComboBox):
-                widget.currentIndexChanged.connect(
-                    self._changed
-                )
-            elif isinstance(widget, QCheckBox):
-                widget.toggled.connect(self._changed)
-            elif isinstance(
-                widget,
-                (QSpinBox, QDoubleSpinBox),
-            ):
-                widget.valueChanged.connect(
-                    self._changed
-                )
         return page
 
-    def create_status_page(
+    def _build_status_widget(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -344,18 +334,18 @@ class LR700Frontend(ModuleFrontend):
             "Refresh Status"
         )
         self.test_connection_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "test_connection",
-                {"settings": self.settings()},
+                {"settings": self.dump()},
             )
         )
         self.status_refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "refresh_resources"
             )
         )
         self.refresh_status_button.clicked.connect(
-            self.context.request_status_refresh
+            self.api.refresh
         )
         buttons.addWidget(
             self.test_connection_button
@@ -369,7 +359,7 @@ class LR700Frontend(ModuleFrontend):
         layout.addStretch(1)
         return page
 
-    def settings(self) -> dict[str, Any]:
+    def dump(self) -> dict[str, Any]:
         """返回纯 Python desired settings；后端仍会把它当作不可信输入复检。"""
 
         channels: dict[str, dict[str, Any]] = {}
@@ -440,7 +430,7 @@ class LR700Frontend(ModuleFrontend):
             "channels": channels,
         }
 
-    def load_settings(
+    def load(
         self,
         settings: Mapping[str, Any],
     ) -> None:
@@ -547,7 +537,7 @@ class LR700Frontend(ModuleFrontend):
             )
         del blockers
 
-    def update_status(
+    def show_status(
         self,
         status: Mapping[str, Any],
     ) -> None:
@@ -571,20 +561,6 @@ class LR700Frontend(ModuleFrontend):
                 )
             else:
                 label.setText(str(value))
-
-    def set_sequence_running(
-        self,
-        running: bool,
-    ) -> None:
-        """Run 期间禁止发起会占用同一 worker/transport 的手动动作。"""
-
-        for button in (
-            self.refresh_resources_button,
-            self.test_connection_button,
-            self.status_refresh_resources_button,
-            self.refresh_status_button,
-        ):
-            button.setEnabled(not running)
 
     def _update_resources(
         self,
@@ -636,9 +612,6 @@ class LR700Frontend(ModuleFrontend):
             widgets.extend(channel.values())
         return widgets
 
-    def _changed(self, *_args: Any) -> None:
-        self.settingsChanged.emit()
-
     @staticmethod
     def _seconds_spin() -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -649,4 +622,6 @@ class LR700Frontend(ModuleFrontend):
         return spin
 
 
-__all__ = ["LR700Frontend"]
+Frontend = LR700Frontend
+
+__all__ = ["Frontend", "LR700Frontend"]

@@ -18,14 +18,22 @@ sys.path.insert(0, str(CORE / "src"))
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
-from labcontrol.measurement.api import (  # noqa: E402
+from labcontrol.module_api import (  # noqa: E402
     ModuleError,
-    ModuleMeasurementStep,
-    ModuleOperationCancelled,
-    ModuleOperationContext,
+    _ModuleOperationCancelled as ModuleOperationCancelled,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
-    ModuleFrontendContext,
+    ModuleUIAPI,
+)
+from module_contract import (  # noqa: E402
+    TestModuleAPI,
+    measure_module,
+    module_slots,
+    open_module,
+    read_status,
+    run_action,
+    run_end,
+    run_start,
 )
 from labcontrol.measurement.manifest import (  # noqa: E402
     load_manifest,
@@ -292,7 +300,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 lambda context, seconds: (
                     waits.append(seconds)
                     if waits is not None
-                    else context.checkpoint()
+                    else context.sleep(0)
                 )
             ),
         )
@@ -301,10 +309,9 @@ class LakeShore372ABackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
-        slot: int = 1,
-    ) -> ModuleOperationContext:
+    ) -> TestModuleAPI:
         iterator = iter(samples or [])
-        return ModuleOperationContext(
+        return TestModuleAPI(
             {},
             lambda kind, values: messages.append(
                 (kind, values)
@@ -316,35 +323,25 @@ class LakeShore372ABackendTests(unittest.TestCase):
             ),
             lambda _timeout: "running",
             120.0,
-        ModuleMeasurementStep(slot, 1, 1),
-    )
+        )
 
 
     @staticmethod
     def _measure_enabled_slots(
         backend,
-        context: ModuleOperationContext,
+        context: TestModuleAPI,
     ) -> None:
-        slots = tuple(backend.measurement_slots(context))
-        for index, logical_slot in enumerate(slots, start=1):
-            context.measurement_step = ModuleMeasurementStep(
-                logical_slot,
-                index,
-                len(slots),
-            )
-            backend.measure(context)
+        for logical_slot in module_slots(backend):
+            measure_module(backend, context, logical_slot)
 
-    def test_initialize_discovers_but_does_not_connect_or_apply(
+    def test_open_discovers_but_does_not_connect_or_apply(
         self,
     ) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
 
-        status = backend.initialize(
-            {"resource": "GPIB0::12::INSTR"},
-            self._context(messages),
-        )
+        status = open_module(backend, self._context(messages))
 
         self.assertEqual(state.opened, [])
         self.assertEqual(
@@ -359,7 +356,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             ],
         )
 
-    def test_legacy_incompatible_disabled_channel_can_initialize_and_apply(
+    def test_disabled_channel_uses_safe_hardware_range_without_changing_saved_value(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -375,7 +372,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         })
         context = self._context(messages)
 
-        backend.initialize(settings, context)
+        open_module(backend, context)
         self.assertEqual(state.opened, [])
         self.assertEqual(
             backend.desired_settings["channels"]["r3"][
@@ -384,7 +381,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             17,
         )
 
-        backend.apply_settings(settings, context)
+        backend.configure(settings, context)
 
         # 用户保存值仍是 17；仪表端的 Disabled 输入只使用临时兼容值 12，
         # 并且必须保持 shunted=1。
@@ -419,17 +416,14 @@ class LakeShore372ABackendTests(unittest.TestCase):
             messages,
             _samples_for_four_channels(),
         )
-        backend.initialize(settings, context)
-        applied = backend.apply_settings(
+        open_module(backend, context)
+        applied = backend.configure(
             settings,
             context,
         )
-        backend.begin_sequence(context)
+        run_start(backend, context)
         self._measure_enabled_slots(backend, context)
-        ended = backend.end_sequence(
-            "completed",
-            context,
-        )
+        ended = run_end(backend, "completed", context)
 
         rows = [
             payload["values"]
@@ -545,7 +539,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             "Shunted",
         )
 
-    def test_begin_sequence_reconfirms_shunt_after_idle_change(
+    def test_run_start_reconfirms_shunt_after_idle_change(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -554,8 +548,8 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::12::INSTR"
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
 
         # 模拟 Apply 后有人从仪表前面板解除 R1 分流。Begin 不能沿用旧状态，
         # 必须重新写入并读回安全状态。
@@ -567,7 +561,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         )
         state.commands.clear()
 
-        backend.begin_sequence(context)
+        run_start(backend, context)
 
         self.assertEqual(state.intypes[1][4], 1)
         self.assertTrue(
@@ -596,9 +590,9 @@ class LakeShore372ABackendTests(unittest.TestCase):
         context = self._context(messages, [
             *_samples_for_four_channels()[:4],
         ])
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         self._measure_enabled_slots(backend, context)
 
@@ -640,14 +634,14 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::12::INSTR"
         backend = self._backend(state, [])
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         state.commands.clear()
         state.failures["SCAN 1,0"] = 1
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -683,11 +677,11 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 _system_sample(2.0, 3.0, 30.0),
             ],
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         self.assertGreaterEqual(len(state.opened), 2)
         self.assertEqual(
@@ -727,12 +721,12 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 _system_sample(2.0, 3.0, 30.0),
             ],
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -752,7 +746,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::12::INSTR"
 
         def cancel_wait(
-            _context: ModuleOperationContext,
+            _context: TestModuleAPI,
             _seconds: float,
         ) -> None:
             raise ModuleOperationCancelled(
@@ -765,14 +759,14 @@ class LakeShore372ABackendTests(unittest.TestCase):
             waiter=cancel_wait,
         )
         context = self._context(messages, [])
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         with self.assertRaises(
             ModuleOperationCancelled
         ):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             state.intypes[1][4],
@@ -794,12 +788,12 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 _system_sample(1.0, 2.0, 20.0),
             ],
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -824,9 +818,9 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings = default_settings()
         settings["resource"] = "GPIB0::12::INSTR"
         context = self._context(messages)
-        backend.initialize(settings, context)
+        open_module(backend, context)
         with self.assertRaises(ModuleError) as identity:
-            backend.apply_settings(settings, context)
+            backend.configure(settings, context)
         self.assertEqual(
             identity.exception.code,
             "LS372_CONNECTION_FAILED",
@@ -838,7 +832,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         unsafe["dwell_seconds"] = 200
         state.identity = "LSCI,MODEL372,1,1"
         with self.assertRaises(ModuleError) as duration:
-            backend.apply_settings(unsafe, context)
+            backend.configure(unsafe, context)
         self.assertEqual(
             duration.exception.code,
             "LS372_MEASURE_TIMEOUT_UNSAFE",
@@ -856,10 +850,10 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::12::INSTR"
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(settings, context)
+        open_module(backend, context)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.apply_settings(settings, context)
+            backend.configure(settings, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -882,7 +876,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         backend = self._backend(state)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.apply_settings(
+            backend.configure(
                 settings,
                 self._context(messages),
             )
@@ -908,13 +902,9 @@ class LakeShore372ABackendTests(unittest.TestCase):
         current = deepcopy(initial)
         current["resource"] = "GPIB0::7::INSTR"
         context = self._context(messages)
-        backend.initialize(initial, context)
+        open_module(backend, context)
 
-        backend.manual_action(
-            "test_connection",
-            {"settings": current},
-            context,
-        )
+        run_action(backend, "test_connection", {"settings": current}, context)
 
         self.assertEqual(
             state.opened[-1][0],
@@ -936,12 +926,8 @@ class LakeShore372ABackendTests(unittest.TestCase):
         })
         context = self._context(messages)
 
-        backend.initialize(settings, context)
-        result = backend.manual_action(
-            "test_connection",
-            {"settings": settings},
-            context,
-        )
+        open_module(backend, context)
+        result = run_action(backend, "test_connection", {"settings": settings}, context)
 
         self.assertEqual(
             result["Last Action"],
@@ -959,17 +945,17 @@ class LakeShore372ABackendTests(unittest.TestCase):
             )
         )
 
-    def test_abort_shunts_and_releases_transport(self) -> None:
+    def test_close_shunts_and_releases_transport(self) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         settings = default_settings()
         settings["resource"] = "GPIB0::12::INSTR"
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
 
-        status = backend.abort(context)
+        status = backend.close(context)
 
         self.assertIsNone(backend.transport)
         self.assertGreaterEqual(state.closed, 1)
@@ -978,7 +964,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             "Disconnected",
         )
 
-    def test_abort_reports_unconfirmed_shunt_after_disconnect(
+    def test_close_reports_unconfirmed_shunt_after_disconnect(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -987,12 +973,12 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings = default_settings()
         settings["resource"] = "GPIB0::12::INSTR"
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
         backend._close_transport()
 
         with self.assertRaises(ModuleError) as captured:
-            backend.abort(context)
+            backend.close(context)
 
         self.assertEqual(
             captured.exception.code,
@@ -1008,7 +994,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             "Shunt unconfirmed",
         )
 
-    def test_end_sequence_failure_clears_running_state(
+    def test_run_end_failure_clears_running_state(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -1017,13 +1003,13 @@ class LakeShore372ABackendTests(unittest.TestCase):
         settings = default_settings()
         settings["resource"] = "GPIB0::12::INSTR"
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         state.failures["INTYPE? 1"] = 2
 
         with self.assertRaises(ModuleError):
-            backend.end_sequence("stopped", context)
+            run_end(backend, "stopped", context)
 
         self.assertFalse(backend.sequence_active)
         statuses = [
@@ -1085,13 +1071,11 @@ class LakeShore372AFrontendTests(unittest.TestCase):
     def test_settings_round_trip_and_resource_dropdown(
         self,
     ) -> None:
-        context = ModuleFrontendContext()
+        context = ModuleUIAPI()
         frontend = LakeShore372AFrontend(context)
         owner = QWidget()
-        settings_page = frontend.create_settings_page(
-            owner
-        )
-        status_page = frontend.create_status_page(owner)
+        settings_page = frontend
+        status_page = frontend.status_widget
         self.assertGreaterEqual(
             settings_page.sizeHint().width(),
             980,
@@ -1109,8 +1093,8 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             "excitation_range"
         ] = 7
 
-        frontend.load_settings(settings)
-        frontend.update_status({
+        frontend.load(settings)
+        frontend.show_status({
             "Available GPIB Resources": [
                 "GPIB0::7::INSTR",
                 "GPIB0::12::INSTR",
@@ -1118,7 +1102,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             "Connection": "Disconnected",
         })
 
-        self.assertEqual(frontend.settings(), settings)
+        self.assertEqual(frontend.dump(), settings)
         self.assertGreaterEqual(
             frontend.resource.count(),
             2,
@@ -1130,7 +1114,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             "Disconnected",
         )
         actions: list[tuple[str, dict]] = []
-        context.manualActionRequested.connect(
+        context.actionRequested.connect(
             lambda action, payload: actions.append(
                 (action, payload)
             )
@@ -1157,22 +1141,15 @@ class LakeShore372AFrontendTests(unittest.TestCase):
         self,
     ) -> None:
         frontend = LakeShore372AFrontend(
-            ModuleFrontendContext()
+            ModuleUIAPI()
         )
         owner = QWidget()
-        settings_page = frontend.create_settings_page(
-            owner
-        )
-        frontend.load_settings(default_settings())
+        settings_page = frontend
+        frontend.load(default_settings())
         widgets = frontend.channel_widgets["r1"]
         mode = widgets["excitation_mode"]
         excitation = widgets["excitation_range"]
         resistance = widgets["resistance_range"]
-        changes: list[None] = []
-        frontend.settingsChanged.connect(
-            lambda: changes.append(None)
-        )
-
         mode.setCurrentIndex(
             mode.findData("current")
         )
@@ -1193,8 +1170,6 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             int(resistance.currentData()),
             9,
         )
-        self.assertEqual(len(changes), 1)
-
         mode.setCurrentIndex(
             mode.findData("voltage")
         )
@@ -1216,15 +1191,13 @@ class LakeShore372AFrontendTests(unittest.TestCase):
                 resistance.findData(20)
             ).isEnabled()
         )
-        self.assertEqual(len(changes), 3)
-
         invalid_loaded = default_settings()
         invalid_loaded["channels"]["r1"].update({
             "excitation_mode": "current",
             "excitation_range": 22,
             "resistance_range": 17,
         })
-        frontend.load_settings(invalid_loaded)
+        frontend.load(invalid_loaded)
         self.assertEqual(
             int(resistance.currentData()),
             17,
@@ -1235,11 +1208,9 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             ).isEnabled()
         )
         self.assertEqual(
-            frontend.settings(),
+            frontend.dump(),
             invalid_loaded,
         )
-        self.assertEqual(len(changes), 3)
-
         settings_page.deleteLater()
         owner.deleteLater()
         self.application.processEvents()
@@ -1258,7 +1229,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
 
 
 class LakeShore372AManifestTests(unittest.TestCase):
-    def test_manifest_uses_framework_dependencies_and_fixed_columns(
+    def test_minimal_manifest_and_backend_columns(
         self,
     ) -> None:
         descriptor = load_manifest(MODULE)
@@ -1276,14 +1247,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(
-            descriptor.framework_dependencies,
-            (
-                "PyVISA>=1.16.2,<1.17",
-                "typing_extensions>=4.16,<5",
-            ),
-        )
-        self.assertEqual(
-            [column.name for column in descriptor.columns],
+            list(LakeShore372ABackend.columns),
             [
                 "TemperatureAverage",
                 "FieldAverage",
@@ -1302,6 +1266,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
                 "StatusCode",
             ],
         )
+        self.assertEqual(descriptor.columns, ())
         self.assertFalse(
             (MODULE / "requirements.lock").exists()
         )

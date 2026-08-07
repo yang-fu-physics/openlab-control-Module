@@ -1,4 +1,4 @@
-"""Lake Shore Model 372 AC Resistance Bridge 的 Measurement Module 后端。
+﻿"""Lake Shore Model 372 AC Resistance Bridge 的 Measurement Module 后端。
 
 用户界面沿用实验室常用的“372A”名称，协议实现依据 Model 372 手册中的
 ``FREQ/FILTER/INSET/INTYPE/SCAN`` 设置命令和
@@ -19,10 +19,9 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
-from labcontrol.measurement.api import (
-    ModuleBackend,
+from labcontrol.module_api import (
     ModuleError,
-    ModuleOperationContext,
+    ModuleAPI,
     ModuleWarning,
 )
 
@@ -53,7 +52,7 @@ TransportFactory = Callable[
     InstrumentTransport,
 ]
 ResourceLister = Callable[[], tuple[str, ...]]
-Waiter = Callable[[ModuleOperationContext, float], None]
+Waiter = Callable[[ModuleAPI, float], None]
 
 
 class PyVisaTransport:
@@ -129,7 +128,7 @@ class PyVisaTransport:
             self._manager.close()
 
 
-class LakeShore372ABackend(ModuleBackend):
+class LakeShore372ABackend:
     """372A 生命周期、设置读回、逐通道测量和异常分流状态机。
 
     每个 Enabled 通道的测量顺序固定为：
@@ -145,6 +144,24 @@ class LakeShore372ABackend(ModuleBackend):
     R1-R4 是 DAT 的固定逻辑槽位，不等同于仪表物理输入号；四个物理输入由设置独立选择
     且必须互不重复。
     """
+
+    columns = {
+        "TemperatureAverage": "K",
+        "FieldAverage": "Oe",
+        "R1": "Ohm",
+        "Phase1": "deg",
+        "Current1": "A",
+        "R2": "Ohm",
+        "Phase2": "deg",
+        "Current2": "A",
+        "R3": "Ohm",
+        "Phase3": "deg",
+        "Current3": "A",
+        "R4": "Ohm",
+        "Phase4": "deg",
+        "Current4": "A",
+        "StatusCode": "",
+    }
 
     def __init__(
         self,
@@ -162,8 +179,8 @@ class LakeShore372ABackend(ModuleBackend):
         self._waiter = (
             waiter
             or (
-                lambda context, seconds:
-                context.interruptible_sleep(seconds)
+                lambda api, seconds:
+                api.sleep(seconds)
             )
         )
         self.transport: InstrumentTransport | None = None
@@ -174,20 +191,16 @@ class LakeShore372ABackend(ModuleBackend):
         self.last_values: dict[str, Any] = {}
         self.available_resources: tuple[str, ...] = ()
 
-    def initialize(
-        self,
-        settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> Mapping[str, Any]:
-        """Enable 阶段只规范化设置和发现 GPIB，不连接仪表、不发送设置。"""
+    def open(self, api: ModuleAPI) -> Mapping[str, Any]:
+        """Enable 阶段只发现 GPIB，不连接仪表、不发送设置。"""
 
-        self._require_live_context(context)
+        self._require_live_context(api)
         self.desired_settings = self._normalized_settings(
-            settings,
+            default_settings(),
             require_resource=False,
             validate_enabled_compatibility=False,
             operation_timeout_seconds=(
-                context.operation_timeout_seconds
+                api.timeout
             ),
         )
         discovery_message = ""
@@ -224,13 +237,13 @@ class LakeShore372ABackend(ModuleBackend):
             "Last Current (A)": "-",
             "Last Status": "-",
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def apply_settings(
+    def configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """连接并发送用户确认的设置，每个写入都必须通过查询读回。
 
@@ -244,7 +257,7 @@ class LakeShore372ABackend(ModuleBackend):
             require_resource=True,
             validate_enabled_compatibility=True,
             operation_timeout_seconds=(
-                context.operation_timeout_seconds
+                api.timeout
             ),
         )
         self.desired_settings = deepcopy(desired)
@@ -256,12 +269,12 @@ class LakeShore372ABackend(ModuleBackend):
             # FREQ 的第一个参数 0 表示全局/测量输入组；写后立即 FREQ? 核对索引。
             self._write(
                 f"FREQ 0,{desired['frequency_index']}",
-                context,
+                api,
             )
             self._expect_integers(
                 "FREQ? 0",
                 (int(desired["frequency_index"]),),
-                context,
+                api,
             )
             for slot in range(1, 5):
                 channel = desired["channels"][
@@ -284,10 +297,10 @@ class LakeShore372ABackend(ModuleBackend):
                     instrument_channel,
                     enabled=bool(channel["enabled"]),
                     shunted=True,
-                    context=context,
+                    api=api,
                 )
         except Exception:
-            # 清理路径不依赖 context checkpoint，Stop 已到达时仍会直接尝试分流。
+            # 清理路径不依赖 api checkpoint，Stop 已到达时仍会直接尝试分流。
             self._best_effort_shunt_settings(desired)
             self._close_transport()
             raise
@@ -303,12 +316,12 @@ class LakeShore372ABackend(ModuleBackend):
                 self._estimated_measure_seconds(desired)
             ),
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def begin_sequence(
+    def _run_start(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """重新确认全部激励已分流，再标记本次 SEQ。
 
@@ -319,30 +332,29 @@ class LakeShore372ABackend(ModuleBackend):
 
         self._require_ready()
         self.sequence_active = False
-        self._shunt_all(context)
+        self._shunt_all(api)
         self.sequence_active = True
         status = {
             "Sequence": "Running",
             "Excitation": "Shunted",
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
     def measure(
         self,
-        context: ModuleOperationContext,
-    ) -> None:
-        """只测量核心当前调度的一个逻辑槽位，并 emit 一行稀疏数据。"""
+        slot: int,
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        """只测量核心当前调度的一个逻辑槽位，并返回一行稀疏数据。"""
 
         self._require_ready()
         settings = self.applied_settings
-        step = context.measurement_step
-        if step is None or not 1 <= step.logical_slot <= 4:
+        if not 1 <= slot <= 4:
             raise ModuleError(
                 "Lake Shore 372A received an invalid logical slot",
                 "LS372_LOGICAL_SLOT_INVALID",
             )
-        slot = step.logical_slot
         channel = settings["channels"][f"r{slot}"]
         if not channel["enabled"]:
             raise ModuleError(
@@ -352,21 +364,18 @@ class LakeShore372ABackend(ModuleBackend):
             )
         self._validate_measure_duration(
             settings,
-            context.operation_timeout_seconds,
+            api.timeout,
         )
-        context.checkpoint()
-        self._measure_channel(
+        api.sleep(0)
+        return self._measure_channel(
             slot,
             channel,
             settings,
-            context,
+            api,
         )
 
-    def measurement_slots(
-        self,
-        context: ModuleOperationContext,
-    ) -> tuple[int, ...]:
-        del context
+    @property
+    def slots(self) -> tuple[int, ...]:
         self._require_ready()
         assert self.applied_settings is not None
         return tuple(
@@ -380,8 +389,8 @@ class LakeShore372ABackend(ModuleBackend):
         slot: int,
         channel: Mapping[str, Any],
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> None:
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
         """执行单通道完整事务，并在 finally 中处理分流确认。"""
 
         input_channel = int(channel["input_channel"])
@@ -394,34 +403,34 @@ class LakeShore372ABackend(ModuleBackend):
                 channel,
                 enabled=True,
                 shunted=True,
-                context=context,
+                api=api,
             )
             self._switch_channel(
                 input_channel,
-                context,
+                api,
             )
             self._set_shunt(
                 channel,
                 shunted=False,
-                context=context,
+                api=api,
             )
-            context.update_status({
+            api.status({
                 "Excitation": (
                     f"Active on input {input_channel}"
                 ),
                 "Last Channel": f"R{slot} / input {input_channel}",
             })
             self._waiter(
-                context,
+                api,
                 float(settings["pause_seconds"]),
             )
             # 第一份温场快照位于 Change Pause 之后、Dwell 之前。
-            first = context.sample_system()
+            first = api.devices()
             self._waiter(
-                context,
+                api,
                 float(settings["dwell_seconds"]),
             )
-            second = context.sample_system()
+            second = api.devices()
             # 平均函数还会要求第二份 temperature/field 时间戳严格更新，避免把同一份
             # 缓存读数重复两次伪装成时间平均。
             temperature, field = (
@@ -433,19 +442,19 @@ class LakeShore372ABackend(ModuleBackend):
             try:
                 resistance = self._query_float(
                     f"RDGR? {input_channel}",
-                    context,
+                    api,
                 )
                 quadrature = self._query_float(
                     f"QRDG? {input_channel}",
-                    context,
+                    api,
                 )
                 power = self._query_float(
                     f"RDGPWR? {input_channel}",
-                    context,
+                    api,
                 )
                 status_bits = self._query_status(
                     input_channel,
-                    context,
+                    api,
                 )
                 phase = math.degrees(
                     # QRDG 是正交分量，RDGR 是同相电阻分量；atan2 保留正确象限。
@@ -474,43 +483,38 @@ class LakeShore372ABackend(ModuleBackend):
                 warning_context = (
                     f"R{slot}/input {input_channel}"
                 )
-                context.resolve_warning(
-                    "LS372_OVER_COMPLIANCE",
-                    warning_context,
-                )
-                context.resolve_warning(
-                    "LS372_OVER_RANGE",
-                    warning_context,
-                )
-                context.warning(
+                api.warn("LS372_OVER_COMPLIANCE", None, warning_context)
+                api.warn("LS372_OVER_RANGE", None, warning_context)
+                api.warn(
+                    "LS372_READING_INVALID",
                     f"R{slot} input {input_channel} returned "
                     "an invalid measurement; this channel was "
                     f"recorded as ERROR: {exc}",
-                    "LS372_READING_INVALID",
                     warning_context,
                 )
-                context.emit_row({
+                row = {
                     "TemperatureAverage": temperature,
                     "FieldAverage": field,
                     "StatusCode": (
                         STATUS_CODE_INVALID_READING
                     ),
-                })
+                }
                 self.last_values = {
                     "slot": slot,
                     "input_channel": input_channel,
                     "status": "ERROR",
                 }
-                context.update_status({
+                api.status({
                     "Last Channel": (
                         f"R{slot} / input {input_channel}"
                     ),
                     "Last Status": f"ERROR: {exc}",
                 })
-                return
+                return row
 
-            context.resolve_warning(
+            api.warn(
                 "LS372_READING_INVALID",
+                None,
                 f"R{slot}/input {input_channel}",
             )
             status, details = self._status(
@@ -521,7 +525,7 @@ class LakeShore372ABackend(ModuleBackend):
                 input_channel,
                 status,
                 details,
-                context,
+                api,
             )
             status_code = {
                 "NORMAL": STATUS_CODE_NORMAL,
@@ -544,7 +548,6 @@ class LakeShore372ABackend(ModuleBackend):
                     f"Phase{slot}": phase,
                     f"Current{slot}": current,
                 })
-            context.emit_row(row)
             self.last_values = {
                 "slot": slot,
                 "input_channel": input_channel,
@@ -556,7 +559,7 @@ class LakeShore372ABackend(ModuleBackend):
                     "phase": phase,
                     "current": current,
                 })
-            context.update_status({
+            api.status({
                 "Last Channel": (
                     f"R{slot} / input {input_channel}"
                 ),
@@ -581,12 +584,13 @@ class LakeShore372ABackend(ModuleBackend):
                     else f"{status}: {details}"
                 ),
             })
+            return row
         except Exception as exc:
             failure = exc
             raise
         finally:
             # 用户可显式关闭“每通道读完分流”，但任何异常都无条件尝试分流。成功路径
-            # 若不分流，最终 end_sequence/abort 仍会对全部 Enabled 通道分流。
+            # 若不分流，最终 run_end/close 仍会对全部 Enabled 通道分流。
             should_shunt = (
                 bool(settings["shunt_after_read"])
                 or failure is not None
@@ -598,7 +602,7 @@ class LakeShore372ABackend(ModuleBackend):
                         channel
                     )
                 )
-                context.update_status({
+                api.status({
                     "Excitation": "Shunted",
                 })
                 if cleanup_error is not None:
@@ -612,10 +616,10 @@ class LakeShore372ABackend(ModuleBackend):
                         f"input {input_channel}",
                     ) from failure
 
-    def end_sequence(
+    def _run_end(
         self,
         reason: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """对 completed/stopped/error 一律分流全部 Enabled 通道。
 
@@ -624,9 +628,9 @@ class LakeShore372ABackend(ModuleBackend):
         """
 
         try:
-            self._shunt_all(context)
+            self._shunt_all(api)
         except Exception:
-            context.update_status({
+            api.status({
                 "Sequence": reason.title(),
                 "Excitation": "Shunt unconfirmed",
             })
@@ -637,12 +641,12 @@ class LakeShore372ABackend(ModuleBackend):
             "Sequence": reason.title(),
             "Excitation": "Shunted",
         }
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def abort(
+    def close(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """Disable/应用退出时逐通道尽力分流，然后无条件关闭 VISA transport。
 
@@ -666,7 +670,7 @@ class LakeShore372ABackend(ModuleBackend):
                 else "Shunt unconfirmed"
             ),
         }
-        context.update_status(status)
+        api.status(status)
         if errors:
             raise ModuleError(
                 "One or more 372A inputs could not be "
@@ -676,9 +680,9 @@ class LakeShore372ABackend(ModuleBackend):
             )
         return status
 
-    def read_status(
+    def _read_status(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """只读查询 ``*IDN?`` 验证当前连接，没有连接时不隐式重连。"""
 
@@ -691,7 +695,7 @@ class LakeShore372ABackend(ModuleBackend):
                     else "Idle"
                 ),
             }
-        identity = self._query_text("*IDN?", context)
+        identity = self._query_text("*IDN?", api)
         self._validate_identity(identity)
         self.identity = identity
         return {
@@ -709,11 +713,11 @@ class LakeShore372ABackend(ModuleBackend):
             ),
         }
 
-    def manual_action(
+    def _action(
         self,
         action: str,
         payload: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """处理 Idle 时的资源刷新和连接测试；两者都不会 Apply 仪表设置。"""
 
@@ -751,7 +755,7 @@ class LakeShore372ABackend(ModuleBackend):
                 require_resource=True,
                 validate_enabled_compatibility=False,
                 operation_timeout_seconds=(
-                    context.operation_timeout_seconds
+                    api.timeout
                 ),
             )
             self._connect(
@@ -766,41 +770,50 @@ class LakeShore372ABackend(ModuleBackend):
                 "Last Action": "Connection test passed",
             }
         else:
-            return (
-                super().manual_action(
-                    action,
-                    payload,
-                    context,
-                )
-                or {}
+            raise ModuleWarning(
+                f"Unsupported 372A action: {action}",
+                "LS372_UNSUPPORTED_ACTION",
+                action,
             )
-        context.update_status(status)
+        api.status(status)
         return status
+
+    def on_event(
+        self,
+        event: str,
+        data: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        if event == "run_start":
+            return self._run_start(api)
+        if event == "run_end":
+            return self._run_end(str(data.get("reason", "error")), api)
+        if event == "status":
+            return self._read_status(api)
+        if event == "action":
+            payload = data.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ModuleError(
+                    "Action payload must be a mapping",
+                    "LS372_INVALID_ACTION",
+                )
+            return self._action(str(data.get("name", "")), payload, api)
+        return {}
 
     @staticmethod
     def _require_live_context(
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        """拒绝缺少实时快照和可中断等待能力的旧核心 API。"""
+        """确认核心给出的总超时有效，并执行一次 Stop/Pause 检查。"""
 
-        if (
-            not callable(
-                getattr(context, "sample_system", None)
-            )
-            or not callable(
-                getattr(
-                    context,
-                    "interruptible_sleep",
-                    None,
-                )
-            )
-        ):
+        timeout = float(api.timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
             raise ModuleError(
-                "This module requires the live, interruptible "
-                "Measurement Module context added after "
-                "OpenLab Control 0.11.0 Beta 2 or newer",
-                "LS372_CORE_API_TOO_OLD",
+                "Core module operation timeout must be a positive finite number",
+                "LS372_INVALID_SETTINGS",
+                "operation_timeout_seconds",
             )
+        api.sleep(0)
 
     def _connect(
         self,
@@ -854,7 +867,7 @@ class LakeShore372ABackend(ModuleBackend):
     def _write(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """发送一次写命令；结果不确定时禁止自动重放。
 
@@ -863,7 +876,7 @@ class LakeShore372ABackend(ModuleBackend):
         上报，并保留当前 transport 供外层安全清理路径直接尝试分流。
         """
 
-        context.checkpoint()
+        api.sleep(0)
         transport = self.transport
         if transport is None:
             raise ModuleError(
@@ -885,14 +898,14 @@ class LakeShore372ABackend(ModuleBackend):
     def _query_text(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> str:
         """查询非空文本；空回复与传输异常一样不能被当作有效读回。"""
 
         result = self._call_with_retry(
             command,
             lambda transport: transport.query(command),
-            context,
+            api,
         )
         text = str(result).strip()
         if not text:
@@ -911,7 +924,7 @@ class LakeShore372ABackend(ModuleBackend):
             [InstrumentTransport],
             Any,
         ],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Any:
         """重试只读查询，并把最终失败升级为 ModuleError。
 
@@ -946,28 +959,22 @@ class LakeShore372ABackend(ModuleBackend):
                 last_error = exc
                 if attempt >= attempts:
                     break
-                context.warning(
+                api.warn(
+                    "LS372_IO_RETRY",
                     f"Model 372 I/O failed; retrying "
                     f"({attempt}/{attempts}): "
                     f"{type(exc).__name__}: {exc}",
-                    "LS372_IO_RETRY",
                     command,
                 )
-                self._waiter(context, 0.2)
+                self._waiter(api, 0.2)
                 try:
                     self._reopen_transport(settings)
                 except Exception as reopen_error:
                     last_error = reopen_error
                 continue
-            context.resolve_warning(
-                "LS372_IO_RETRY",
-                command,
-            )
+            api.warn("LS372_IO_RETRY", None, command)
             return result
-        context.resolve_warning(
-            "LS372_IO_RETRY",
-            command,
-        )
+        api.warn("LS372_IO_RETRY", None, command)
         assert last_error is not None
         raise ModuleError(
             f"Model 372 I/O failed after {attempts} "
@@ -1007,7 +1014,7 @@ class LakeShore372ABackend(ModuleBackend):
         *,
         enabled: bool,
         shunted: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """按 FILTER→INSET→INTYPE 顺序完整配置一个物理输入并逐项核对。
 
@@ -1027,7 +1034,7 @@ class LakeShore372ABackend(ModuleBackend):
             f"{1 if settings['filter_enabled'] else 0},"
             f"{settings['filter_settle_seconds']},"
             f"{settings['filter_window_percent']}",
-            context,
+            api,
         )
         self._expect_integers(
             f"FILTER? {input_channel}",
@@ -1036,7 +1043,7 @@ class LakeShore372ABackend(ModuleBackend):
                 int(settings["filter_settle_seconds"]),
                 int(settings["filter_window_percent"]),
             ),
-            context,
+            api,
         )
         self._write(
             "INSET "
@@ -1045,7 +1052,7 @@ class LakeShore372ABackend(ModuleBackend):
             f"{settings['dwell_seconds']},"
             f"{settings['pause_seconds']},"
             "0,2",
-            context,
+            api,
         )
         self._expect_integers(
             f"INSET? {input_channel}",
@@ -1056,19 +1063,19 @@ class LakeShore372ABackend(ModuleBackend):
                 0,
                 2,
             ),
-            context,
+            api,
         )
         self._write(
             self._intype_command(
                 channel,
                 shunted=shunted,
             ),
-            context,
+            api,
         )
         self._verify_intype(
             channel,
             shunted=shunted,
-            context=context,
+            api=api,
         )
 
     @staticmethod
@@ -1104,18 +1111,18 @@ class LakeShore372ABackend(ModuleBackend):
     def _switch_channel(
         self,
         input_channel: int,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """切换 SCAN 到指定输入并关闭仪表内部自动扫描，然后读回确认。"""
 
         self._write(
             f"SCAN {input_channel},0",
-            context,
+            api,
         )
         self._expect_integers(
             "SCAN?",
             (input_channel, 0),
-            context,
+            api,
         )
 
     def _set_shunt(
@@ -1123,7 +1130,7 @@ class LakeShore372ABackend(ModuleBackend):
         channel: Mapping[str, Any],
         *,
         shunted: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """用完整 INTYPE 设置改变分流位，并要求仪表返回完全一致的配置。"""
 
@@ -1132,12 +1139,12 @@ class LakeShore372ABackend(ModuleBackend):
                 channel,
                 shunted=shunted,
             ),
-            context,
+            api,
         )
         self._verify_intype(
             channel,
             shunted=shunted,
-            context=context,
+            api=api,
         )
 
     def _verify_intype(
@@ -1145,7 +1152,7 @@ class LakeShore372ABackend(ModuleBackend):
         channel: Mapping[str, Any],
         *,
         shunted: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """核对 INTYPE 的模式、量程、自动量程、分流和首选单位全部字段。"""
 
@@ -1155,14 +1162,14 @@ class LakeShore372ABackend(ModuleBackend):
                 channel,
                 shunted=shunted,
             ),
-            context,
+            api,
         )
 
     def _expect_integers(
         self,
         command: str,
         expected: tuple[int, ...],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """解析逗号分隔的整数读回，字段数量和值都必须与期望完全相同。
 
@@ -1170,7 +1177,7 @@ class LakeShore372ABackend(ModuleBackend):
         差异或通道仍处于未确认的激励状态。
         """
 
-        reply = self._query_text(command, context)
+        reply = self._query_text(command, api)
         try:
             actual = tuple(
                 int(part.strip(), 10)
@@ -1195,11 +1202,11 @@ class LakeShore372ABackend(ModuleBackend):
     def _query_float(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> float:
         """读取一个有限浮点数；NaN/Inf 不允许进入 DAT 或后续电流计算。"""
 
-        reply = self._query_text(command, context)
+        reply = self._query_text(command, api)
         try:
             value = float(reply)
         except ValueError as exc:
@@ -1221,12 +1228,12 @@ class LakeShore372ABackend(ModuleBackend):
     def _query_status(
         self,
         input_channel: int,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> int:
         """读取 RDGST 的 8 位状态字，并拒绝负数或超出一个字节的回复。"""
 
         command = f"RDGST? {input_channel}"
-        reply = self._query_text(command, context)
+        reply = self._query_text(command, api)
         try:
             value = int(reply, 10)
         except ValueError as exc:
@@ -1272,7 +1279,7 @@ class LakeShore372ABackend(ModuleBackend):
         input_channel: int,
         status: str,
         details: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """按逻辑槽位和物理输入发布可恢复 Warning，并在状态恢复时解除。
 
@@ -1284,36 +1291,24 @@ class LakeShore372ABackend(ModuleBackend):
             f"R{slot}/input {input_channel}"
         )
         if status == "OVER_COMPLIANCE":
-            context.resolve_warning(
-                "LS372_OVER_RANGE",
-                warning_context,
-            )
-            context.warning(
+            api.warn("LS372_OVER_RANGE", None, warning_context)
+            api.warn(
+                "LS372_OVER_COMPLIANCE",
                 f"R{slot} input {input_channel} exceeded "
                 f"current-source compliance ({details})",
-                "LS372_OVER_COMPLIANCE",
                 warning_context,
             )
         elif status == "OVER_RANGE":
-            context.resolve_warning(
-                "LS372_OVER_COMPLIANCE",
-                warning_context,
-            )
-            context.warning(
+            api.warn("LS372_OVER_COMPLIANCE", None, warning_context)
+            api.warn(
+                "LS372_OVER_RANGE",
                 f"R{slot} input {input_channel} is outside "
                 f"the valid measurement range ({details})",
-                "LS372_OVER_RANGE",
                 warning_context,
             )
         else:
-            context.resolve_warning(
-                "LS372_OVER_COMPLIANCE",
-                warning_context,
-            )
-            context.resolve_warning(
-                "LS372_OVER_RANGE",
-                warning_context,
-            )
+            api.warn("LS372_OVER_COMPLIANCE", None, warning_context)
+            api.warn("LS372_OVER_RANGE", None, warning_context)
 
     @staticmethod
     def _excitation_current(
@@ -1596,7 +1591,7 @@ class LakeShore372ABackend(ModuleBackend):
 
     def _shunt_all(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """严格分流全部已 Apply 且 Enabled 的输入，并汇总所有失败后一次抛出。
 
@@ -1617,7 +1612,7 @@ class LakeShore372ABackend(ModuleBackend):
                 self._set_shunt(
                     channel,
                     shunted=True,
-                    context=context,
+                    api=api,
                 )
             except Exception as exc:
                 errors.append(
@@ -2052,7 +2047,7 @@ class LakeShore372ABackend(ModuleBackend):
     ) -> None:
         """要求估算时间至少比核心总截止时间短两秒，为 IPC 返回和分流清理留余量。"""
 
-        # 核心 API 1.1 会把每个槽位作为独立 worker 请求，因此总超时只需要容纳
+        # 核心会把每个槽位作为独立 worker 请求，因此总超时只需要容纳
         # 最慢的一个槽位；状态页仍继续显示完整 T Measure 的总估算时间。
         estimate = (
             float(settings["pause_seconds"])
@@ -2167,8 +2162,11 @@ class LakeShore372ABackend(ModuleBackend):
         return value
 
 
+Module = LakeShore372ABackend
+
 __all__ = [
     "InstrumentTransport",
     "LakeShore372ABackend",
+    "Module",
     "PyVisaTransport",
 ]

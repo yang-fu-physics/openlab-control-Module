@@ -16,13 +16,21 @@ sys.path.insert(0, str(CORE / "src"))
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
-from labcontrol.measurement.api import (  # noqa: E402
+from labcontrol.module_api import (  # noqa: E402
     ModuleError,
-    ModuleMeasurementStep,
-    ModuleOperationContext,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
-    ModuleFrontendContext,
+    ModuleUIAPI,
+)
+from module_contract import (  # noqa: E402
+    TestModuleAPI,
+    measure_module,
+    module_slots,
+    open_module,
+    read_status,
+    run_action,
+    run_end,
+    run_start,
 )
 from labcontrol.measurement.manifest import (  # noqa: E402
     load_manifest,
@@ -262,7 +270,7 @@ class LR700BackendTests(unittest.TestCase):
                 lambda context, seconds: (
                     waits.append(seconds)
                     if waits is not None
-                    else context.checkpoint()
+                    else context.sleep(0)
                 )
             ),
         )
@@ -271,10 +279,9 @@ class LR700BackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
-        slot: int = 1,
-    ) -> ModuleOperationContext:
+    ) -> TestModuleAPI:
         iterator = iter(samples or [])
-        return ModuleOperationContext(
+        return TestModuleAPI(
             {},
             lambda kind, values: messages.append(
                 (kind, values)
@@ -286,35 +293,25 @@ class LR700BackendTests(unittest.TestCase):
             ),
             lambda _timeout: "running",
             120.0,
-        ModuleMeasurementStep(slot, 1, 1),
-    )
+        )
 
 
     @staticmethod
     def _measure_enabled_slots(
         backend,
-        context: ModuleOperationContext,
+        context: TestModuleAPI,
     ) -> None:
-        slots = tuple(backend.measurement_slots(context))
-        for index, logical_slot in enumerate(slots, start=1):
-            context.measurement_step = ModuleMeasurementStep(
-                logical_slot,
-                index,
-                len(slots),
-            )
-            backend.measure(context)
+        for logical_slot in module_slots(backend):
+            measure_module(backend, context, logical_slot)
 
-    def test_initialize_discovers_without_connecting_or_writing(
+    def test_open_discovers_without_connecting_or_writing(
         self,
     ) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
 
-        status = backend.initialize(
-            {"resource": "GPIB0::18::INSTR"},
-            self._context(messages),
-        )
+        status = open_module(backend, self._context(messages))
 
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
@@ -344,17 +341,14 @@ class LR700BackendTests(unittest.TestCase):
             _samples(2),
         )
 
-        backend.initialize(settings, context)
-        applied = backend.apply_settings(
+        open_module(backend, context)
+        applied = backend.configure(
             settings,
             context,
         )
-        backend.begin_sequence(context)
+        run_start(backend, context)
         self._measure_enabled_slots(backend, context)
-        ended = backend.end_sequence(
-            "completed",
-            context,
-        )
+        ended = run_end(backend, "completed", context)
 
         rows = [
             payload["values"]
@@ -450,11 +444,11 @@ class LR700BackendTests(unittest.TestCase):
             messages,
             _samples(1),
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         self.assertGreaterEqual(len(state.opened), 2)
         self.assertEqual(
@@ -488,9 +482,9 @@ class LR700BackendTests(unittest.TestCase):
         settings = _two_slot_settings()
         backend = self._backend(state, [])
         context = self._context(messages, _samples(2))
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         self._measure_enabled_slots(backend, context)
 
@@ -535,15 +529,15 @@ class LR700BackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::18::INSTR"
         backend = self._backend(state, [])
         context = self._context(messages, _samples(1))
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         backend._best_effort_safe_state = (
             lambda: "simulated cleanup failure"
         )
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -568,12 +562,12 @@ class LR700BackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::18::INSTR"
         backend = self._backend(state)
         context = self._context(messages, _samples(1))
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -606,12 +600,12 @@ class LR700BackendTests(unittest.TestCase):
                 _system_sample(1.0, 2.0, 20.0),
             ],
         )
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -620,7 +614,7 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(state.excitation_index, 0)
         self.assertEqual(state.excitation_percent, 5)
 
-    def test_abort_confirms_minimum_excitation_and_closes_transport(
+    def test_close_confirms_minimum_excitation_and_closes_transport(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -629,12 +623,12 @@ class LR700BackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::18::INSTR"
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
         state.excitation_index = 6
         state.excitation_percent = 100
 
-        status = backend.abort(context)
+        status = backend.close(context)
 
         self.assertIsNone(backend.transport)
         self.assertGreaterEqual(state.closed, 1)
@@ -654,9 +648,9 @@ class LR700BackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::18::INSTR"
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(settings, context)
+        open_module(backend, context)
 
-        status = backend.abort(context)
+        status = backend.close(context)
 
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
@@ -674,16 +668,13 @@ class LR700BackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::18::INSTR"
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
         state.excitation_index = 6
         state.excitation_percent = 100
         state.failures["AUTORANGE 0"] = 1
 
-        status = backend.end_sequence(
-            "stopped",
-            context,
-        )
+        status = run_end(backend, "stopped", context)
 
         self.assertGreaterEqual(len(state.opened), 2)
         self.assertGreaterEqual(state.closed, 1)
@@ -708,10 +699,10 @@ class LR700BackendTests(unittest.TestCase):
         settings["resource"] = "GPIB0::18::INSTR"
         backend = self._backend(state)
         context = self._context(messages)
-        backend.initialize(settings, context)
+        open_module(backend, context)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.apply_settings(settings, context)
+            backend.configure(settings, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -734,7 +725,7 @@ class LR700BackendTests(unittest.TestCase):
             "filter_index"
         ] = 2
         with self.assertRaises(ModuleError) as filter_error:
-            backend.apply_settings(
+            backend.configure(
                 filter_unsafe,
                 context,
             )
@@ -758,7 +749,7 @@ class LR700BackendTests(unittest.TestCase):
         with self.assertRaises(
             ModuleError
         ) as duration_error:
-            backend.apply_settings(
+            backend.configure(
                 duration_unsafe,
                 context,
             )
@@ -781,7 +772,7 @@ class LR700BackendTests(unittest.TestCase):
         backend = self._backend(state)
 
         with self.assertRaises(ModuleError) as captured:
-            backend.apply_settings(
+            backend.configure(
                 settings,
                 self._context(messages),
             )
@@ -857,13 +848,9 @@ class LR700BackendTests(unittest.TestCase):
         current = default_settings()
         current["resource"] = "GPIB0::7::INSTR"
         context = self._context(messages)
-        backend.initialize(initial, context)
+        open_module(backend, context)
 
-        backend.manual_action(
-            "test_connection",
-            {"settings": current},
-            context,
-        )
+        run_action(backend, "test_connection", {"settings": current}, context)
 
         self.assertEqual(
             state.opened[-1][0],
@@ -889,13 +876,11 @@ class LR700FrontendTests(unittest.TestCase):
     def test_settings_round_trip_resources_and_manual_payload(
         self,
     ) -> None:
-        context = ModuleFrontendContext()
+        context = ModuleUIAPI()
         frontend = LR700Frontend(context)
         owner = QWidget()
-        settings_page = frontend.create_settings_page(
-            owner
-        )
-        status_page = frontend.create_status_page(owner)
+        settings_page = frontend
+        status_page = frontend.status_widget
         self.assertGreaterEqual(
             settings_page.sizeHint().width(),
             1180,
@@ -913,8 +898,8 @@ class LR700FrontendTests(unittest.TestCase):
             "excitation_percent": 25,
             "filter_index": 1,
         })
-        frontend.load_settings(settings)
-        frontend.update_status({
+        frontend.load(settings)
+        frontend.show_status({
             "Available GPIB Resources": [
                 "GPIB0::7::INSTR",
                 "GPIB0::18::INSTR",
@@ -922,7 +907,7 @@ class LR700FrontendTests(unittest.TestCase):
             "Connection": "Disconnected",
         })
 
-        self.assertEqual(frontend.settings(), settings)
+        self.assertEqual(frontend.dump(), settings)
         self.assertGreaterEqual(
             frontend.resource.count(),
             2,
@@ -934,7 +919,7 @@ class LR700FrontendTests(unittest.TestCase):
             "Disconnected",
         )
         actions: list[tuple[str, dict]] = []
-        context.manualActionRequested.connect(
+        context.actionRequested.connect(
             lambda action, payload: actions.append(
                 (action, payload)
             )
@@ -971,7 +956,7 @@ class LR700FrontendTests(unittest.TestCase):
 
 
 class LR700ManifestTests(unittest.TestCase):
-    def test_manifest_uses_shared_pyvisa_and_all_sparse_columns(
+    def test_minimal_manifest_and_backend_sparse_columns(
         self,
     ) -> None:
         descriptor = load_manifest(MODULE)
@@ -985,14 +970,7 @@ class LR700ManifestTests(unittest.TestCase):
             "0.1.0b5",
         )
         self.assertEqual(descriptor.dependencies, ())
-        self.assertEqual(
-            descriptor.framework_dependencies,
-            ("PyVISA>=1.16.2,<1.17",),
-        )
-        names = [
-            column.name
-            for column in descriptor.columns
-        ]
+        names = list(LR700Backend.columns)
         self.assertEqual(
             names[:4],
             [
@@ -1007,6 +985,7 @@ class LR700ManifestTests(unittest.TestCase):
             ["R4", "X4", "StatusCode"],
         )
         self.assertEqual(len(names), 11)
+        self.assertEqual(descriptor.columns, ())
         self.assertFalse(
             (MODULE / "requirements.lock").exists()
         )

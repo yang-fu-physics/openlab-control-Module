@@ -23,14 +23,22 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from labcontrol.extensions.loading import (  # noqa: E402
     load_source_object,
 )
-from labcontrol.measurement.api import (  # noqa: E402
+from labcontrol.module_api import (  # noqa: E402
     ModuleError,
-    ModuleMeasurementStep,
-    ModuleOperationCancelled,
-    ModuleOperationContext,
+    _ModuleOperationCancelled as ModuleOperationCancelled,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
-    ModuleFrontendContext,
+    ModuleUIAPI,
+)
+from module_contract import (  # noqa: E402
+    TestModuleAPI,
+    measure_module,
+    module_slots,
+    open_module,
+    read_status,
+    run_action,
+    run_end,
+    run_start,
 )
 from labcontrol.measurement.manifest import (  # noqa: E402
     load_manifest,
@@ -503,9 +511,8 @@ def _settings(
 
 def _context(
     messages: list[tuple[str, dict]],
-    slot: int = 1,
-) -> ModuleOperationContext:
-    return ModuleOperationContext(
+) -> TestModuleAPI:
+    return TestModuleAPI(
         {},
         lambda kind, values: messages.append(
             (kind, values)
@@ -513,22 +520,15 @@ def _context(
         None,
         lambda _timeout: "running",
         300.0,
-        ModuleMeasurementStep(slot, 1, 1),
     )
 
 
 def _measure_enabled_slots(
     backend,
-    context: ModuleOperationContext,
+    context: TestModuleAPI,
 ) -> None:
-    slots = tuple(backend.measurement_slots(context))
-    for index, logical_slot in enumerate(slots, start=1):
-        context.measurement_step = ModuleMeasurementStep(
-            logical_slot,
-            index,
-            len(slots),
-        )
-        backend.measure(context)
+    for logical_slot in module_slots(backend):
+        measure_module(backend, context, logical_slot)
 
 
 class QuantityTests(unittest.TestCase):
@@ -585,7 +585,7 @@ class BackendTests(unittest.TestCase):
         waits: list[float] | None = None,
     ) -> Keithley6221DeltaBackend:
         def wait(
-            context: ModuleOperationContext,
+            context: TestModuleAPI,
             seconds: float,
         ) -> None:
             # 把等待放进同一命令时间线，才能断言 ARM 查询确实发生在 3 秒等待之后，
@@ -596,7 +596,7 @@ class BackendTests(unittest.TestCase):
             if waits is not None:
                 waits.append(seconds)
             else:
-                context.checkpoint()
+                context.sleep(0)
 
         return Keithley6221DeltaBackend(
             transport_factory=state.factory,
@@ -607,34 +607,28 @@ class BackendTests(unittest.TestCase):
             waiter=wait,
         )
 
-    def test_enable_probes_7001_but_does_not_touch_6221(
+    def test_open_only_discovers_and_apply_probes_7001(
         self,
     ) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
-        status = backend.initialize(
-            _settings(),
-            _context(messages),
-        )
+        status = open_module(backend, _context(messages))
+        self.assertFalse(backend.switcher_available)
+        self.assertEqual(status["7001"], "Not checked")
+        self.assertEqual(state.opened, [])
+
+        context = _context(messages)
+        backend.configure(_settings(), context)
         self.assertTrue(backend.switcher_available)
-        self.assertIn("MODEL 7001", status["7001"])
-        self.assertFalse(
-            any(
-                resource == "GPIB0::12::INSTR"
-                for resource, _timeout in state.opened
-            )
-        )
-        self.assertEqual(
-            [
-                command
-                for resource, action, command
-                in state.commands
-                if resource == "GPIB0::7::INSTR"
-                and action == "query"
-            ],
-            ["*IDN?"],
-        )
+        self.assertIn("MODEL 7001", backend.identity_7001)
+        switcher_queries = [
+            command
+            for resource, action, command in state.commands
+            if resource == "GPIB0::7::INSTR" and action == "query"
+        ]
+        self.assertEqual(switcher_queries[0], "*IDN?")
+        self.assertIn("ROUT:OPEN? (@1!1,1!11,1!5,1!15,1!2,1!12,1!3,1!13,1!4,1!14)", switcher_queries)
 
     def test_connection_test_uses_current_ui_settings_payload(
         self,
@@ -645,14 +639,10 @@ class BackendTests(unittest.TestCase):
         saved = _settings()
         saved["resource_6221"] = "GPIB0::99::INSTR"
         context = _context(messages)
-        backend.initialize(saved, context)
+        open_module(backend, context)
         current = _settings()
 
-        backend.manual_action(
-            "test_connection",
-            {"settings": current},
-            context,
-        )
+        run_action(backend, "test_connection", {"settings": current}, context)
 
         self.assertIn(
             ("GPIB0::12::INSTR", 3.0),
@@ -743,7 +733,8 @@ class BackendTests(unittest.TestCase):
         backend = self._backend(state, waits)
         settings = _settings(channels=4)
         context = _context(messages)
-        backend.initialize(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
         self.assertFalse(backend.switcher_available)
         self.assertTrue(
             any(
@@ -753,9 +744,8 @@ class BackendTests(unittest.TestCase):
                 for kind, payload in messages
             )
         )
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
-        backend.measure(context)
+        run_start(backend, context)
+        measure_module(backend, context)
         rows = [
             payload["values"]
             for kind, payload in messages
@@ -788,10 +778,10 @@ class BackendTests(unittest.TestCase):
         settings = _settings(channels=2)
         context = _context(messages)
 
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
         self.assertFalse(state.armed)
-        backend.begin_sequence(context)
+        run_start(backend, context)
         self.assertTrue(state.armed)
         _measure_enabled_slots(backend, context)
 
@@ -871,7 +861,7 @@ class BackendTests(unittest.TestCase):
         self.assertLess(arm_index, wait_index)
         self.assertLess(wait_index, verify_index)
 
-        backend.end_sequence("completed", context)
+        run_end(backend, "completed", context)
         self.assertFalse(state.armed)
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
@@ -888,9 +878,9 @@ class BackendTests(unittest.TestCase):
             independent=True,
         )
         context = _context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         self.assertFalse(state.armed)
         _measure_enabled_slots(backend, context)
 
@@ -975,11 +965,11 @@ class BackendTests(unittest.TestCase):
         settings = _settings(channels=1)
         settings["shared"]["count"] = 3
         context = _context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(
             payload
@@ -1019,11 +1009,11 @@ class BackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         settings = _settings(channels=1)
         context = _context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         row = next(
             payload
@@ -1045,9 +1035,9 @@ class BackendTests(unittest.TestCase):
         backend = self._backend(state, [])
         settings = _settings(channels=1)
         context = _context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         command = (
             "ROUT:CLOS (@1!1,1!11,1!5,1!15)"
         )
@@ -1058,7 +1048,7 @@ class BackendTests(unittest.TestCase):
         )
 
         with self.assertRaises(ModuleError) as captured:
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertEqual(
             captured.exception.code,
@@ -1071,13 +1061,13 @@ class BackendTests(unittest.TestCase):
             for resource, action, sent in state.commands
         )
         self.assertEqual(attempts, 1)
-        # 不等待核心稍后调用 end_sequence：失败返回 worker 前已经直接请求
+        # 不等待核心稍后发送 run_end：失败返回 worker 前已经直接请求
         # Abort/zero-current/open-all，尽可能缩短不确定路由状态的持续时间。
         self.assertFalse(backend.sequence_active)
         self.assertFalse(state.armed)
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
-        backend.end_sequence("error", context)
+        run_end(backend, "error", context)
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
 
@@ -1089,11 +1079,11 @@ class BackendTests(unittest.TestCase):
         settings = _settings(channels=1)
         messages: list[tuple[str, dict]] = []
         running = _context(messages)
-        backend.initialize(settings, running)
-        backend.apply_settings(settings, running)
-        backend.begin_sequence(running)
+        open_module(backend, running)
+        backend.configure(settings, running)
+        run_start(backend, running)
         self.assertTrue(state.armed)
-        stopping = ModuleOperationContext(
+        stopping = TestModuleAPI(
             {},
             lambda kind, values: messages.append(
                 (kind, values)
@@ -1101,11 +1091,10 @@ class BackendTests(unittest.TestCase):
             None,
             lambda _timeout: "stopping",
             300.0,
-            ModuleMeasurementStep(1, 1, 1),
         )
 
         with self.assertRaises(ModuleOperationCancelled):
-            backend.measure(stopping)
+            measure_module(backend, stopping)
 
         self.assertFalse(backend.sequence_active)
         self.assertFalse(state.armed)
@@ -1118,7 +1107,7 @@ class BackendTests(unittest.TestCase):
         state = _FakeVisaState()
 
         def cancel_during_arm(
-            _context: ModuleOperationContext,
+            _context: TestModuleAPI,
             seconds: float,
         ) -> None:
             self.assertEqual(seconds, 3.0)
@@ -1139,11 +1128,11 @@ class BackendTests(unittest.TestCase):
         settings = _settings(channels=1)
         messages: list[tuple[str, dict]] = []
         context = _context(messages)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
 
         with self.assertRaises(ModuleOperationCancelled):
-            backend.begin_sequence(context)
+            run_start(backend, context)
 
         self.assertFalse(backend.sequence_active)
         self.assertFalse(state.armed)
@@ -1161,9 +1150,9 @@ class BackendTests(unittest.TestCase):
         )
         messages: list[tuple[str, dict]] = []
         context = _context(messages)
-        backend.initialize(settings, context)
+        open_module(backend, context)
         with self.assertRaises(ModuleError) as captured:
-            backend.apply_settings(settings, context)
+            backend.configure(settings, context)
         self.assertEqual(
             captured.exception.code,
             "K6221_INVALID_SETTINGS",
@@ -1172,7 +1161,7 @@ class BackendTests(unittest.TestCase):
         unsafe = _settings(channels=1)
         unsafe["shared"]["high_current"] = "200m"
         with self.assertRaises(ModuleError) as captured:
-            backend.apply_settings(unsafe, context)
+            backend.configure(unsafe, context)
         self.assertEqual(
             captured.exception.code,
             "K6221_INVALID_SETTINGS",
@@ -1189,12 +1178,12 @@ class FrontendTests(unittest.TestCase):
     def test_si_text_mode_pages_and_ch1_only_status(
         self,
     ) -> None:
-        context = ModuleFrontendContext()
+        context = ModuleUIAPI()
         frontend = Keithley6221DeltaFrontend(context)
-        page = frontend.create_settings_page()
+        page = frontend
         # 实际主框架会持有两个页面；测试也必须保留状态页，避免 Qt 在状态刷新
         # 前回收其子控件，造成与真实窗口生命周期不一致的假失败。
-        status_page = frontend.create_status_page()
+        status_page = frontend.status_widget
         settings = _settings(
             channels=4,
             independent=True,
@@ -1203,7 +1192,7 @@ class FrontendTests(unittest.TestCase):
         settings["independent"]["ch2"][
             "low_current"
         ] = "-1pA"
-        frontend.load_settings(settings)
+        frontend.load(settings)
 
         self.assertEqual(
             frontend.shared_widgets[
@@ -1233,7 +1222,7 @@ class FrontendTests(unittest.TestCase):
             ].currentData(),
             "moving",
         )
-        saved = frontend.settings()
+        saved = frontend.dump()
         self.assertEqual(
             saved["shared"]["high_current"],
             "1m",
@@ -1245,7 +1234,7 @@ class FrontendTests(unittest.TestCase):
             "-1p",
         )
         actions: list[tuple[str, dict]] = []
-        context.manualActionRequested.connect(
+        context.actionRequested.connect(
             lambda action, payload: actions.append(
                 (action, payload)
             )
@@ -1266,7 +1255,7 @@ class FrontendTests(unittest.TestCase):
             "GPIB0::22::INSTR",
         )
 
-        frontend.update_status(
+        frontend.show_status(
             {
                 "7001": "Unavailable - CH1 only",
                 "State": "Initialized",
@@ -1282,7 +1271,7 @@ class FrontendTests(unittest.TestCase):
             page.sizeHint().width(),
             1200,
         )
-        current = frontend.settings()
+        current = frontend.dump()
         self.assertNotIn("absolute_current_limit", current)
         self.assertNotIn("absolute_compliance_limit", current)
         self.assertNotIn(
@@ -1311,7 +1300,7 @@ class ManifestTests(unittest.TestCase):
             "0.1.0b5",
         )
         self.assertEqual(
-            [column.name for column in descriptor.columns],
+            list(Keithley6221DeltaBackend.columns),
             [
                 "Channel",
                 "Resistance",
@@ -1321,6 +1310,7 @@ class ManifestTests(unittest.TestCase):
                 "StatusCode",
             ],
         )
+        self.assertEqual(descriptor.columns, ())
 
 
 if __name__ == "__main__":

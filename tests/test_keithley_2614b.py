@@ -18,13 +18,22 @@ sys.path.insert(0, str(CORE / "src"))
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from labcontrol.extensions.loading import load_source_object  # noqa: E402
-from labcontrol.measurement.api import (  # noqa: E402
+from labcontrol.module_api import (  # noqa: E402
     ModuleError,
-    ModuleOperationCancelled,
-    ModuleOperationContext,
+    _ModuleOperationCancelled as ModuleOperationCancelled,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
-    ModuleFrontendContext,
+    ModuleUIAPI,
+)
+from module_contract import (  # noqa: E402
+    TestModuleAPI,
+    measure_module,
+    module_slots,
+    open_module,
+    read_status,
+    run_action,
+    run_end,
+    run_start,
 )
 from labcontrol.measurement.manifest import load_manifest  # noqa: E402
 from labcontrol.measurement.settings import (  # noqa: E402
@@ -215,8 +224,8 @@ def _settings(two_channels: bool = False) -> dict:
 
 class Keithley2614BBackendTests(unittest.TestCase):
     @staticmethod
-    def _context(messages: list[tuple[str, dict]]) -> ModuleOperationContext:
-        return ModuleOperationContext(
+    def _context(messages: list[tuple[str, dict]]) -> TestModuleAPI:
+        return TestModuleAPI(
             {},
             lambda kind, values: messages.append((kind, values)),
             None,
@@ -232,15 +241,15 @@ class Keithley2614BBackendTests(unittest.TestCase):
                 "GPIB0::26::INSTR",
                 "GPIB0::5::INSTR",
             ),
-            waiter=waiter or (lambda context, _seconds: context.checkpoint()),
+            waiter=waiter or (lambda context, _seconds: context.sleep(0)),
         )
 
-    def test_initialize_discovers_without_opening_or_writing(self) -> None:
+    def test_open_discovers_without_opening_or_writing(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
 
-        status = backend.initialize(_settings(), self._context(messages))
+        status = open_module(backend, self._context(messages))
 
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
@@ -252,9 +261,9 @@ class Keithley2614BBackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context(messages)
         settings = _settings(two_channels=True)
-        backend.initialize(settings, context)
+        open_module(backend, context)
 
-        status = backend.apply_settings(settings, context)
+        status = backend.configure(settings, context)
 
         a = state.channels["smua"]
         b = state.channels["smub"]
@@ -286,12 +295,12 @@ class Keithley2614BBackendTests(unittest.TestCase):
         context = self._context(messages)
         settings = _settings(two_channels=True)
         settings["settle_seconds"] = 0.5
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         self.assertEqual(waits, [0.5])
         self.assertFalse(state.channels["smua"]["output"])
@@ -310,12 +319,12 @@ class Keithley2614BBackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context(messages)
         settings = _settings(two_channels=True)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
-        backend.measure(context)
+        measure_module(backend, context)
 
         rows = [payload["values"] for kind, payload in messages if kind == "row"]
         self.assertEqual(len(rows), 1)
@@ -333,17 +342,17 @@ class Keithley2614BBackendTests(unittest.TestCase):
         context = self._context(messages)
         settings = _settings(two_channels=True)
         settings["output_off_between_measurements"] = False
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
 
-        backend.measure(context)
+        measure_module(backend, context)
         self.assertTrue(state.channels["smua"]["output"])
         self.assertTrue(state.channels["smub"]["output"])
-        backend.measure(context)
+        measure_module(backend, context)
         self.assertTrue(state.channels["smua"]["output"])
         self.assertTrue(state.channels["smub"]["output"])
-        backend.end_sequence("completed", context)
+        run_end(backend, "completed", context)
 
         self.assertFalse(state.channels["smua"]["output"])
         self.assertFalse(state.channels["smub"]["output"])
@@ -362,13 +371,13 @@ class Keithley2614BBackendTests(unittest.TestCase):
         backend = self._backend(state, cancel)
         context = self._context(messages)
         settings = _settings(two_channels=True)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
 
         with self.assertRaises(ModuleOperationCancelled):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(state.channels["smua"]["output"])
         self.assertFalse(state.channels["smub"]["output"])
@@ -380,15 +389,15 @@ class Keithley2614BBackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context(messages)
         settings = _settings(two_channels=True)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
         command = "print(smub.source.output == smub.OUTPUT_ON)"
         state.query_overrides[command] = "false"
 
         with self.assertRaisesRegex(ModuleError, "interlock"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(state.channels["smua"]["output"])
         self.assertFalse(state.channels["smub"]["output"])
@@ -399,9 +408,9 @@ class Keithley2614BBackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context([])
         settings = _settings()
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         state.channels["smua"]["leveli"] = 2.0e-3
         on_before = sum(
             command.endswith("OUTPUT_ON")
@@ -410,7 +419,7 @@ class Keithley2614BBackendTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ModuleError, "readback mismatch"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         on_after = sum(
             command.endswith("OUTPUT_ON")
@@ -425,9 +434,9 @@ class Keithley2614BBackendTests(unittest.TestCase):
         backend = self._backend(state)
         context = self._context(messages)
         settings = _settings(two_channels=True)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
-        backend.begin_sequence(context)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
         messages.clear()
         read_command = (
             "print(smua.measure.v(), smua.measure.i(), smua.source.compliance)"
@@ -440,7 +449,7 @@ class Keithley2614BBackendTests(unittest.TestCase):
             ] = "true"
 
         with self.assertRaisesRegex(ModuleError, "could not be confirmed OFF"):
-            backend.measure(context)
+            measure_module(backend, context)
 
         self.assertFalse(any(kind == "row" for kind, _ in messages))
 
@@ -449,10 +458,10 @@ class Keithley2614BBackendTests(unittest.TestCase):
         state.identity = "KEITHLEY INSTRUMENTS,MODEL 2612B,0,1"
         backend = self._backend(state)
         context = self._context([])
-        backend.initialize(_settings(), context)
+        open_module(backend, context)
 
         with self.assertRaisesRegex(ModuleError, "Expected Keithley Model 2614B"):
-            backend.apply_settings(_settings(), context)
+            backend.configure(_settings(), context)
 
         self.assertEqual(state.closed, 1)
         self.assertIsNone(backend.transport)
@@ -465,7 +474,7 @@ class Keithley2614BBackendTests(unittest.TestCase):
             source_current="200mA", voltage_limit="30V"
         )
         with self.assertRaises(ModuleError) as voltage_error:
-            backend.initialize(high_current, context)
+            backend.configure(high_current, context)
         self.assertEqual(voltage_error.exception.context, "ch1.voltage_limit")
 
         high_voltage = _settings()
@@ -475,36 +484,36 @@ class Keithley2614BBackendTests(unittest.TestCase):
             current_limit="200mA",
         )
         with self.assertRaises(ModuleError) as current_error:
-            backend.initialize(high_voltage, context)
+            backend.configure(high_voltage, context)
         self.assertEqual(current_error.exception.context, "ch1.current_limit")
 
         none_enabled = _settings()
         none_enabled["channels"]["ch1"]["enabled"] = False
         none_enabled["channels"]["ch2"]["enabled"] = False
         with self.assertRaises(ModuleError) as channel_error:
-            backend.initialize(none_enabled, context)
+            backend.configure(none_enabled, context)
         self.assertEqual(channel_error.exception.context, "channels")
 
         # 默认 2 s VISA timeout 下，两个 Enabled 通道仍应落在 120 s lifecycle budget 内。
-        backend.initialize(_settings(two_channels=True), context)
+        backend.configure(_settings(two_channels=True), context)
 
     def test_short_operation_timeout_rejects_before_connection(self) -> None:
         backend = self._backend(_FakeState())
-        short = ModuleOperationContext({}, lambda *_: None, None, None, 50.0)
+        short = TestModuleAPI({}, lambda *_: None, None, None, 50.0)
         with self.assertRaises(ModuleError) as timeout_error:
-            backend.initialize(_settings(two_channels=True), short)
+            backend.configure(_settings(two_channels=True), short)
         self.assertEqual(timeout_error.exception.context, "operation_timeout_seconds")
 
-    def test_abort_is_idempotent_and_closes_once(self) -> None:
+    def test_close_is_idempotent_and_closes_once(self) -> None:
         state = _FakeState()
         backend = self._backend(state)
         context = self._context([])
         settings = _settings(two_channels=True)
-        backend.initialize(settings, context)
-        backend.apply_settings(settings, context)
+        open_module(backend, context)
+        backend.configure(settings, context)
 
-        backend.abort(context)
-        backend.abort(context)
+        backend.close(context)
+        backend.close(context)
 
         self.assertFalse(state.channels["smua"]["output"])
         self.assertFalse(state.channels["smub"]["output"])
@@ -520,7 +529,7 @@ class Keithley2614BFrontendTests(unittest.TestCase):
         manifest = load_manifest(MODULE)
         self.assertEqual(manifest.id, "keithley_2614b")
         self.assertEqual(
-            [column.name for column in manifest.columns],
+            list(Keithley2614BBackend.columns),
             [
                 "R1",
                 "Voltage1",
@@ -532,9 +541,10 @@ class Keithley2614BFrontendTests(unittest.TestCase):
                 "StatusCode2",
             ],
         )
-        frontend = Keithley2614BFrontend(ModuleFrontendContext())
-        settings_page = frontend.create_settings_page()
-        status_page = frontend.create_status_page()
+        self.assertEqual(manifest.columns, ())
+        frontend = Keithley2614BFrontend(ModuleUIAPI())
+        settings_page = frontend
+        status_page = frontend.status_widget
         supplied = _settings(two_channels=True)
         supplied["channels"]["ch2"].update(
             source_voltage="5V",
@@ -542,8 +552,8 @@ class Keithley2614BFrontendTests(unittest.TestCase):
             sense_mode="4wire",
         )
 
-        frontend.load_settings(supplied)
-        saved = frontend.settings()
+        frontend.load(supplied)
+        saved = frontend.dump()
 
         self.assertIsInstance(settings_page, QWidget)
         self.assertIsInstance(status_page, QWidget)
@@ -554,12 +564,12 @@ class Keithley2614BFrontendTests(unittest.TestCase):
         self.assertEqual(saved["channels"]["ch2"]["sense_mode"], "4wire")
 
     def test_resource_refresh_preserves_manual_address(self) -> None:
-        frontend = Keithley2614BFrontend(ModuleFrontendContext())
-        settings_page = frontend.create_settings_page()
-        status_page = frontend.create_status_page()
+        frontend = Keithley2614BFrontend(ModuleUIAPI())
+        settings_page = frontend
+        status_page = frontend.status_widget
         frontend.resource.setCurrentText("GPIB9::26::INSTR")
 
-        frontend.update_status(
+        frontend.show_status(
             {"Available GPIB Resources": ["GPIB0::26::INSTR"]}
         )
 

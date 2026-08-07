@@ -29,9 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from labcontrol.measurement.frontend_api import (
-    ModuleFrontend,
-)
+from labcontrol.measurement.frontend_api import ModuleUIAPI
 
 from .constants import (
     CURRENT_EXCITATIONS,
@@ -52,10 +50,18 @@ class _SettingsPage(QWidget):
         return QSize(980, 600)
 
 
-class LakeShore372AFrontend(ModuleFrontend):
+class LakeShore372AFrontend(QWidget):
     """372A 的 Settings/Status 两页视图及设置脏状态信号适配器。"""
 
-    def create_settings_page(
+    def __init__(self, api: ModuleUIAPI) -> None:
+        super().__init__()
+        self.api = api
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_settings(self))
+        self.status_widget = self._build_status_widget()
+
+    def _build_settings(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -88,7 +94,7 @@ class LakeShore372AFrontend(ModuleFrontend):
             "Refresh GPIB"
         )
         self.refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "refresh_resources"
             )
         )
@@ -273,7 +279,7 @@ class LakeShore372AFrontend(ModuleFrontend):
         layout.addLayout(channel_grid)
 
         note = QLabel(
-            "Enable only initializes this module and discovers "
+            "Enable only opens this module and discovers "
             "GPIB resources. Apply Settings verifies *IDN? and "
             "configures the selected inputs while keeping "
             "excitation shunted. Measure temporarily enables "
@@ -285,36 +291,12 @@ class LakeShore372AFrontend(ModuleFrontend):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-        # 所有用户编辑最终只发 settingsChanged；是否允许 Apply、何时保存以及正在
-        # Run 时的拒绝逻辑由核心统一管理，前端不直接调用后端。
-        for widget in self._setting_widgets():
-            if isinstance(widget, QComboBox):
-                widget.currentTextChanged.connect(
-                    self._changed
-                )
-            elif isinstance(widget, QCheckBox):
-                widget.toggled.connect(self._changed)
-            elif isinstance(
-                widget,
-                (QSpinBox, QDoubleSpinBox),
-            ):
-                widget.valueChanged.connect(
-                    self._changed
-                )
         for key, widgets in self.channel_widgets.items():
             mode = widgets["excitation_mode"]
             excitation = widgets["excitation_range"]
             assert isinstance(mode, QComboBox)
             assert isinstance(excitation, QComboBox)
-            # mode 需要先重建 excitation 列表，excitation 需要先更新电阻量程可用状态。
-            # 两者都先断开通用连接，确保一次用户操作只发一个 settingsChanged。
-            for combo in (mode, excitation):
-                try:
-                    combo.currentTextChanged.disconnect(
-                        self._changed
-                    )
-                except (RuntimeError, TypeError):
-                    pass
+            # 这两个信号只维护控件间的量程约束；核心直接比较 dump() 判断是否修改。
             mode.currentIndexChanged.connect(
                 lambda _index, channel_key=key:
                 self._mode_changed(channel_key)
@@ -325,7 +307,7 @@ class LakeShore372AFrontend(ModuleFrontend):
             )
         return page
 
-    def create_status_page(
+    def _build_status_widget(
         self,
         parent: QWidget | None = None,
     ) -> QWidget:
@@ -375,18 +357,18 @@ class LakeShore372AFrontend(ModuleFrontend):
             "Refresh Status"
         )
         self.test_connection_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "test_connection",
-                {"settings": self.settings()},
+                {"settings": self.dump()},
             )
         )
         self.status_refresh_resources_button.clicked.connect(
-            lambda: self.context.request_manual_action(
+            lambda: self.api.action(
                 "refresh_resources"
             )
         )
         self.refresh_status_button.clicked.connect(
-            self.context.request_status_refresh
+            self.api.refresh
         )
         buttons.addWidget(
             self.test_connection_button
@@ -400,7 +382,7 @@ class LakeShore372AFrontend(ModuleFrontend):
         layout.addStretch(1)
         return page
 
-    def settings(self) -> dict[str, Any]:
+    def dump(self) -> dict[str, Any]:
         """返回当前控件值的纯字典快照，供保存、Apply 或连接测试使用。
 
         这里不复制后端的完整校验逻辑；即使调用方绕过控件范围构造字典，后端也会把它
@@ -465,7 +447,7 @@ class LakeShore372AFrontend(ModuleFrontend):
             "channels": channels,
         }
 
-    def load_settings(
+    def load(
         self,
         settings: Mapping[str, Any],
     ) -> None:
@@ -579,7 +561,7 @@ class LakeShore372AFrontend(ModuleFrontend):
             )
         del blockers
 
-    def update_status(
+    def show_status(
         self,
         status: Mapping[str, Any],
     ) -> None:
@@ -606,24 +588,6 @@ class LakeShore372AFrontend(ModuleFrontend):
             else:
                 label.setText(str(value))
 
-    def set_sequence_running(
-        self,
-        running: bool,
-    ) -> None:
-        """Run 期间禁用会产生 I/O 的手动按钮。
-
-        这是界面层防误触；即使外部代码直接触发动作，核心服务仍会依据生命周期状态拒绝
-        与正在运行的 Measure 冲突的请求。
-        """
-
-        for button in (
-            self.refresh_resources_button,
-            self.test_connection_button,
-            self.status_refresh_resources_button,
-            self.refresh_status_button,
-        ):
-            button.setEnabled(not running)
-
     def _mode_changed(self, key: str) -> None:
         """切换模式后重建激励表、修正电阻量程，并只发送一次变化信号。"""
 
@@ -640,7 +604,6 @@ class LakeShore372AFrontend(ModuleFrontend):
             key,
             adjust_selection=True,
         )
-        self._changed()
 
     def _excitation_changed(self, key: str) -> None:
         """激励改变时同步禁用不兼容量程，并将旧选择夹到最近合法范围。"""
@@ -649,7 +612,6 @@ class LakeShore372AFrontend(ModuleFrontend):
             key,
             adjust_selection=True,
         )
-        self._changed()
 
     def _populate_excitation(
         self,
@@ -831,11 +793,6 @@ class LakeShore372AFrontend(ModuleFrontend):
             widgets.extend(channel.values())
         return widgets
 
-    def _changed(self, *_args: Any) -> None:
-        """把不同 Qt 信号携带的参数收敛成核心定义的无参数 settingsChanged。"""
-
-        self.settingsChanged.emit()
-
     @staticmethod
     def _seconds_spin(
         minimum: int,
@@ -849,4 +806,6 @@ class LakeShore372AFrontend(ModuleFrontend):
         return spin
 
 
-__all__ = ["LakeShore372AFrontend"]
+Frontend = LakeShore372AFrontend
+
+__all__ = ["Frontend", "LakeShore372AFrontend"]

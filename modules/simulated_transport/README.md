@@ -1,17 +1,7 @@
 # Simulated Transport
 
-Hardware-free API 1.1 reference Measurement Module. It declares
-`measurement_mode = "aligned_slots"` and exposes logical slots 1-4. The core
-therefore calls `measure()` four times and writes four sparse rows, one for each
-of R1-R4; a single backend call never emits more than one row.
+无硬件的四槽位示例。`slots = 4`，因此核心调用 `measure(slot, api)` 四次，
+分别写 R1–R4 四个稀疏行。
 
-The DAT values are numeric. Each row contains the current resistance and one
-module-specific integer `StatusCode`:
-
-- `0`: normal;
-- `1`: the simulated resistance exceeded `warning_threshold_ohm`.
-
-Code 1 also raises a deduplicated, human-readable Warning, but the Warning text
-is written to `events.dat`, not the experiment DAT. A code 1 row leaves the
-corresponding R1-R4 value empty. This module defines no other nonzero status
-codes.
+模块自定义 `StatusCode`：0 正常；1 表示模拟电阻超过 `warning_threshold_ohm`。状态 1
+同时报告去重 Warning，并让当前 R 值留空。该语义属于本模块，不是核心统一规则。

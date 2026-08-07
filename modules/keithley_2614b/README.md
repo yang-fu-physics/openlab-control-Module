@@ -13,8 +13,8 @@ Measurement Module。每个通道可独立选择：
 
 ## 测量顺序
 
-本模块声明 `measurement_mode = "once_per_slot"`。每个逻辑槽位调用都会一次完成全部
-Enabled SMU 通道，并写一个宽表行；A/B 不是核心用来对齐其他扫描模块的逻辑槽位。
+本模块没有声明 `slots`。每个逻辑槽位调用都会一次完成全部 Enabled
+SMU 通道并写一个宽表行；A/B 不是核心用来对齐其他扫描模块的逻辑槽位。
 若同时启用了四槽位扫描模块，一条 `T Measure` 会调用 2614B 四次，每次都重新读取
 Enabled 的 A/B；没有扫描模块时只调用一次。
 
@@ -53,8 +53,8 @@ maximum limits 检查组合：
   读回两个 Enabled 通道；结束保持全部输出 OFF。
 - **Measure**：默认只在采样事务内输出；取消逐行关闭选项时可跨成功行保持 Enabled
   输出。Stop、通信异常或任一通道失败会直接请求 A/B OFF。
-- **completed / stopped / error**：严格读回 A/B 都是 OFF，连接保持。
-- **Disable / 退出**：确认 A/B OFF 后关闭 VISA session。
+- **completed / stopped / error**：`run_end` 严格读回 A/B 都是 OFF，连接保持。
+- **Disable / 退出**：`close(api)` 确认 A/B OFF 后关闭 VISA session。
 
 Settings 中的 `Turn SMU A/B outputs off after each DAT row` 默认勾选。取消勾选后，
 Enabled 输出会在成功行之间以及 SEQ Pause 期间保持活动；每个逻辑槽位仍重新读取 A/B。

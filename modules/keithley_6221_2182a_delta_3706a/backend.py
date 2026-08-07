@@ -1,4 +1,4 @@
-"""Keithley 6221 + 2182A Delta 与可选 3706A 的 Measurement Module 后端。
+﻿"""Keithley 6221 + 2182A Delta 与可选 3706A 的 Measurement Module 后端。
 
 协议依据：
 
@@ -12,7 +12,7 @@
 
 - Enable 不发送电流设置；只发现资源并探测可选 3706A；
 - Apply 前后均确认 6221 为零电流且输出关闭；
-- 共享模式只在 ``begin_sequence`` ARM 一次，ARM 后等待至少 3 秒并查询确认；
+- 共享模式只在 ``run_start`` 事件 ARM 一次，ARM 后等待至少 3 秒并查询确认；
 - 独立模式每次切换前 Abort/Clear，切换后重新配置和 ARM；
 - 3706A 的任何运行期通信或回读错误立即中止，不自动重发切换/触发命令；
 - compliance abort 和 cold switching 固定开启，通道设置必须落在仪表合法命令范围；
@@ -33,10 +33,9 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
-from labcontrol.measurement.api import (
-    ModuleBackend,
+from labcontrol.module_api import (
     ModuleError,
-    ModuleOperationContext,
+    ModuleAPI,
     ModuleWarning,
 )
 
@@ -76,7 +75,7 @@ class InstrumentTransport(Protocol):
 
 TransportFactory = Callable[[str, float], InstrumentTransport]
 ResourceLister = Callable[[], tuple[str, ...]]
-Waiter = Callable[[ModuleOperationContext, float], None]
+Waiter = Callable[[ModuleAPI, float], None]
 
 # 长时间 ``*OPC?`` 不再拥有可配置的单通道超时，而是共享本次 Measure 的核心总
 # 预算。提前预留两秒，使通信错误仍有机会在核心强制终止 worker 前执行安全关闭。
@@ -143,8 +142,17 @@ class PyVisaTransport:
             self._manager.close()
 
 
-class Keithley6221Delta3706ABackend(ModuleBackend):
+class Keithley6221Delta3706ABackend:
     """6221/2182A Delta 测量和四路 3706A 路由状态机。"""
+
+    columns = {
+        "Channel": "",
+        "Resistance": "Ohm",
+        "Current": "A",
+        "StdDev": "Ohm",
+        "SampleCount": "",
+        "StatusCode": "",
+    }
 
     _TRACE_TOKEN = re.compile(
         r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
@@ -172,7 +180,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self._waiter = (
             waiter
             or (
-                lambda context, seconds: context.interruptible_sleep(
+                lambda api, seconds: api.sleep(
                     seconds
                 )
             )
@@ -205,19 +213,15 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self.last_stddev: float | None = None
         self.last_status = "Idle"
 
-    def initialize(
-        self,
-        settings: Mapping[str, Any],
-        context: ModuleOperationContext,
-    ) -> Mapping[str, Any]:
-        """发现资源并只探测可选 3706A，不连接或配置 6221 输出。"""
+    def open(self, api: ModuleAPI) -> Mapping[str, Any]:
+        """只发现资源并建立空闲状态，不连接或配置任何仪表。"""
 
         self.desired_settings = self._normalized_settings(
-            settings,
+            default_settings(),
             require_6221=False,
             require_measurement=False,
             operation_timeout_seconds=(
-                context.operation_timeout_seconds
+                api.timeout
             ),
         )
         resources: tuple[str, ...]
@@ -228,18 +232,20 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     key=str.casefold,
                 )
             )
-            context.resolve_warning(
-                "K6221_3706_RESOURCE_DISCOVERY_FAILED"
-            )
+            api.warn("K6221_3706_RESOURCE_DISCOVERY_FAILED", None)
         except Exception as exc:
             resources = ()
-            context.warning(
+            api.warn(
+                "K6221_3706_RESOURCE_DISCOVERY_FAILED",
                 "GPIB resource discovery failed: "
                 f"{type(exc).__name__}: {exc}",
-                "K6221_3706_RESOURCE_DISCOVERY_FAILED",
             )
 
-        self._detect_switcher_on_enable(context)
+        # open() 不接收持久设置，不能猜测 3706A 地址。只有用户明确
+        # Apply 后，configure() 才按当前设置探测并连接仪表。
+        self.switcher_detection_complete = False
+        self.switcher_available = False
+        self.identity_3706a = ""
         self.applied_settings = None
         self.sequence_active = False
         self.armed = False
@@ -248,32 +254,47 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         status = self._status(
             available_resources=resources,
         )
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def apply_settings(
+    def configure(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """连接、识别并写入一套安全的待 ARM 设置，但不开始输出。"""
 
-        normalized = self._normalized_settings(
+        # 先完整验证地址和四通道设置；随后用本次 Apply 的地址探测
+        # 3706A。探测失败仅降级为 CH1，运行期通信错误仍立即中止。
+        candidate = self._normalized_settings(
             settings,
             require_6221=True,
             require_measurement=True,
             operation_timeout_seconds=(
-                context.operation_timeout_seconds
+                api.timeout
             ),
-            ch1_only=not self.switcher_available,
+            ch1_only=False,
+        )
+        self.desired_settings = deepcopy(candidate)
+        self._detect_switcher(api)
+        normalized = (
+            candidate
+            if self.switcher_available
+            else self._normalized_settings(
+                settings,
+                require_6221=True,
+                require_measurement=True,
+                operation_timeout_seconds=api.timeout,
+                ch1_only=True,
+            )
         )
         self.desired_settings = deepcopy(normalized)
         try:
-            self._connect_6221(normalized, context)
+            self._connect_6221(normalized, api)
             if self.switcher_available:
-                self._connect_3706a(normalized, context)
-            self._enter_safe_state(context)
-            self._verify_2182a(context)
+                self._connect_3706a(normalized, api)
+            self._enter_safe_state(api)
+            self._verify_2182a(api)
             first_channel = self._enabled_channels(
                 normalized
             )[0]
@@ -281,23 +302,23 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 normalized,
                 first_channel,
             )
-            self._configure_delta(selected, context)
+            self._configure_delta(selected, api)
             # Apply 结束时再次清零。配置命令本身不应打开输出，但这一确认可捕获
             # 前面遗留状态或仪表异常行为。
-            self._enter_safe_state(context)
+            self._enter_safe_state(api)
         except Exception:
-            self._best_effort_safe_state(context)
+            self._best_effort_safe_state(api)
             raise
 
         self.applied_settings = normalized
         self.last_status = "Settings applied - output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def begin_sequence(
+    def _run_start(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """在第一条 SEQ 指令前建立本次运行状态。
 
@@ -307,13 +328,13 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
         settings = self._require_applied()
         try:
-            self._enter_safe_state(context)
+            self._enter_safe_state(api)
             if settings["mode"] == MODE_SHARED:
                 self._configure_delta(
                     settings["shared"],
-                    context,
+                    api,
                 )
-                self._arm_delta(context)
+                self._arm_delta(api)
             self.sequence_active = True
             self.last_status = (
                 "Armed - waiting for software trigger"
@@ -322,31 +343,33 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             )
         except Exception:
             self.sequence_active = False
-            self._best_effort_safe_state(context)
+            self._best_effort_safe_state(api)
             raise
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
     def measure(
         self,
-        context: ModuleOperationContext,
-    ) -> None:
+        slot: int,
+        api: ModuleAPI,
+    ) -> tuple[Mapping[str, Any], list[float]]:
         """测量核心当前调度的一个通道；异常返回核心前先请求安全关闭。
 
-        核心随后仍会调用 ``end_sequence("error"|"stopped")`` 做严格确认。这里的
+        核心随后仍会发送 ``run_end(error|stopped)`` 做严格确认。这里的
         best-effort 不是替代该生命周期，而是缩短 3706A/6221 通信失败到 Abort、清零、
         打开触点之间的时间；协作 Stop 在 checkpoint 抛出的异常也走同一路径。
         """
 
         operation_deadline = (
             time.monotonic()
-            + float(context.operation_timeout_seconds)
+            + float(api.timeout)
             - _OPERATION_CLEANUP_RESERVE_SECONDS
         )
         try:
-            self._measure_impl(
-                context,
+            return self._measure_impl(
+                slot,
+                api,
                 operation_deadline,
             )
         except Exception:
@@ -354,25 +377,25 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             self.last_status = (
                 "Measurement interrupted - safety shutdown requested"
             )
-            self._best_effort_safe_state(context)
+            self._best_effort_safe_state(api)
             raise
 
     def _measure_impl(
         self,
-        context: ModuleOperationContext,
+        slot: int,
+        api: ModuleAPI,
         operation_deadline: float,
-    ) -> None:
+    ) -> tuple[Mapping[str, Any], list[float]]:
         """实现当前逻辑槽位的正常测量路径，产生一行 DAT 与 rawdata。"""
 
         settings = self._require_ready()
         channels = self._enabled_channels(settings)
-        step = context.measurement_step
-        if step is None or step.logical_slot < 1:
+        if slot < 1:
             raise ModuleError(
                 "Delta module received an invalid logical slot",
                 "K6221_3706_LOGICAL_SLOT_INVALID",
             )
-        scheduled = f"ch{step.logical_slot}"
+        scheduled = f"ch{slot}"
         if scheduled not in channels:
             raise ModuleError(
                 f"{scheduled.upper()} is not enabled for this sequence",
@@ -380,33 +403,33 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 scheduled,
             )
         for channel in (scheduled,):
-            context.checkpoint()
+            api.sleep(0)
             selected = self._channel_settings(
                 settings,
                 channel,
             )
             if settings["mode"] == MODE_INDEPENDENT:
-                self._enter_safe_source_state(context)
+                self._enter_safe_source_state(api)
                 self._switch_channel(
                     channel,
                     settings,
-                    context,
+                    api,
                 )
-                self._configure_delta(selected, context)
-                self._arm_delta(context)
+                self._configure_delta(selected, api)
+                self._arm_delta(api)
             else:
-                self._verify_armed(context)
-                self._verify_zero_current(context)
+                self._verify_armed(api)
+                self._verify_zero_current(api)
                 self._switch_channel(
                     channel,
                     settings,
-                    context,
+                    api,
                 )
 
             raw_values, issues, status_code = (
                 self._trigger_and_read(
                     selected,
-                    context,
+                    api,
                     operation_deadline,
                 )
             )
@@ -420,10 +443,10 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             if issues:
                 # “通道 Error”是数据状态，不是框架 Error 事件。以 Warning 报告后
                 # SEQ 继续，且不把部分有效样本伪装成正式电阻。
-                context.warning(
+                api.warn(
+                    "K6221_3706_READING_WARNING",
                     f"{channel.upper()} Delta readings are invalid: "
                     + "; ".join(issues),
-                    "K6221_3706_READING_WARNING",
                     channel,
                 )
                 self.last_resistance = None
@@ -451,44 +474,35 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                         "StdDev": stddev,
                     }
                 )
-                context.resolve_warning(
-                    "K6221_3706_READING_WARNING",
-                    channel,
-                )
+                api.warn("K6221_3706_READING_WARNING", None, channel)
                 self.last_resistance = mean
                 self.last_stddev = stddev
                 self.last_status = "Normal"
             self.last_current = current
             self.active_channel = channel.upper()
-            context.emit_row(
-                row,
-                raw_values=raw_values,
-            )
-            context.update_status(self._status())
-            context.checkpoint()
+            api.status(self._status())
+            api.sleep(0)
+            return row, raw_values
 
-    def measurement_slots(
-        self,
-        context: ModuleOperationContext,
-    ) -> tuple[int, ...]:
-        del context
+    @property
+    def slots(self) -> tuple[int, ...]:
         settings = self._require_ready()
         return tuple(
             int(channel[2:])
             for channel in self._enabled_channels(settings)
         )
 
-    def end_sequence(
+    def _run_end(
         self,
         reason: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """对 completed/stopped/error 使用相同的严格安全收尾。"""
 
         self.sequence_active = False
         self.armed = False
         try:
-            self._enter_safe_state(context)
+            self._enter_safe_state(api)
         finally:
             # 即使严格安全确认抛错，内部状态也不能继续显示 Running/Armed。
             self.sequence_active = False
@@ -496,12 +510,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             self.active_channel = ""
         self.last_status = f"Sequence {reason} - output off"
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def abort(
+    def close(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """Disable/退出时尽力安全关闭，再释放两个 VISA 会话。"""
 
@@ -509,7 +523,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self.armed = False
         failure: ModuleError | None = None
         try:
-            self._enter_safe_state(context)
+            self._enter_safe_state(api)
         except ModuleError as exc:
             failure = exc
         finally:
@@ -522,42 +536,42 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             else "Disabled"
         )
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         if failure is not None:
             raise failure
         return status
 
-    def read_status(
+    def _read_status(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """只读刷新 Armed、输出和 3706A 状态，不隐式 Apply。"""
 
         if self.transport_6221 is not None:
             armed = self._query_6221(
                 "SOUR:DELT:ARM?",
-                context,
+                api,
             )
             self.armed = self._parse_switch(
                 armed,
                 "SOUR:DELT:ARM?",
             )
             output = self._parse_switch(
-                self._query_6221("OUTP?", context),
+                self._query_6221("OUTP?", api),
                 "OUTP?",
             )
             self.last_status = (
                 "Armed" if self.armed else "Connected"
             ) + (" / Output on" if output else " / Output off")
         status = self._status()
-        context.update_status(status)
+        api.status(status)
         return status
 
-    def manual_action(
+    def _action(
         self,
         action: str,
         payload: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> Mapping[str, Any]:
         """处理 Idle 时的资源刷新、连接测试和安全关闭。"""
 
@@ -575,13 +589,11 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     f"{type(exc).__name__}: {exc}",
                     "K6221_3706_RESOURCE_DISCOVERY_FAILED",
                 ) from exc
-            context.resolve_warning(
-                "K6221_3706_RESOURCE_DISCOVERY_FAILED"
-            )
+            api.warn("K6221_3706_RESOURCE_DISCOVERY_FAILED", None)
             status = self._status(
                 available_resources=resources,
             )
-            context.update_status(status)
+            api.status(status)
             return status
         if action == "test_connection":
             candidate = payload.get(
@@ -600,33 +612,52 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 require_6221=True,
                 require_measurement=False,
                 operation_timeout_seconds=(
-                    context.operation_timeout_seconds
+                    api.timeout
                 ),
             )
-            self._test_connections(settings, context)
+            self._test_connections(settings, api)
             status = self._status()
-            context.update_status(status)
+            api.status(status)
             return status
         if action == "safe_off":
-            self._enter_safe_state(context)
+            self._enter_safe_state(api)
             self.last_status = "Output off / all routes open"
             status = self._status()
-            context.update_status(status)
+            api.status(status)
             return status
-        return (
-            super().manual_action(
-                action,
-                payload,
-                context,
-            )
-            or {}
+        raise ModuleError(
+            f"Unsupported action: {action}",
+            "UNSUPPORTED_ACTION",
+            action,
         )
 
-    def _detect_switcher_on_enable(
+    def on_event(
         self,
-        context: ModuleOperationContext,
+        event: str,
+        data: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        if event == "run_start":
+            return self._run_start(api)
+        if event == "run_end":
+            return self._run_end(str(data.get("reason", "error")), api)
+        if event == "status":
+            return self._read_status(api)
+        if event == "action":
+            payload = data.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ModuleError(
+                    "Action payload must be a mapping",
+                    "K6221_3706_INVALID_ACTION",
+                )
+            return self._action(str(data.get("name", "")), payload, api)
+        return {}
+
+    def _detect_switcher(
+        self,
+        api: ModuleAPI,
     ) -> None:
-        """3706A 缺失只在 Enable 阶段降级为 CH1-only。"""
+        """按本次 Apply 设置探测 3706A；缺失时降级为 CH1-only。"""
 
         resource = str(
             self.desired_settings["resource_3706a"]
@@ -635,9 +666,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self.switcher_available = False
         self.identity_3706a = ""
         if not resource:
-            context.resolve_warning(
-                "K6221_3706_SWITCHER_UNAVAILABLE"
-            )
+            api.warn("K6221_3706_SWITCHER_UNAVAILABLE", None)
             return
         transport: InstrumentTransport | None = None
         try:
@@ -654,12 +683,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             ).strip()
             self._validate_3706a_identity(identity)
         except Exception as exc:
-            context.warning(
-                "Keithley 3706A was not available during Enable; "
-                "the module will measure CH1 only until it is "
-                "Disabled and Enabled again: "
-                f"{type(exc).__name__}: {exc}",
+            api.warn(
                 "K6221_3706_SWITCHER_UNAVAILABLE",
+                "Keithley 3706A was not available during Apply; "
+                "the module will measure CH1 only until settings "
+                "are applied again: "
+                f"{type(exc).__name__}: {exc}",
                 resource,
             )
             return
@@ -671,15 +700,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     pass
         self.switcher_available = True
         self.identity_3706a = identity
-        context.resolve_warning(
-            "K6221_3706_SWITCHER_UNAVAILABLE",
-            resource,
-        )
+        api.warn("K6221_3706_SWITCHER_UNAVAILABLE", None, resource)
 
     def _test_connections(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """临时连接并识别仪表，不改变当前 Apply/Armed 状态。"""
 
@@ -709,9 +735,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     identity_3706a
                 )
                 self.identity_3706a = identity_3706a
-            context.resolve_warning(
-                "K6221_3706_CONNECTION_TEST_FAILED"
-            )
+            api.warn("K6221_3706_CONNECTION_TEST_FAILED", None)
             self.last_status = "Connection test passed"
         except Exception as exc:
             raise ModuleWarning(
@@ -730,7 +754,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
     def _connect_6221(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         self._close_transport_6221()
         try:
@@ -758,12 +782,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 str(settings["resource_6221"]),
             ) from exc
         self.identity_6221 = identity
-        context.checkpoint()
+        api.sleep(0)
 
     def _connect_3706a(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """初始化时存在的 3706A 此后失败即为 Error，不再静默降级。"""
 
@@ -790,7 +814,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 resource,
             ) from exc
         self.identity_3706a = identity
-        context.checkpoint()
+        api.sleep(0)
 
     @staticmethod
     def _validate_identity(
@@ -834,11 +858,11 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
     def _verify_2182a(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         present = self._query_6221(
             "SOUR:DELT:NVPRESENT?",
-            context,
+            api,
         )
         if not self._parse_switch(
             present,
@@ -851,7 +875,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             )
         identity = self._serial_query(
             "*IDN?",
-            context,
+            api,
         )
         normalized = identity.upper()
         if "KEITHLEY" not in normalized or "2182A" not in normalized:
@@ -866,7 +890,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
     def _configure_delta(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """写入并逐项回读一套 Delta/2182A 设置；不 ARM。"""
 
@@ -892,40 +916,40 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             "SOUR:DELT:CAB ON",
             f"TRAC:POIN {count}",
         ):
-            self._write_6221(command, context)
+            self._write_6221(command, api)
 
-        self._configure_2182a(settings, context)
+        self._configure_2182a(settings, api)
         self._expect_float(
             "SOUR:CURR:COMP?",
             compliance,
-            context,
+            api,
         )
         self._expect_float(
             "SOUR:DELT:HIGH?",
             high,
-            context,
+            api,
         )
         self._expect_float(
             "SOUR:DELT:LOW?",
             low,
-            context,
+            api,
         )
         self._expect_float(
             "SOUR:DELT:DEL?",
             delay,
-            context,
+            api,
         )
         self._expect_integer(
             "SOUR:DELT:COUN?",
             count,
-            context,
+            api,
         )
         for query in (
             "SOUR:DELT:CSW?",
             "SOUR:DELT:CAB?",
         ):
             if not self._parse_switch(
-                self._query_6221(query, context),
+                self._query_6221(query, api),
                 query,
             ):
                 raise ModuleError(
@@ -933,12 +957,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     "K6221_3706_SETTINGS_VERIFY_FAILED",
                     query,
                 )
-        self._raise_if_instrument_error(context)
+        self._raise_if_instrument_error(api)
 
     def _configure_2182a(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         voltage_range = str(settings["voltage_range"])
         ranges = {
@@ -948,33 +972,33 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         if voltage_range == "auto":
             self._serial_write(
                 "VOLT:RANG:AUTO ON",
-                context,
+                api,
             )
             self._expect_serial_switch(
                 "VOLT:RANG:AUTO?",
                 True,
-                context,
+                api,
             )
         else:
             value = ranges[voltage_range]
             assert value is not None
             self._serial_write(
                 "VOLT:RANG:AUTO OFF",
-                context,
+                api,
             )
             self._serial_write(
                 f"VOLT:RANG {self._scpi_number(value)}",
-                context,
+                api,
             )
             self._expect_serial_switch(
                 "VOLT:RANG:AUTO?",
                 False,
-                context,
+                api,
             )
             actual = self._parse_float(
                 self._serial_query(
                     "VOLT:RANG?",
-                    context,
+                    api,
                 ),
                 "VOLT:RANG?",
             )
@@ -994,10 +1018,10 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         nplc = int(settings["nplc"])
         self._serial_write(
             f"VOLT:NPLC {nplc}",
-            context,
+            api,
         )
         actual_nplc = self._parse_float(
-            self._serial_query("VOLT:NPLC?", context),
+            self._serial_query("VOLT:NPLC?", api),
             "VOLT:NPLC?",
         )
         if not math.isclose(
@@ -1018,16 +1042,16 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         )
         self._serial_write(
             f"VOLT:LPAS {'ON' if analog else 'OFF'}",
-            context,
+            api,
         )
         self._serial_write(
             "VOLT:DFIL:TCON MOV",
-            context,
+            api,
         )
         self._serial_write(
             "VOLT:DFIL:COUN "
             f"{int(settings['digital_filter_count'])}",
-            context,
+            api,
         )
         self._serial_write(
             "VOLT:DFIL:WIND "
@@ -1038,46 +1062,46 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                     ]
                 )
             ),
-            context,
+            api,
         )
         self._serial_write(
             f"VOLT:DFIL:STAT {'ON' if digital else 'OFF'}",
-            context,
+            api,
         )
         self._expect_serial_switch(
             "VOLT:LPAS?",
             analog,
-            context,
+            api,
         )
         self._expect_serial_switch(
             "VOLT:DFIL:STAT?",
             digital,
-            context,
+            api,
         )
 
     def _arm_delta(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """发送 ARM，等待用户指定的 3 秒，再查询确认。"""
 
-        self._write_6221("SOUR:DELT:ARM", context)
+        self._write_6221("SOUR:DELT:ARM", api)
         self.armed = False
         self.last_status = "Arming"
-        context.update_status(self._status())
-        self._waiter(context, ARM_SETTLE_SECONDS)
-        self._verify_armed(context)
-        self._raise_if_instrument_error(context)
+        api.status(self._status())
+        self._waiter(api, ARM_SETTLE_SECONDS)
+        self._verify_armed(api)
+        self._raise_if_instrument_error(api)
         self.last_status = "Armed - waiting for software trigger"
-        context.update_status(self._status())
+        api.status(self._status())
 
     def _verify_armed(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         reply = self._query_6221(
             "SOUR:DELT:ARM?",
-            context,
+            api,
         )
         self.armed = self._parse_switch(
             reply,
@@ -1092,7 +1116,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
     def _trigger_and_read(
         self,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
         operation_deadline: float,
     ) -> tuple[
         tuple[float, ...],
@@ -1101,8 +1125,8 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
     ]:
         """软件触发有限 Delta 采集并读取预数学电压缓冲。"""
 
-        self._verify_armed(context)
-        self._write_6221("INIT:IMM", context)
+        self._verify_armed(api)
+        self._write_6221("INIT:IMM", api)
         completion_timeout = (
             operation_deadline - time.monotonic()
         )
@@ -1117,7 +1141,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             )
         completion = self._query_6221(
             "*OPC?",
-            context,
+            api,
             timeout_seconds=completion_timeout,
         )
         if completion.strip() not in {"1", "+1"}:
@@ -1128,11 +1152,11 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             )
         trace = self._query_6221(
             "TRAC:DATA?",
-            context,
+            api,
         )
-        self._raise_if_instrument_error(context)
-        self._verify_armed(context)
-        self._verify_zero_current(context)
+        self._raise_if_instrument_error(api)
+        self._verify_armed(api)
+        self._verify_zero_current(api)
         return self._parse_trace(
             trace,
             int(settings["count"]),
@@ -1220,7 +1244,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self,
         channel: str,
         settings: Mapping[str, Any],
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         if not self.switcher_available:
             if channel != "ch1":
@@ -1242,12 +1266,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         # 3706A 的写入结果不确定时绝不重放，后续精确回读不一致直接成为 Error。
         self._write_3706a(
             'channel.open("allslots")',
-            context,
+            api,
         )
         self._expect_closed_routes(
             self._query_3706a(
                 'print(channel.getclose("allslots"))',
-                context,
+                api,
             ),
             expected=frozenset(),
             command='channel.open("allslots")',
@@ -1255,12 +1279,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         target = self.routing.list_text(channel)
         self._write_3706a(
             f'channel.exclusiveclose("{target}")',
-            context,
+            api,
         )
         self._expect_closed_routes(
             self._query_3706a(
                 'print(channel.getclose("allslots"))',
-                context,
+                api,
             ),
             expected=frozenset(
                 self.routing.channels[channel]
@@ -1268,9 +1292,9 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             command="channel.exclusiveclose",
         )
         self.active_channel = channel.upper()
-        context.update_status(self._status())
+        api.status(self._status())
         self._waiter(
-            context,
+            api,
             float(settings["switch_settle_seconds"]),
         )
 
@@ -1320,7 +1344,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
     def _enter_safe_state(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """严格 Abort/Clear/输出关闭并打开全部路由。"""
 
@@ -1334,7 +1358,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             self.armed = False
             self.active_channel = ""
             return
-        self._enter_safe_source_state(context)
+        self._enter_safe_source_state(api)
         if self.switcher_available:
             if self.transport_3706a is None:
                 raise ModuleError(
@@ -1345,12 +1369,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 )
             self._write_3706a(
                 'channel.open("allslots")',
-                context,
+                api,
             )
             self._expect_closed_routes(
                 self._query_3706a(
                     'print(channel.getclose("allslots"))',
-                    context,
+                    api,
                 ),
                 expected=frozenset(),
                 command='channel.open("allslots")',
@@ -1359,19 +1383,19 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
     def _enter_safe_source_state(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         if self.transport_6221 is None:
             self.armed = False
             return
-        self._write_6221("SOUR:SWE:ABOR", context)
-        self._write_6221("SOUR:CLE", context)
+        self._write_6221("SOUR:SWE:ABOR", api)
+        self._write_6221("SOUR:CLE", api)
         output = self._parse_switch(
-            self._query_6221("OUTP?", context),
+            self._query_6221("OUTP?", api),
             "OUTP?",
         )
         current = self._parse_float(
-            self._query_6221("SOUR:CURR?", context),
+            self._query_6221("SOUR:CURR?", api),
             "SOUR:CURR?",
         )
         self.armed = False
@@ -1385,12 +1409,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
     def _verify_zero_current(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         current = self._parse_float(
             self._query_6221(
                 "SOUR:CURR?",
-                context,
+                api,
             ),
             "SOUR:CURR?",
         )
@@ -1409,7 +1433,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
 
     def _best_effort_safe_state(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         """异常路径不掩盖原始错误，但尽可能执行安全命令。"""
 
@@ -1435,14 +1459,14 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self.armed = False
         self.active_channel = ""
         try:
-            context.update_status(self._status())
+            api.status(self._status())
         except Exception:
             pass
 
     def _write_6221(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         transport = self.transport_6221
         if transport is None:
@@ -1450,7 +1474,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "6221 is not connected",
                 "K6221_3706_NOT_CONNECTED",
             )
-        context.checkpoint()
+        api.sleep(0)
         try:
             transport.write(command)
         except Exception as exc:
@@ -1460,12 +1484,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "K6221_3706_COMMUNICATION_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
 
     def _query_6221(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
         *,
         timeout_seconds: float | None = None,
     ) -> str:
@@ -1475,7 +1499,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "6221 is not connected",
                 "K6221_3706_NOT_CONNECTED",
             )
-        context.checkpoint()
+        api.sleep(0)
         try:
             result = transport.query(
                 command,
@@ -1488,13 +1512,13 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "K6221_3706_COMMUNICATION_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
         return str(result).strip()
 
     def _write_3706a(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         transport = self.transport_3706a
         if transport is None:
@@ -1502,7 +1526,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "3706A is not connected",
                 "K6221_3706_SWITCHER_NOT_CONNECTED",
             )
-        context.checkpoint()
+        api.sleep(0)
         try:
             transport.write(command)
         except Exception as exc:
@@ -1512,12 +1536,12 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "K6221_3706_SWITCHER_COMMUNICATION_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
 
     def _query_3706a(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> str:
         transport = self.transport_3706a
         if transport is None:
@@ -1525,7 +1549,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "3706A is not connected",
                 "K6221_3706_SWITCHER_NOT_CONNECTED",
             )
-        context.checkpoint()
+        api.sleep(0)
         try:
             result = transport.query(command)
         except Exception as exc:
@@ -1535,36 +1559,36 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
                 "K6221_3706_SWITCHER_COMMUNICATION_FAILED",
                 command,
             ) from exc
-        context.checkpoint()
+        api.sleep(0)
         return str(result).strip()
 
     def _serial_write(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         escaped = command.replace('"', '""')
         self._write_6221(
             f'SYST:COMM:SER:SEND "{escaped}"',
-            context,
+            api,
         )
 
     def _serial_query(
         self,
         command: str,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> str:
-        self._serial_write(command, context)
+        self._serial_write(command, api)
         return self._query_6221(
             "SYST:COMM:SER:ENT?",
-            context,
+            api,
         )
 
     def _raise_if_instrument_error(
         self,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
-        reply = self._query_6221("SYST:ERR?", context)
+        reply = self._query_6221("SYST:ERR?", api)
         matched = re.match(
             r"^\s*([+-]?\d+)\s*(?:,|$)",
             reply,
@@ -1586,10 +1610,10 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self,
         query: str,
         expected: float,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         actual = self._parse_float(
-            self._query_6221(query, context),
+            self._query_6221(query, api),
             query,
         )
         tolerance = max(
@@ -1613,10 +1637,10 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self,
         query: str,
         expected: int,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         actual = self._parse_float(
-            self._query_6221(query, context),
+            self._query_6221(query, api),
             query,
         )
         if not math.isclose(
@@ -1636,10 +1660,10 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         self,
         query: str,
         expected: bool,
-        context: ModuleOperationContext,
+        api: ModuleAPI,
     ) -> None:
         actual = self._parse_switch(
-            self._serial_query(query, context),
+            self._serial_query(query, api),
             query,
         )
         if actual is not expected:
@@ -1775,9 +1799,13 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
             "6221": self.identity_6221 or "Not connected",
             "2182A": self.identity_2182a or "Not verified",
             "3706A": (
-                self.identity_3706a
-                if self.switcher_available
-                else "Unavailable - CH1 only"
+                "Not checked"
+                if not self.switcher_detection_complete
+                else (
+                    self.identity_3706a
+                    if self.switcher_available
+                    else "Unavailable - CH1 only"
+                )
             ),
             "Armed": self.armed,
             "Sequence Active": self.sequence_active,
@@ -2236,7 +2264,7 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         operation_timeout_seconds: float,
     ) -> None:
         # operation_timeout_seconds 是每个生命周期调用各自的上限。共享模式的唯一
-        # ARM 位于 begin_sequence，不能再次计入 Measure；独立模式则每个通道都在
+        # ARM 位于 run_start，不能再次计入 Measure；独立模式则每个通道都在
         # Measure 内 ARM。Begin 与 Measure 必须分别证明能够在同一个调用上限内完成。
         begin_worst_case = 5.0 + (
             ARM_SETTLE_SECONDS
@@ -2381,8 +2409,11 @@ class Keithley6221Delta3706ABackend(ModuleBackend):
         return value
 
 
+Module = Keithley6221Delta3706ABackend
+
 __all__ = [
     "InstrumentTransport",
     "Keithley6221Delta3706ABackend",
+    "Module",
     "PyVisaTransport",
 ]
