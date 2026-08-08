@@ -1,9 +1,4 @@
-"""读取不暴露在界面中的 Keithley 7001 通道路由。
-
-7001 的地址取决于卡类型。配置文件保存的是手册定义的完整 Channel List 项，而不是
-让后端猜测卡型号。默认值按用户给出的同一张非矩阵卡、Slot 1 配置；若实际卡使用
-矩阵行列地址，可把项目改成 ``1!row!column``，无需修改 Python 代码。
-"""
+"""读取不暴露在界面中的 7001 与 3706A 物理路由。"""
 
 from __future__ import annotations
 
@@ -13,22 +8,22 @@ import re
 import tomllib
 
 
-_ROUTE = re.compile(
-    r"^[12]![1-9][0-9]*(?:![1-9][0-9]*)?$"
-)
+_ROUTE_PATTERNS = {
+    "7001": re.compile(r"^[12]![1-9][0-9]*(?:![1-9][0-9]*)?$"),
+    "3706a": re.compile(r"^[1-6][0-9]{3}$"),
+}
 
 
 @dataclass(frozen=True, slots=True)
 class RoutingConfig:
-    """四个逻辑通道对应的已验证 7001 Channel List。"""
+    """某一种切换器的四个逻辑通道路由。"""
 
+    switcher_type: str
     channels: dict[str, tuple[str, ...]]
     source_path: Path
 
     @property
     def all_routes(self) -> tuple[str, ...]:
-        """按首次出现顺序返回所有配置中使用的物理触点。"""
-
         return tuple(
             dict.fromkeys(
                 route
@@ -37,74 +32,80 @@ class RoutingConfig:
             )
         )
 
-    def list_text(self, channel: str) -> str:
-        """生成 ``(@1!1,1!11,...)`` SCPI Channel List。"""
 
-        return "(@" + ",".join(self.channels[channel]) + ")"
+@dataclass(frozen=True, slots=True)
+class RoutingTable:
+    """同一个 ``routing.toml`` 中的全部切换器路由。"""
 
-    @property
-    def all_list_text(self) -> str:
-        return "(@" + ",".join(self.all_routes) + ")"
+    switchers: dict[str, RoutingConfig]
+    source_path: Path
+
+    def for_switcher(self, switcher_type: str) -> RoutingConfig:
+        try:
+            return self.switchers[switcher_type]
+        except KeyError as exc:
+            raise ValueError(f"routing for {switcher_type!r} is not configured") from exc
 
 
-def load_routing(
-    path: Path | None = None,
+def _load_channels(
+    raw: object,
+    *,
+    switcher_type: str,
+    source: Path,
 ) -> RoutingConfig:
-    """读取并严格验证 routing.toml。
-
-    每个逻辑通道必须恰好配置四个不重复触点。不同逻辑通道之间允许共享公共电压线，
-    例如默认的 ``1!5`` 和 ``1!15``。
-    """
-
-    source = (
-        path
-        if path is not None
-        else Path(__file__).with_name("routing.toml")
-    )
-    try:
-        with source.open("rb") as handle:
-            raw = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ValueError(
-            f"cannot read routing configuration: {exc}"
-        ) from exc
-    if raw.get("format_version") != 1:
-        raise ValueError("routing format_version must be 1")
-    table = raw.get("channels")
-    if not isinstance(table, dict):
-        raise ValueError("routing [channels] table is missing")
+    if not isinstance(raw, dict):
+        raise ValueError(f"routing [switchers.{switcher_type}.channels] table is missing")
+    pattern = _ROUTE_PATTERNS[switcher_type]
     channels: dict[str, tuple[str, ...]] = {}
     for index in range(1, 5):
         key = f"ch{index}"
-        values = table.get(key)
+        values = raw.get(key)
         if (
             not isinstance(values, list)
             or len(values) != 4
             or any(not isinstance(item, str) for item in values)
         ):
             raise ValueError(
-                f"routing {key} must contain exactly four channel addresses"
+                f"routing {switcher_type}.{key} must contain exactly four addresses"
             )
         normalized = tuple(item.strip() for item in values)
         if len(set(normalized)) != 4:
-            raise ValueError(
-                f"routing {key} contains duplicate channel addresses"
-            )
-        invalid = [
-            item
-            for item in normalized
-            if _ROUTE.fullmatch(item) is None
-        ]
+            raise ValueError(f"routing {switcher_type}.{key} contains duplicate addresses")
+        invalid = [item for item in normalized if pattern.fullmatch(item) is None]
         if invalid:
             raise ValueError(
-                f"routing {key} contains invalid 7001 addresses: "
+                f"routing {switcher_type}.{key} contains invalid addresses: "
                 + ", ".join(invalid)
             )
         channels[key] = normalized
-    return RoutingConfig(
-        channels=channels,
-        source_path=source.resolve(),
-    )
+    return RoutingConfig(switcher_type, channels, source.resolve())
 
 
-__all__ = ["RoutingConfig", "load_routing"]
+def load_routing(path: Path | None = None) -> RoutingTable:
+    """严格读取两个切换器分区；不接受旧的单 ``[channels]`` 格式。"""
+
+    source = path if path is not None else Path(__file__).with_name("routing.toml")
+    try:
+        with source.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"cannot read routing configuration: {exc}") from exc
+    if raw.get("format_version") != 2:
+        raise ValueError("routing format_version must be 2")
+    switchers = raw.get("switchers")
+    if not isinstance(switchers, dict):
+        raise ValueError("routing [switchers] table is missing")
+    configs = {
+        name: _load_channels(
+            switchers.get(name, {}).get("channels")
+            if isinstance(switchers.get(name), dict)
+            else None,
+            switcher_type=name,
+            source=source,
+        )
+        for name in ("7001", "3706a")
+    }
+    return RoutingTable(configs, source.resolve())
+
+
+__all__ = ["RoutingConfig", "RoutingTable", "load_routing"]

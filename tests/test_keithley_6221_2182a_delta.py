@@ -482,7 +482,8 @@ def _settings(
 ) -> dict:
     settings = default_settings()
     settings["resource_6221"] = "GPIB0::12::INSTR"
-    settings["resource_7001"] = "GPIB0::7::INSTR"
+    settings["switcher_type"] = "7001"
+    settings["resource_switcher"] = "GPIB0::7::INSTR"
     settings["switch_settle_seconds"] = 0.0
     for index, channel in enumerate(
         settings["channels"].values(),
@@ -564,18 +565,16 @@ class RoutingTests(unittest.TestCase):
         self,
     ) -> None:
         routing = load_routing()
+        routes = routing.for_switcher("7001")
         self.assertEqual(
-            routing.channels["ch1"],
+            routes.channels["ch1"],
             ("1!1", "1!11", "1!5", "1!15"),
         )
         self.assertEqual(
-            routing.channels["ch4"],
+            routes.channels["ch4"],
             ("1!4", "1!14", "1!5", "1!15"),
         )
-        self.assertEqual(
-            routing.list_text("ch2"),
-            "(@1!2,1!12,1!5,1!15)",
-        )
+        self.assertEqual(routes.switcher_type, "7001")
 
 
 class BackendTests(unittest.TestCase):
@@ -607,21 +606,21 @@ class BackendTests(unittest.TestCase):
             waiter=wait,
         )
 
-    def test_open_only_discovers_and_apply_probes_7001(
+    def test_open_only_discovers_and_apply_connects_selected_7001(
         self,
     ) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         status = open_module(backend, _context(messages))
-        self.assertFalse(backend.switcher_available)
-        self.assertEqual(status["7001"], "Not checked")
+        self.assertEqual(backend.switcher_type, "none")
+        self.assertEqual(status["Switcher"], "None - CH1 only")
         self.assertEqual(state.opened, [])
 
         context = _context(messages)
         backend.configure(_settings(), context)
-        self.assertTrue(backend.switcher_available)
-        self.assertIn("MODEL 7001", backend.identity_7001)
+        self.assertEqual(backend.switcher_type, "7001")
+        self.assertIn("MODEL 7001", backend.identity_switcher)
         switcher_queries = [
             command
             for resource, action, command in state.commands
@@ -654,6 +653,27 @@ class BackendTests(unittest.TestCase):
                 for resource, _timeout in state.opened
             )
         )
+
+    def test_reapply_none_safes_old_7001_before_changing_protocol(self) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state)
+        context = _context([])
+        open_module(backend, context)
+        backend.configure(_settings(channels=2), context)
+
+        state.closed_routes = {"1!2", "1!12", "1!5", "1!15"}
+        state.output = True
+        state.current = 1.0e-6
+        direct = _settings(channels=1)
+        direct["switcher_type"] = "none"
+        direct["resource_switcher"] = "GPIB0::7::INSTR"
+        backend.configure(direct, context)
+
+        self.assertEqual(backend.switcher_type, "none")
+        self.assertEqual(state.closed_routes, set())
+        self.assertFalse(state.output)
+        self.assertEqual(state.current, 0.0)
+        self.assertIn("GPIB0::7::INSTR", state.closed)
 
     def test_lifecycle_timeouts_are_validated_separately(
         self,
@@ -719,7 +739,7 @@ class BackendTests(unittest.TestCase):
             "K6221_MEASURE_TIMEOUT_UNSAFE",
         )
 
-    def test_missing_7001_falls_back_to_ch1_only(
+    def test_selected_7001_connection_failure_is_fatal(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -734,28 +754,13 @@ class BackendTests(unittest.TestCase):
         settings = _settings(channels=4)
         context = _context(messages)
         open_module(backend, context)
-        backend.configure(settings, context)
-        self.assertFalse(backend.switcher_available)
-        self.assertTrue(
-            any(
-                kind == "warning"
-                and payload["code"]
-                == "K6221_SWITCHER_UNAVAILABLE"
-                for kind, payload in messages
-            )
-        )
-        run_start(backend, context)
-        measure_module(backend, context)
-        rows = [
-            payload["values"]
-            for kind, payload in messages
-            if kind == "row"
-        ]
+        with self.assertRaises(ModuleError) as captured:
+            backend.configure(settings, context)
         self.assertEqual(
-            [row["Channel"] for row in rows],
-            [1],
+            captured.exception.code,
+            "K6221_SWITCHER_CONNECTION_FAILED",
         )
-        self.assertEqual(waits, [3.0])
+        self.assertEqual(waits, [])
         # Enable 探测失败后，Apply/Measure 不再尝试 7001，也不会在未知路由上触发。
         self.assertEqual(
             sum(
@@ -1255,12 +1260,10 @@ class FrontendTests(unittest.TestCase):
             "GPIB0::22::INSTR",
         )
 
-        frontend.show_status(
-            {
-                "7001": "Unavailable - CH1 only",
-                "State": "Initialized",
-            }
+        frontend.switcher_type.setCurrentIndex(
+            frontend.switcher_type.findData("none")
         )
+        frontend.show_status({"State": "Initialized"})
         self.assertTrue(
             frontend.channel_enabled["ch1"].isEnabled()
         )
@@ -1297,7 +1300,7 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b5",
+            "0.2.0b1",
         )
         self.assertEqual(
             list(Keithley6221DeltaBackend.columns),

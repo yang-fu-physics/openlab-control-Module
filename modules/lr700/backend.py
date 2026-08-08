@@ -18,12 +18,10 @@ Beta。自动化测试验证的是协议状态机和异常边界，不是硬件�
 
 from __future__ import annotations
 
-import importlib
 import math
-import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from typing import Any, Protocol
+from typing import Any
 
 from labcontrol.module_api import (
     ModuleError,
@@ -42,90 +40,15 @@ from .constants import (
     STATUS_CODE_OVER_RANGE,
     default_settings,
 )
-
-
-class InstrumentTransport(Protocol):
-    """后端使用的最小同步通信接口，测试可用内存替身完全覆盖。"""
-
-    def write(self, command: str) -> None: ...
-
-    def query(self, command: str) -> str: ...
-
-    def close(self) -> None: ...
+from . import lr700 as instrument
 
 
 TransportFactory = Callable[
     [str, float],
-    InstrumentTransport,
+    instrument.Transport,
 ]
 ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
-
-
-class PyVisaTransport:
-    """在 Measurement Module worker 内惰性持有 PyVISA 资源。
-
-    LR-700 的响应以 LF 和 IEEE-488 End Of Message 结束；设置读写终止符为换行后，
-    PyVISA 会继续由底层 VISA 实现处理 EOI。框架主进程不会 import PyVISA，也不会
-    持有 ResourceManager 或 GPIB session。
-    """
-
-    def __init__(
-        self,
-        resource_name: str,
-        timeout_seconds: float,
-    ) -> None:
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        try:
-            self._instrument = self._manager.open_resource(
-                resource_name
-            )
-            self._instrument.timeout = max(
-                1,
-                int(timeout_seconds * 1000),
-            )
-            self._instrument.read_termination = "\n"
-            self._instrument.write_termination = "\n"
-        except Exception:
-            self._manager.close()
-            raise
-
-    @staticmethod
-    def list_resources() -> tuple[str, ...]:
-        """只返回 GPIB VISA 资源，不把串口、USB 或 TCPIP 混入地址下拉框。"""
-
-        pyvisa = importlib.import_module("pyvisa")
-        manager = pyvisa.ResourceManager()
-        try:
-            resources = tuple(
-                str(item)
-                for item in manager.list_resources()
-            )
-        finally:
-            manager.close()
-        return tuple(
-            sorted(
-                {
-                    item
-                    for item in resources
-                    if item.upper().startswith("GPIB")
-                },
-                key=str.casefold,
-            )
-        )
-
-    def write(self, command: str) -> None:
-        self._instrument.write(command)
-
-    def query(self, command: str) -> str:
-        return str(self._instrument.query(command))
-
-    def close(self) -> None:
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
 
 
 class LR700Backend:
@@ -157,22 +80,6 @@ class LR700Backend:
         "StatusCode": "",
     }
 
-    _SETTINGS_RE = re.compile(
-        r"^\s*(\d)R\s*,\s*(\d)E\s*,\s*(\d{1,3})%\s*,"
-        r"\s*(\d)F(?:\([^)]*\))?\s*,\s*(\d)M\s*,"
-        r"\s*(\d)L\s*,\s*(\d{1,2})S\s*$",
-        re.IGNORECASE,
-    )
-    _MEASUREMENT_RE = re.compile(
-        r"^\s*([+-]?)\s*(\d+(?:\.\d*)?|\.\d+)\s*"
-        r"([KMU]?)\s*OHM\s*(R|X|DR|DX|RSET|XSET)\s*$",
-        re.IGNORECASE,
-    )
-    _OVERLOAD_RE = re.compile(
-        r"^\s*(\d{1,3})\s+OVERLOADS\s*$",
-        re.IGNORECASE,
-    )
-
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
@@ -180,11 +87,11 @@ class LR700Backend:
         waiter: Waiter | None = None,
     ) -> None:
         self._transport_factory = (
-            transport_factory or PyVisaTransport
+            transport_factory or instrument.PyVisaTransport
         )
         self._resource_lister = (
             resource_lister
-            or PyVisaTransport.list_resources
+            or instrument.PyVisaTransport.list_resources
         )
         self._waiter = (
             waiter
@@ -193,7 +100,7 @@ class LR700Backend:
                 api.sleep(seconds)
             )
         )
-        self.transport: InstrumentTransport | None = None
+        self.transport: instrument.Transport | None = None
         self.desired_settings = default_settings()
         self.applied_settings: dict[str, Any] = {}
         self.protocol_signature = ""
@@ -439,13 +346,13 @@ class LR700Backend:
             data_failure: ModuleError | None = None
             try:
                 resistance = self._query_measurement(
-                    "GET 0",
+                    instrument.GET_RESISTANCE,
                     "R",
                     range_index,
                     api,
                 )
                 reactance = self._query_measurement(
-                    "GET 1",
+                    instrument.GET_REACTANCE,
                     "X",
                     range_index,
                     api,
@@ -761,7 +668,7 @@ class LR700Backend:
                     api.timeout
                 ),
             )
-            transport: InstrumentTransport | None = None
+            transport: instrument.Transport | None = None
             try:
                 transport = self._transport_factory(
                     desired["resource"],
@@ -772,13 +679,13 @@ class LR700Backend:
                     ),
                 )
                 raw_settings = str(
-                    transport.query("GET 6")
+                    transport.query(instrument.GET_SETTINGS)
                 ).strip()
                 bridge = self._parse_bridge_settings(
                     raw_settings,
                 )
                 raw_overloads = str(
-                    transport.query("GET 7")
+                    transport.query(instrument.GET_OVERLOADS)
                 ).strip()
                 self._parse_overloads(raw_overloads)
             except Exception as exc:
@@ -845,14 +752,14 @@ class LR700Backend:
         """
 
         self._close_transport()
-        transport: InstrumentTransport | None = None
+        transport: instrument.Transport | None = None
         try:
             transport = self._transport_factory(
                 resource,
                 timeout_seconds,
             )
             raw = str(
-                transport.query("GET 6")
+                transport.query(instrument.GET_SETTINGS)
             ).strip()
             bridge = self._parse_bridge_settings(raw)
         except Exception as exc:
@@ -992,7 +899,7 @@ class LR700Backend:
         )
         try:
             raw = str(
-                transport.query("GET 6")
+                transport.query(instrument.GET_SETTINGS)
             ).strip()
             bridge = self._parse_bridge_settings(raw)
         except Exception:
@@ -1011,24 +918,10 @@ class LR700Backend:
     ) -> None:
         """发送一套完整的当前传感器绝对设置，并用 GET 6 逐字段读回。"""
 
-        commands = [
-            "AUTORANGE 0",
-            "MODE 0",
-            f"SELECT S={input_channel:02d}",
-            f"RANGE {channel['range_index']}",
-            (
-                "EXCITATION "
-                f"{channel['excitation_index']}"
-            ),
-            *self._variable_excitation_commands(
-                int(
-                    channel[
-                        "excitation_percent"
-                    ]
-                )
-            ),
-            f"FILTER {channel['filter_index']}",
-        ]
+        commands = instrument.configuration_commands(
+            input_channel,
+            channel,
+        )
         for command in commands:
             self._write_absolute(
                 command,
@@ -1041,26 +934,13 @@ class LR700Backend:
             bridge,
         )
 
-    @staticmethod
-    def _variable_excitation_commands(
-        percent: int,
-    ) -> tuple[str, ...]:
-        """按手册构造 VAREXC：100% 用 ``0``，5-99% 需先存百分比再选择 ``1``。"""
-
-        if percent == 100:
-            return ("VAREXC 0",)
-        return (
-            f"VAREXC ={percent:02d}",
-            "VAREXC 1",
-        )
-
     def _set_safe_state(
         self,
         api: ModuleAPI,
     ) -> None:
         """通过普通受控 I/O 设置并读回最低激励。"""
 
-        for command in self._safe_state_commands():
+        for command in instrument.safe_state_commands():
             self._write_absolute(command, api)
         bridge = self._query_bridge_settings(api)
         self._verify_safe_state(bridge)
@@ -1097,7 +977,7 @@ class LR700Backend:
                     )
                     initial = self._parse_bridge_settings(
                         str(
-                            transport.query("GET 6")
+                            transport.query(instrument.GET_SETTINGS)
                         ).strip()
                     )
                     self.transport = transport
@@ -1115,13 +995,13 @@ class LR700Backend:
                     continue
             try:
                 for command in (
-                    self._safe_state_commands()
+                    instrument.safe_state_commands()
                 ):
                     transport.write(command)
                 bridge = (
                     self._parse_bridge_settings(
                         str(
-                            transport.query("GET 6")
+                            transport.query(instrument.GET_SETTINGS)
                         ).strip()
                     )
                 )
@@ -1140,20 +1020,6 @@ class LR700Backend:
         )
 
     @staticmethod
-    def _safe_state_commands() -> tuple[str, ...]:
-        """返回不依赖旧状态的最低激励绝对命令序列。"""
-
-        return (
-            "AUTORANGE 0",
-            f"EXCITATION {SAFE_EXCITATION_INDEX}",
-            (
-                "VAREXC "
-                f"={SAFE_EXCITATION_PERCENT:02d}"
-            ),
-            "VAREXC 1",
-        )
-
-    @staticmethod
     def _safe_state_text() -> str:
         return (
             "Minimum confirmed: 20 uV x 5% "
@@ -1165,7 +1031,7 @@ class LR700Backend:
         api: ModuleAPI,
     ) -> dict[str, int]:
         return self._parse_bridge_settings(
-            self._query_text("GET 6", api)
+            self._query_text(instrument.GET_SETTINGS, api)
         )
 
     @classmethod
@@ -1174,51 +1040,15 @@ class LR700Backend:
         reply: str,
     ) -> dict[str, int]:
         """解析 ``9R,6E,100%,0F,0M,0L,00S`` 形式的 GET 6 响应。"""
-
-        match = cls._SETTINGS_RE.fullmatch(reply)
-        if match is None:
+        try:
+            return instrument.parse_bridge_settings(reply)
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
                 "LR-700 GET 6 response does not match "
                 f"the documented protocol: {reply!r}",
                 "LR700_INVALID_REPLY",
-                "GET 6",
-            )
-        (
-            range_index,
-            excitation_index,
-            excitation_percent,
-            filter_index,
-            mode,
-            local_lockout,
-            sensor,
-        ) = (
-            int(value, 10)
-            for value in match.groups()
-        )
-        if not (
-            0 <= range_index <= 9
-            and 0 <= excitation_index <= 6
-            and 0 <= excitation_percent <= 100
-            and 0 <= filter_index <= 3
-            and 0 <= mode <= 1
-            and 0 <= local_lockout <= 1
-            and 0 <= sensor <= 99
-        ):
-            raise ModuleError(
-                "LR-700 GET 6 response contains an "
-                f"out-of-range field: {reply!r}",
-                "LR700_INVALID_REPLY",
-                "GET 6",
-            )
-        return {
-            "range_index": range_index,
-            "excitation_index": excitation_index,
-            "excitation_percent": excitation_percent,
-            "filter_index": filter_index,
-            "mode": mode,
-            "local_lockout": local_lockout,
-            "sensor": sensor,
-        }
+                instrument.GET_SETTINGS,
+            ) from exc
 
     @staticmethod
     def _protocol_text(
@@ -1312,97 +1142,39 @@ class LR700Backend:
         量程 9 时解释为 mega；中间量程若出现 M 属于协议歧义并拒绝写入数据。
         """
 
-        match = cls._MEASUREMENT_RE.fullmatch(
-            reply
-        )
-        if match is None:
+        try:
+            return instrument.parse_measurement(
+                reply,
+                expected_parameter,
+                range_index,
+            )
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
                 "LR-700 measurement response does not "
-                f"match the documented format: {reply!r}",
+                f"match the documented format for {command}: {reply!r}",
                 "LR700_INVALID_REPLY",
                 command,
-            )
-        sign, number, multiplier, parameter = (
-            match.groups()
-        )
-        normalized_parameter = (
-            parameter.upper()
-        )
-        if normalized_parameter != (
-            expected_parameter.upper()
-        ):
-            raise ModuleError(
-                f"{command} returned parameter "
-                f"{parameter!r}, expected "
-                f"{expected_parameter!r}",
-                "LR700_INVALID_REPLY",
-                command,
-            )
-        value = float(number)
-        if sign == "-":
-            value = -value
-        normalized_multiplier = (
-            multiplier.upper()
-        )
-        if normalized_multiplier == "":
-            factor = 1.0
-        elif normalized_multiplier == "U":
-            factor = 1.0e-6
-        elif normalized_multiplier == "K":
-            factor = 1.0e3
-        elif normalized_multiplier == "M":
-            if range_index <= 2:
-                factor = 1.0e-3
-            elif range_index == 9:
-                factor = 1.0e6
-            else:
-                raise ModuleError(
-                    "LR-700 returned ambiguous M multiplier "
-                    f"on range {range_index}: {reply!r}",
-                    "LR700_INVALID_REPLY",
-                    command,
-                )
-        else:  # pragma: no cover - regex 已排除其他字符
-            raise AssertionError(
-                normalized_multiplier
-            )
-        result = value * factor
-        if not math.isfinite(result):
-            raise ModuleError(
-                f"LR-700 returned a non-finite value for "
-                f"{command}",
-                "LR700_INVALID_REPLY",
-                command,
-            )
-        return result
+            ) from exc
 
     def _query_overloads(
         self,
         api: ModuleAPI,
     ) -> int:
         return self._parse_overloads(
-            self._query_text("GET 7", api)
+            self._query_text(instrument.GET_OVERLOADS, api)
         )
 
     @classmethod
     def _parse_overloads(cls, reply: str) -> int:
-        match = cls._OVERLOAD_RE.fullmatch(reply)
-        if match is None:
+        try:
+            return instrument.parse_overloads(reply)
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
                 "LR-700 GET 7 response does not match "
                 f"'### OVERLOADS': {reply!r}",
                 "LR700_INVALID_REPLY",
-                "GET 7",
-            )
-        bits = int(match.group(1), 10)
-        if not 0 <= bits <= 255:
-            raise ModuleError(
-                f"LR-700 overload word is outside 0-255: "
-                f"{bits}",
-                "LR700_INVALID_REPLY",
-                "GET 7",
-            )
-        return bits
+                instrument.GET_OVERLOADS,
+            ) from exc
 
     @staticmethod
     def _status(
@@ -2036,8 +1808,6 @@ class LR700Backend:
 Module = LR700Backend
 
 __all__ = [
-    "InstrumentTransport",
     "LR700Backend",
     "Module",
-    "PyVisaTransport",
 ]

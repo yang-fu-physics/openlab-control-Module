@@ -12,12 +12,10 @@
 
 from __future__ import annotations
 
-import importlib
 import math
-import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from typing import Any, Protocol
+from typing import Any
 
 from labcontrol.module_api import (
     ModuleError,
@@ -35,97 +33,15 @@ from .constants import (
     compatible_resistance_range_indices,
     default_settings,
 )
-
-
-class InstrumentTransport(Protocol):
-    """后端所需的最小通信接口，便于使用真实 PyVISA 或测试替身。"""
-
-    def write(self, command: str) -> None: ...
-
-    def query(self, command: str) -> str: ...
-
-    def close(self) -> None: ...
+from . import lakeshore_372a as instrument
 
 
 TransportFactory = Callable[
     [str, float],
-    InstrumentTransport,
+    instrument.Transport,
 ]
 ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
-
-
-class PyVisaTransport:
-    """完全位于模块 worker 内的惰性 PyVISA 适配器。
-
-    主进程不 import PyVISA，也不持有 ResourceManager/Instrument；模块被强制回收时，
-    VISA 对象随独立进程一起释放。仪表 I/O timeout 在打开资源后立即换算为毫秒设置。
-    """
-
-    def __init__(
-        self,
-        resource_name: str,
-        timeout_seconds: float,
-    ) -> None:
-        """打开单个 VISA session，并把核心的秒制超时转换成 PyVISA 毫秒。"""
-
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        try:
-            self._instrument = self._manager.open_resource(
-                resource_name
-            )
-            self._instrument.timeout = max(
-                1,
-                int(timeout_seconds * 1000),
-            )
-            self._instrument.read_termination = "\n"
-            self._instrument.write_termination = "\n"
-        except Exception:
-            self._manager.close()
-            raise
-
-    @staticmethod
-    def list_resources() -> tuple[str, ...]:
-        """枚举并排序 GPIB VISA 资源；不把串口/USB/TCPIP 混入下拉框。"""
-
-        pyvisa = importlib.import_module("pyvisa")
-        manager = pyvisa.ResourceManager()
-        try:
-            resources = tuple(
-                str(item)
-                for item in manager.list_resources()
-            )
-        finally:
-            manager.close()
-        return tuple(
-            sorted(
-                {
-                    item
-                    for item in resources
-                    if item.upper().startswith("GPIB")
-                },
-                key=str.casefold,
-            )
-        )
-
-    def write(self, command: str) -> None:
-        """向仪表发送一条已经过后端构造的绝对设置命令。"""
-
-        self._instrument.write(command)
-
-    def query(self, command: str) -> str:
-        """发送查询并保留 PyVISA 返回的原始文本，解析由后端集中完成。"""
-
-        return str(self._instrument.query(command))
-
-    def close(self) -> None:
-        """先关闭仪表 session，再关闭其 ResourceManager。"""
-
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
 
 
 class LakeShore372ABackend:
@@ -170,11 +86,11 @@ class LakeShore372ABackend:
         waiter: Waiter | None = None,
     ) -> None:
         self._transport_factory = (
-            transport_factory or PyVisaTransport
+            transport_factory or instrument.PyVisaTransport
         )
         self._resource_lister = (
             resource_lister
-            or PyVisaTransport.list_resources
+            or instrument.PyVisaTransport.list_resources
         )
         self._waiter = (
             waiter
@@ -183,7 +99,7 @@ class LakeShore372ABackend:
                 api.sleep(seconds)
             )
         )
-        self.transport: InstrumentTransport | None = None
+        self.transport: instrument.Transport | None = None
         self.desired_settings = default_settings()
         self.applied_settings: dict[str, Any] = {}
         self.identity = ""
@@ -268,11 +184,13 @@ class LakeShore372ABackend:
         try:
             # FREQ 的第一个参数 0 表示全局/测量输入组；写后立即 FREQ? 核对索引。
             self._write(
-                f"FREQ 0,{desired['frequency_index']}",
+                instrument.frequency_command(
+                    desired["frequency_index"]
+                ),
                 api,
             )
             self._expect_integers(
-                "FREQ? 0",
+                instrument.frequency_query(),
                 (int(desired["frequency_index"]),),
                 api,
             )
@@ -441,15 +359,15 @@ class LakeShore372ABackend:
             )
             try:
                 resistance = self._query_float(
-                    f"RDGR? {input_channel}",
+                    instrument.resistance_query(input_channel),
                     api,
                 )
                 quadrature = self._query_float(
-                    f"QRDG? {input_channel}",
+                    instrument.quadrature_query(input_channel),
                     api,
                 )
                 power = self._query_float(
-                    f"RDGPWR? {input_channel}",
+                    instrument.power_query(input_channel),
                     api,
                 )
                 status_bits = self._query_status(
@@ -695,7 +613,7 @@ class LakeShore372ABackend:
                     else "Idle"
                 ),
             }
-        identity = self._query_text("*IDN?", api)
+        identity = self._query_text(instrument.IDENTIFY, api)
         self._validate_identity(identity)
         self.identity = identity
         return {
@@ -823,14 +741,14 @@ class LakeShore372ABackend:
         """关闭旧 session，打开新资源并在接管前严格验证 ``*IDN?``。"""
 
         self._close_transport()
-        transport: InstrumentTransport | None = None
+        transport: instrument.Transport | None = None
         try:
             transport = self._transport_factory(
                 resource,
                 timeout_seconds,
             )
             identity = str(
-                transport.query("*IDN?")
+                transport.query(instrument.IDENTIFY)
             ).strip()
             self._validate_identity(identity)
         except Exception as exc:
@@ -852,12 +770,7 @@ class LakeShore372ABackend:
     def _validate_identity(identity: str) -> None:
         """宽容厂商字符串中的空格/下划线/连字符，但必须明确包含 MODEL372。"""
 
-        compact = re.sub(
-            r"[\s_-]+",
-            "",
-            identity,
-        ).upper()
-        if "MODEL372" not in compact:
+        if not instrument.validate_identity(identity):
             raise ModuleError(
                 f"Expected Lake Shore Model 372, received "
                 f"{identity!r}",
@@ -921,7 +834,7 @@ class LakeShore372ABackend:
         self,
         command: str,
         operation: Callable[
-            [InstrumentTransport],
+            [instrument.Transport],
             Any,
         ],
         api: ModuleAPI,
@@ -999,7 +912,7 @@ class LakeShore372ABackend:
         )
         try:
             identity = str(
-                transport.query("*IDN?")
+                transport.query(instrument.IDENTIFY)
             ).strip()
             self._validate_identity(identity)
         except Exception:
@@ -1029,15 +942,16 @@ class LakeShore372ABackend:
         )
         input_channel = int(channel["input_channel"])
         self._write(
-            "FILTER "
-            f"{input_channel},"
-            f"{1 if settings['filter_enabled'] else 0},"
-            f"{settings['filter_settle_seconds']},"
-            f"{settings['filter_window_percent']}",
+            instrument.filter_command(
+                input_channel,
+                enabled=bool(settings["filter_enabled"]),
+                settle_seconds=settings["filter_settle_seconds"],
+                window_percent=settings["filter_window_percent"],
+            ),
             api,
         )
         self._expect_integers(
-            f"FILTER? {input_channel}",
+            instrument.filter_query(input_channel),
             (
                 1 if settings["filter_enabled"] else 0,
                 int(settings["filter_settle_seconds"]),
@@ -1046,16 +960,16 @@ class LakeShore372ABackend:
             api,
         )
         self._write(
-            "INSET "
-            f"{input_channel},"
-            f"{1 if enabled else 0},"
-            f"{settings['dwell_seconds']},"
-            f"{settings['pause_seconds']},"
-            "0,2",
+            instrument.inset_command(
+                input_channel,
+                enabled=enabled,
+                dwell_seconds=settings["dwell_seconds"],
+                pause_seconds=settings["pause_seconds"],
+            ),
             api,
         )
         self._expect_integers(
-            f"INSET? {input_channel}",
+            instrument.inset_query(input_channel),
             (
                 1 if enabled else 0,
                 int(settings["dwell_seconds"]),
@@ -1066,7 +980,7 @@ class LakeShore372ABackend:
             api,
         )
         self._write(
-            self._intype_command(
+            instrument.intype_command(
                 channel,
                 shunted=shunted,
             ),
@@ -1116,11 +1030,11 @@ class LakeShore372ABackend:
         """切换 SCAN 到指定输入并关闭仪表内部自动扫描，然后读回确认。"""
 
         self._write(
-            f"SCAN {input_channel},0",
+            instrument.scan_command(input_channel),
             api,
         )
         self._expect_integers(
-            "SCAN?",
+            instrument.SCAN_QUERY,
             (input_channel, 0),
             api,
         )
@@ -1135,7 +1049,7 @@ class LakeShore372ABackend:
         """用完整 INTYPE 设置改变分流位，并要求仪表返回完全一致的配置。"""
 
         self._write(
-            self._intype_command(
+            instrument.intype_command(
                 channel,
                 shunted=shunted,
             ),
@@ -1157,8 +1071,8 @@ class LakeShore372ABackend:
         """核对 INTYPE 的模式、量程、自动量程、分流和首选单位全部字段。"""
 
         self._expect_integers(
-            f"INTYPE? {channel['input_channel']}",
-            self._intype_values(
+            instrument.intype_query(channel["input_channel"]),
+            instrument.intype_values(
                 channel,
                 shunted=shunted,
             ),
@@ -1179,11 +1093,8 @@ class LakeShore372ABackend:
 
         reply = self._query_text(command, api)
         try:
-            actual = tuple(
-                int(part.strip(), 10)
-                for part in reply.split(",")
-            )
-        except ValueError as exc:
+            actual = instrument.parse_integer_tuple(reply)
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
                 f"Model 372 returned an invalid settings "
                 f"reply to {command}: {reply!r}",
@@ -1208,21 +1119,14 @@ class LakeShore372ABackend:
 
         reply = self._query_text(command, api)
         try:
-            value = float(reply)
-        except ValueError as exc:
+            value = instrument.parse_number(reply)
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
-                f"Model 372 returned a non-numeric reply "
+                f"Model 372 returned an invalid numeric reply "
                 f"to {command}: {reply!r}",
                 "LS372_INVALID_REPLY",
                 command,
             ) from exc
-        if not math.isfinite(value):
-            raise ModuleError(
-                f"Model 372 returned a non-finite reply "
-                f"to {command}: {reply!r}",
-                "LS372_INVALID_REPLY",
-                command,
-            )
         return value
 
     def _query_status(
@@ -1232,24 +1136,17 @@ class LakeShore372ABackend:
     ) -> int:
         """读取 RDGST 的 8 位状态字，并拒绝负数或超出一个字节的回复。"""
 
-        command = f"RDGST? {input_channel}"
+        command = instrument.status_query(input_channel)
         reply = self._query_text(command, api)
         try:
-            value = int(reply, 10)
-        except ValueError as exc:
+            value = instrument.parse_status(reply)
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
                 f"Model 372 returned an invalid status "
                 f"to {command}: {reply!r}",
                 "LS372_INVALID_REPLY",
                 command,
             ) from exc
-        if not 0 <= value <= 255:
-            raise ModuleError(
-                f"Model 372 returned an out-of-range status "
-                f"to {command}: {value}",
-                "LS372_INVALID_REPLY",
-                command,
-            )
         return value
 
     @staticmethod
@@ -1642,21 +1539,20 @@ class LakeShore372ABackend:
             return "transport is disconnected"
         try:
             transport.write(
-                self._intype_command(
+                instrument.intype_command(
                     channel,
                     shunted=True,
                 )
             )
             reply = str(
                 transport.query(
-                    f"INTYPE? {channel['input_channel']}"
+                    instrument.intype_query(
+                        channel["input_channel"]
+                    )
                 )
             ).strip()
-            actual = tuple(
-                int(part.strip(), 10)
-                for part in reply.split(",")
-            )
-            expected = self._intype_values(
+            actual = instrument.parse_integer_tuple(reply)
+            expected = instrument.intype_values(
                 channel,
                 shunted=True,
             )
@@ -1706,55 +1602,6 @@ class LakeShore372ABackend:
                     f"{error}"
                 )
         return errors
-
-    @staticmethod
-    def _intype_command(
-        channel: Mapping[str, Any],
-        *,
-        shunted: bool,
-    ) -> str:
-        """构造完整 INTYPE 绝对设置；末尾 ``2`` 固定首选单位为 Ohm。
-
-        手册规定 current=1、voltage=0，分流开启=1。调用者不能只拼接最后一个分流字段，
-        以免覆盖或继承未知的其余参数。
-        """
-
-        mode = (
-            1
-            if channel["excitation_mode"] == "current"
-            else 0
-        )
-        return (
-            "INTYPE "
-            f"{channel['input_channel']},"
-            f"{mode},"
-            f"{channel['excitation_range']},"
-            f"{channel['autorange']},"
-            f"{channel['resistance_range']},"
-            f"{1 if shunted else 0},"
-            "2"
-        )
-
-    @staticmethod
-    def _intype_values(
-        channel: Mapping[str, Any],
-        *,
-        shunted: bool,
-    ) -> tuple[int, ...]:
-        """返回 INTYPE? 应读回的六个字段，不含查询中已指定的输入号。"""
-
-        return (
-            (
-                1
-                if channel["excitation_mode"] == "current"
-                else 0
-            ),
-            int(channel["excitation_range"]),
-            int(channel["autorange"]),
-            int(channel["resistance_range"]),
-            1 if shunted else 0,
-            2,
-        )
 
     def _close_transport(self) -> None:
         """先清空对象引用再关闭底层资源，避免 close 异常留下“似乎仍连接”的状态。"""
@@ -2165,8 +2012,6 @@ class LakeShore372ABackend:
 Module = LakeShore372ABackend
 
 __all__ = [
-    "InstrumentTransport",
     "LakeShore372ABackend",
     "Module",
-    "PyVisaTransport",
 ]

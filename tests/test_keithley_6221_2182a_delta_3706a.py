@@ -15,7 +15,7 @@ CORE = ROOT.parent / "OpenLabControl"
 MODULE = (
     ROOT
     / "modules"
-    / "keithley_6221_2182a_delta_3706a"
+    / "keithley_6221_2182a_delta"
 )
 sys.path.insert(0, str(CORE / "src"))
 
@@ -48,12 +48,12 @@ from labcontrol.measurement.manifest import (  # noqa: E402
 
 Keithley6221Delta3706ABackend = load_source_object(
     MODULE,
-    "backend:Keithley6221Delta3706ABackend",
+    "backend:Keithley6221DeltaBackend",
     "test_keithley_delta_3706a_backend",
 )
 Keithley6221Delta3706AFrontend = load_source_object(
     MODULE,
-    "frontend:Keithley6221Delta3706AFrontend",
+    "frontend:Keithley6221DeltaFrontend",
     "test_keithley_delta_3706a_frontend",
 )
 default_settings = load_source_object(
@@ -485,7 +485,8 @@ def _settings(
 ) -> dict:
     settings = default_settings()
     settings["resource_6221"] = "GPIB0::12::INSTR"
-    settings["resource_3706a"] = "GPIB0::7::INSTR"
+    settings["switcher_type"] = "3706a"
+    settings["resource_switcher"] = "GPIB0::7::INSTR"
     settings["switch_settle_seconds"] = 0.0
     for index, channel in enumerate(
         settings["channels"].values(),
@@ -582,7 +583,8 @@ class DefaultSettingsTests(unittest.TestCase):
         self.assertEqual(first["shared"]["low_current"], "0")
         self.assertTrue(first["channels"]["ch1"]["enabled"])
         self.assertFalse(first["resource_6221"])
-        self.assertFalse(first["resource_3706a"])
+        self.assertEqual(first["switcher_type"], "none")
+        self.assertFalse(first["resource_switcher"])
 
 
 class RoutingTests(unittest.TestCase):
@@ -590,18 +592,16 @@ class RoutingTests(unittest.TestCase):
         self,
     ) -> None:
         routing = load_routing()
+        routes = routing.for_switcher("3706a")
         self.assertEqual(
-            routing.channels["ch1"],
+            routes.channels["ch1"],
             ("1001", "1011", "1005", "1015"),
         )
         self.assertEqual(
-            routing.channels["ch4"],
+            routes.channels["ch4"],
             ("1004", "1014", "1005", "1015"),
         )
-        self.assertEqual(
-            routing.list_text("ch2"),
-            "1002,1012,1005,1015",
-        )
+        self.assertEqual(routes.switcher_type, "3706a")
 
     def test_legacy_7001_address_syntax_is_rejected(
         self,
@@ -609,8 +609,13 @@ class RoutingTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "routing.toml"
             path.write_text(
-                "format_version = 1\n"
-                "[channels]\n"
+                "format_version = 2\n"
+                "[switchers.7001.channels]\n"
+                'ch1 = ["1!1", "1!11", "1!5", "1!15"]\n'
+                'ch2 = ["1!2", "1!12", "1!5", "1!15"]\n'
+                'ch3 = ["1!3", "1!13", "1!5", "1!15"]\n'
+                'ch4 = ["1!4", "1!14", "1!5", "1!15"]\n'
+                "[switchers.3706a.channels]\n"
                 'ch1 = ["1!1", "1011", "1005", "1015"]\n'
                 'ch2 = ["1002", "1012", "1005", "1015"]\n'
                 'ch3 = ["1003", "1013", "1005", "1015"]\n'
@@ -619,19 +624,17 @@ class RoutingTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 ValueError,
-                "invalid 3706A addresses",
+                "invalid addresses",
             ):
                 load_routing(path)
 
     def test_four_pole_getclose_pair_is_expanded(
         self,
     ) -> None:
-        Keithley6221Delta3706ABackend._expect_closed_routes(
+        Keithley6221Delta3706ABackend._expect_3706a_routes(
             "1001(1031),1005",
-            expected=frozenset(
-                {"1001", "1031", "1005"}
-            ),
-            command="test",
+            frozenset({"1001", "1031", "1005"}),
+            "test",
         )
 
 
@@ -664,21 +667,21 @@ class BackendTests(unittest.TestCase):
             waiter=wait,
         )
 
-    def test_open_only_discovers_and_apply_probes_3706a(
+    def test_open_only_discovers_and_apply_connects_selected_3706a(
         self,
     ) -> None:
         state = _FakeVisaState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
         status = open_module(backend, _context(messages))
-        self.assertFalse(backend.switcher_available)
-        self.assertEqual(status["3706A"], "Not checked")
+        self.assertEqual(backend.switcher_type, "none")
+        self.assertEqual(status["Switcher"], "None - CH1 only")
         self.assertEqual(state.opened, [])
 
         context = _context(messages)
         backend.configure(_settings(), context)
-        self.assertTrue(backend.switcher_available)
-        self.assertEqual(backend.identity_3706a, "3706A")
+        self.assertEqual(backend.switcher_type, "3706a")
+        self.assertEqual(backend.identity_switcher, "3706A")
         switcher_queries = [
             command
             for resource, action, command in state.commands
@@ -698,8 +701,8 @@ class BackendTests(unittest.TestCase):
         open_module(backend, context)
         status = backend.configure(_settings(), context)
 
-        self.assertTrue(backend.switcher_available)
-        self.assertEqual(status["3706A"], "3706")
+        self.assertEqual(backend.switcher_type, "3706a")
+        self.assertEqual(status["Switcher"], "3706")
 
     def test_same_visa_resource_is_rejected_before_connect(
         self,
@@ -707,7 +710,7 @@ class BackendTests(unittest.TestCase):
         state = _FakeVisaState()
         backend = self._backend(state)
         settings = _settings()
-        settings["resource_3706a"] = (
+        settings["resource_switcher"] = (
             settings["resource_6221"]
         )
 
@@ -718,7 +721,7 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_INVALID_SETTINGS",
+            "K6221_INVALID_SETTINGS",
         )
         self.assertEqual(state.opened, [])
 
@@ -794,7 +797,7 @@ class BackendTests(unittest.TestCase):
             )
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_BEGIN_TIMEOUT_UNSAFE",
+            "K6221_BEGIN_TIMEOUT_UNSAFE",
         )
 
         slow = _settings(channels=1)
@@ -808,10 +811,10 @@ class BackendTests(unittest.TestCase):
             )
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_MEASURE_TIMEOUT_UNSAFE",
+            "K6221_MEASURE_TIMEOUT_UNSAFE",
         )
 
-    def test_missing_3706a_falls_back_to_ch1_only(
+    def test_selected_3706a_connection_failure_is_fatal(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -826,28 +829,13 @@ class BackendTests(unittest.TestCase):
         settings = _settings(channels=4)
         context = _context(messages)
         open_module(backend, context)
-        backend.configure(settings, context)
-        self.assertFalse(backend.switcher_available)
-        self.assertTrue(
-            any(
-                kind == "warning"
-                and payload["code"]
-                == "K6221_3706_SWITCHER_UNAVAILABLE"
-                for kind, payload in messages
-            )
-        )
-        run_start(backend, context)
-        measure_module(backend, context)
-        rows = [
-            payload["values"]
-            for kind, payload in messages
-            if kind == "row"
-        ]
+        with self.assertRaises(ModuleError) as captured:
+            backend.configure(settings, context)
         self.assertEqual(
-            [row["Channel"] for row in rows],
-            [1],
+            captured.exception.code,
+            "K6221_SWITCHER_CONNECTION_FAILED",
         )
-        self.assertEqual(waits, [3.0])
+        self.assertEqual(waits, [])
         # Enable 探测失败后，Apply/Measure 不再尝试 3706A，也不会在未知路由上触发。
         self.assertEqual(
             sum(
@@ -1104,7 +1092,7 @@ class BackendTests(unittest.TestCase):
             any(
                 kind == "warning"
                 and payload["code"]
-                == "K6221_3706_READING_WARNING"
+                == "K6221_READING_WARNING"
                 for kind, payload in messages
             )
         )
@@ -1164,7 +1152,7 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_SWITCHER_COMMUNICATION_FAILED",
+            "K6221_SWITCHER_COMMUNICATION_FAILED",
         )
         attempts = sum(
             resource == "GPIB0::7::INSTR"
@@ -1207,7 +1195,7 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_SWITCHER_VERIFY_FAILED",
+            "K6221_SWITCHER_VERIFY_FAILED",
         )
         self.assertEqual(
             sum(
@@ -1305,7 +1293,7 @@ class BackendTests(unittest.TestCase):
             backend.configure(settings, context)
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_INVALID_SETTINGS",
+            "K6221_INVALID_SETTINGS",
         )
 
         unsafe = _settings(channels=1)
@@ -1314,7 +1302,7 @@ class BackendTests(unittest.TestCase):
             backend.configure(unsafe, context)
         self.assertEqual(
             captured.exception.code,
-            "K6221_3706_INVALID_SETTINGS",
+            "K6221_INVALID_SETTINGS",
         )
 
 
@@ -1374,7 +1362,7 @@ class FrontendTests(unittest.TestCase):
         )
         saved = frontend.dump()
         self.assertEqual(
-            saved["resource_3706a"],
+            saved["resource_switcher"],
             "GPIB0::7::INSTR",
         )
         self.assertEqual(
@@ -1409,12 +1397,10 @@ class FrontendTests(unittest.TestCase):
             "GPIB0::22::INSTR",
         )
 
-        frontend.show_status(
-            {
-                "3706A": "Unavailable - CH1 only",
-                "State": "Initialized",
-            }
+        frontend.switcher_type.setCurrentIndex(
+            frontend.switcher_type.findData("none")
         )
+        frontend.show_status({"State": "Initialized"})
         self.assertTrue(
             frontend.channel_enabled["ch1"].isEnabled()
         )
@@ -1447,15 +1433,15 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.id,
-            "keithley_6221_2182a_delta_3706a",
+            "keithley_6221_2182a_delta",
         )
         self.assertEqual(
             descriptor.name,
-            "Keithley 6221 + 2182A Delta + 3706A",
+            "Keithley 6221 + 2182A Delta",
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b2",
+            "0.2.0b1",
         )
         self.assertEqual(
             list(Keithley6221Delta3706ABackend.columns),

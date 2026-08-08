@@ -39,6 +39,8 @@ from .constants import (
     MAX_DELTA_COUNT,
     MODE_INDEPENDENT,
     MODE_SHARED,
+    SWITCHER_NONE,
+    SWITCHER_TYPES,
     VOLTAGE_RANGES,
     default_delta_settings,
     default_settings,
@@ -137,7 +139,10 @@ class Keithley6221DeltaFrontend(QWidget):
             communication
         )
         self.resource_6221 = self._resource_combo()
-        self.resource_7001 = self._resource_combo()
+        self.switcher_type = QComboBox()
+        for value, label in SWITCHER_TYPES:
+            self.switcher_type.addItem(label, value)
+        self.resource_switcher = self._resource_combo()
         self.refresh_resources_button = QPushButton(
             "Refresh GPIB"
         )
@@ -173,13 +178,25 @@ class Keithley6221DeltaFrontend(QWidget):
             3,
         )
         communication_layout.addWidget(
-            QLabel("Keithley 7001 VISA resource"),
+            QLabel("Channel switcher"),
             1,
             0,
         )
         communication_layout.addWidget(
-            self.resource_7001,
+            self.switcher_type,
             1,
+            1,
+            1,
+            3,
+        )
+        communication_layout.addWidget(
+            QLabel("Switcher VISA resource"),
+            2,
+            0,
+        )
+        communication_layout.addWidget(
+            self.resource_switcher,
+            2,
             1,
             1,
             3,
@@ -191,17 +208,17 @@ class Keithley6221DeltaFrontend(QWidget):
         )
         communication_layout.addWidget(
             self.test_connection_button,
-            1,
+            2,
             4,
         )
         communication_layout.addWidget(
             QLabel("I/O timeout"),
-            2,
+            3,
             0,
         )
         communication_layout.addWidget(
             self.io_timeout,
-            2,
+            3,
             1,
         )
         communication_note = QLabel(
@@ -212,7 +229,7 @@ class Keithley6221DeltaFrontend(QWidget):
         communication_note.setWordWrap(True)
         communication_layout.addWidget(
             communication_note,
-            2,
+            3,
             2,
             1,
             3,
@@ -251,7 +268,7 @@ class Keithley6221DeltaFrontend(QWidget):
             3,
         )
         operation_layout.addWidget(
-            QLabel("7001 settle time"),
+            QLabel("Switcher settle time"),
             1,
             0,
         )
@@ -292,7 +309,7 @@ class Keithley6221DeltaFrontend(QWidget):
             channels_layout.addWidget(checkbox)
         channels_layout.addStretch(1)
         self.switcher_note = QLabel(
-            "7001 state has not been checked yet."
+            "None uses CH1 only and does not open a switcher connection."
         )
         self.switcher_note.setWordWrap(True)
         channels_layout.addWidget(
@@ -353,9 +370,11 @@ class Keithley6221DeltaFrontend(QWidget):
 
         scroll.setWidget(content)
         outer.addWidget(scroll)
-        self._switcher_available = True
         self.mode.currentIndexChanged.connect(
             self._update_mode_page
+        )
+        self.switcher_type.currentIndexChanged.connect(
+            self._update_control_availability
         )
         self.load(default_settings())
         return page
@@ -450,7 +469,8 @@ class Keithley6221DeltaFrontend(QWidget):
             "State",
             "6221",
             "2182A",
-            "7001",
+            "Switcher Type",
+            "Switcher",
             "Armed",
             "Sequence Active",
             "Active Channel",
@@ -508,9 +528,8 @@ class Keithley6221DeltaFrontend(QWidget):
             "resource_6221": (
                 self.resource_6221.currentText().strip()
             ),
-            "resource_7001": (
-                self.resource_7001.currentText().strip()
-            ),
+            "switcher_type": str(self.switcher_type.currentData()),
+            "resource_switcher": self.resource_switcher.currentText().strip(),
             "mode": str(self.mode.currentData()),
             "io_timeout_seconds": self.io_timeout.value(),
             "switch_settle_seconds": (
@@ -606,8 +625,12 @@ class Keithley6221DeltaFrontend(QWidget):
             str(merged["resource_6221"]),
         )
         self._select_resource(
-            self.resource_7001,
-            str(merged["resource_7001"]),
+            self.resource_switcher,
+            str(merged["resource_switcher"]),
+        )
+        self._select_data(
+            self.switcher_type,
+            merged["switcher_type"],
         )
         self._select_data(
             self.mode,
@@ -712,23 +735,6 @@ class Keithley6221DeltaFrontend(QWidget):
             self._update_resources(
                 tuple(str(item) for item in resources)
             )
-        switcher = str(status.get("7001", ""))
-        if switcher:
-            self._switcher_available = not (
-                switcher.startswith("Unavailable")
-            )
-            self.switcher_note.setText(
-                (
-                    "7001 available: CH1-CH4 may be used."
-                    if self._switcher_available
-                    else (
-                        "7001 unavailable: only CH1 will be "
-                        "measured. Saved CH2-CH4 selections "
-                        "are retained but skipped."
-                    )
-                )
-            )
-            self._update_control_availability()
         for key, value in status.items():
             label = self.status_labels.get(str(key))
             if label is None:
@@ -750,12 +756,21 @@ class Keithley6221DeltaFrontend(QWidget):
             else 1
         )
 
-    def _update_control_availability(self) -> None:
+    def _update_control_availability(self, *_args: Any) -> None:
+        switcher_selected = self.switcher_type.currentData() != SWITCHER_NONE
+        self.resource_switcher.setEnabled(switcher_selected)
+        self.switcher_note.setText(
+            "Selected switcher enables CH1-CH4. Apply fails if it cannot be identified."
+            if switcher_selected
+            else "None uses CH1 only and does not open a switcher connection."
+        )
         for index in range(1, 5):
             key = f"ch{index}"
             available = (
-                index == 1 or self._switcher_available
+                index == 1 or switcher_selected
             )
+            if not available:
+                self.channel_enabled[key].setChecked(False)
             self.channel_enabled[key].setEnabled(
                 available
             )
@@ -770,7 +785,7 @@ class Keithley6221DeltaFrontend(QWidget):
     ) -> None:
         for combo in (
             self.resource_6221,
-            self.resource_7001,
+            self.resource_switcher,
         ):
             current = combo.currentText().strip()
             blocker = QSignalBlocker(combo)
@@ -817,7 +832,8 @@ class Keithley6221DeltaFrontend(QWidget):
     def _setting_widgets(self) -> list[QWidget]:
         widgets: list[QWidget] = [
             self.resource_6221,
-            self.resource_7001,
+            self.switcher_type,
+            self.resource_switcher,
             self.mode,
             self.io_timeout,
             self.switch_settle,
@@ -839,7 +855,8 @@ class Keithley6221DeltaFrontend(QWidget):
             return result
         for key in (
             "resource_6221",
-            "resource_7001",
+            "switcher_type",
+            "resource_switcher",
             "mode",
             "io_timeout_seconds",
             "switch_settle_seconds",

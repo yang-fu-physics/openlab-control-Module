@@ -1,6 +1,6 @@
 """Keithley Delta 模块的协议常量和无输出默认设置。
 
-默认设置不会产生非零电流。Enable 只发现资源并判断 7001 是否可用；模块不再维护
+默认设置不会产生非零电流。Enable 只发现资源；Apply 按明确选择连接切换器。模块不维护
 用户可配置的软件电流或 compliance 上限，但仍会按仪表手册拒绝设备本身无法接受的
 命令范围。样品、接线和允许功耗的实验安全边界应在真实仪表上人工配置并核对。
 """
@@ -13,6 +13,14 @@ from typing import Any, Final
 
 MODE_SHARED: Final = "shared_armed"
 MODE_INDEPENDENT: Final = "independent_rearm"
+SWITCHER_NONE: Final = "none"
+SWITCHER_7001: Final = "7001"
+SWITCHER_3706A: Final = "3706a"
+SWITCHER_TYPES: Final = (
+    (SWITCHER_NONE, "None (CH1 only)"),
+    (SWITCHER_7001, "Keithley 7001"),
+    (SWITCHER_3706A, "Keithley 3706A"),
+)
 ARM_SETTLE_SECONDS: Final = 3.0
 # 核心单条 IPC 消息上限为 1 MiB。32,768 个最坏长度的 JSON float 加上事件
 # 元数据仍可安全放入一帧；再高会在结果写盘前因消息过大而失败。
@@ -75,7 +83,8 @@ def default_settings() -> dict[str, Any]:
     delta = default_delta_settings()
     return {
         "resource_6221": "",
-        "resource_7001": "",
+        "switcher_type": SWITCHER_NONE,
+        "resource_switcher": "",
         "mode": MODE_SHARED,
         "io_timeout_seconds": 3.0,
         "switch_settle_seconds": 0.5,
@@ -102,6 +111,10 @@ __all__ = [
     "MAX_DELTA_COUNT",
     "MODE_INDEPENDENT",
     "MODE_SHARED",
+    "SWITCHER_NONE",
+    "SWITCHER_7001",
+    "SWITCHER_3706A",
+    "SWITCHER_TYPES",
     "STATUS_CODE_COMPLIANCE",
     "STATUS_CODE_INVALID_TRACE",
     "STATUS_CODE_NORMAL",

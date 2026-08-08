@@ -1,20 +1,20 @@
-﻿"""Keithley 6221 + 2182A Delta 与可选 7001 的 Measurement Module 后端。
+﻿"""Keithley 6221 + 2182A Delta 与显式可选切换器的 Measurement Module 后端。
 
 协议依据：
 
 - 6221 用户手册第 5 节：``SOUR:DELT:*``、``INIT:IMM``、``TRAC:DATA?``；
 - 2182A 由 6221 的 RS-232 转发口控制，不单独占用电脑的 VISA 资源；
-- 7001 Quick Reference Guide：``ROUT:CLOS``、``ROUT:OPEN`` 与查询回读。
+- 7001 使用 SCPI 路由；3706A 使用区分大小写的 TSP 路由。
 
 关键安全边界：
 
-- Enable 不发送电流设置；只发现资源并探测可选 7001；
+- Enable 不连接仪表；Apply 按 None/7001/3706A 的明确选择连接；
 - Apply 前后均确认 6221 为零电流且输出关闭；
 - 共享模式只在 ``run_start`` 事件 ARM 一次，ARM 后等待至少 3 秒并查询确认；
 - 独立模式每次切换前 Abort/Clear，切换后重新配置和 ARM；
-- 7001 的任何运行期通信或回读错误立即中止，不自动重发切换/触发命令；
+- 切换器的任何运行期通信或回读错误立即中止，不自动重发切换/触发命令；
 - compliance abort 和 cold switching 固定开启，通道设置必须落在仪表合法命令范围；
-- Stop/Error/Disable/SEQ 完成均 Abort、清零、关闭输出并打开 7001 全部触点。
+- Stop/Error/Disable/SEQ 完成均 Abort、清零、关闭输出并打开切换器全部触点。
 
 本模块仍是 Beta。自动化测试只能验证命令状态机，不能证明真实开关卡接线、6221 实际
 零电流回读语义或 DUT 的功耗边界正确。
@@ -22,14 +22,12 @@
 
 from __future__ import annotations
 
-import importlib
 import math
-import re
 import statistics
 import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from typing import Any, Protocol
+from typing import Any
 
 from labcontrol.module_api import (
     ModuleError,
@@ -46,6 +44,10 @@ from .constants import (
     MAX_DELTA_COUNT,
     MODE_INDEPENDENT,
     MODE_SHARED,
+    SWITCHER_3706A,
+    SWITCHER_7001,
+    SWITCHER_NONE,
+    SWITCHER_TYPES,
     STATUS_CODE_INVALID_TRACE,
     STATUS_CODE_NORMAL,
     STATUS_CODE_OVER_RANGE,
@@ -54,24 +56,14 @@ from .constants import (
     default_settings,
 )
 from .quantities import parse_quantity
-from .routing import RoutingConfig, load_routing
+from .routing import RoutingTable, load_routing
+from . import keithley_2182a
+from . import keithley_3706a
+from . import keithley_6221
+from . import keithley_7001
 
 
-class InstrumentTransport(Protocol):
-    """后端使用的最小 VISA 接口，测试用内存替身也实现同一契约。"""
-
-    def write(self, command: str) -> None: ...
-
-    def query(
-        self,
-        command: str,
-        timeout_seconds: float | None = None,
-    ) -> str: ...
-
-    def close(self) -> None: ...
-
-
-TransportFactory = Callable[[str, float], InstrumentTransport]
+TransportFactory = Callable[[str, float], keithley_6221.Transport]
 ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
 
@@ -80,68 +72,8 @@ Waiter = Callable[[ModuleAPI, float], None]
 _OPERATION_CLEANUP_RESERVE_SECONDS = 2.0
 
 
-class PyVisaTransport:
-    """惰性导入 PyVISA，并为单次长测量临时扩大读超时。"""
-
-    def __init__(
-        self,
-        resource: str,
-        timeout_seconds: float,
-    ) -> None:
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        self._instrument = self._manager.open_resource(resource)
-        self._instrument.timeout = max(
-            1,
-            int(float(timeout_seconds) * 1000),
-        )
-        self._instrument.write_termination = "\n"
-        self._instrument.read_termination = "\n"
-
-    @staticmethod
-    def list_resources() -> tuple[str, ...]:
-        """列出当前 VISA 层能看到的 GPIB 资源。"""
-
-        pyvisa = importlib.import_module("pyvisa")
-        manager = pyvisa.ResourceManager()
-        try:
-            return tuple(
-                str(item)
-                for item in manager.list_resources()
-                if str(item).upper().startswith("GPIB")
-            )
-        finally:
-            manager.close()
-
-    def write(self, command: str) -> None:
-        self._instrument.write(command)
-
-    def query(
-        self,
-        command: str,
-        timeout_seconds: float | None = None,
-    ) -> str:
-        if timeout_seconds is None:
-            return str(self._instrument.query(command))
-        original = self._instrument.timeout
-        self._instrument.timeout = max(
-            1,
-            int(float(timeout_seconds) * 1000),
-        )
-        try:
-            return str(self._instrument.query(command))
-        finally:
-            self._instrument.timeout = original
-
-    def close(self) -> None:
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
-
-
 class Keithley6221DeltaBackend:
-    """6221/2182A Delta 测量和四路 7001 路由状态机。"""
+    """6221/2182A Delta 测量及可选 7001/3706A 四路路由状态机。"""
 
     columns = {
         "Channel": "",
@@ -152,24 +84,19 @@ class Keithley6221DeltaBackend:
         "StatusCode": "",
     }
 
-    _TRACE_TOKEN = re.compile(
-        r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
-        r"(?:[eE][+-]?\d+)?(?:\s*[vV])?$"
-    )
-
     def __init__(
         self,
         *,
         transport_factory: TransportFactory | None = None,
         resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
-        routing: RoutingConfig | None = None,
+        routing: RoutingTable | None = None,
     ) -> None:
         self._transport_factory = (
-            transport_factory or PyVisaTransport
+            transport_factory or keithley_6221.PyVisaTransport
         )
         self._resource_lister = (
-            resource_lister or PyVisaTransport.list_resources
+            resource_lister or keithley_6221.PyVisaTransport.list_resources
         )
         self._waiter = (
             waiter
@@ -180,7 +107,7 @@ class Keithley6221DeltaBackend:
             )
         )
         try:
-            self.routing = routing or load_routing()
+            self.routing_table = routing or load_routing()
         except ValueError as exc:
             raise ModuleError(
                 str(exc),
@@ -192,13 +119,12 @@ class Keithley6221DeltaBackend:
             default_settings()
         )
         self.applied_settings: dict[str, Any] | None = None
-        self.transport_6221: InstrumentTransport | None = None
-        self.transport_7001: InstrumentTransport | None = None
+        self.transport_6221: keithley_6221.Transport | None = None
+        self.transport_switcher: keithley_6221.Transport | None = None
         self.identity_6221 = ""
         self.identity_2182a = ""
-        self.identity_7001 = ""
-        self.switcher_available = False
-        self.switcher_detection_complete = False
+        self.identity_switcher = ""
+        self.switcher_type = SWITCHER_NONE
         self.sequence_active = False
         self.armed = False
         self.active_channel = ""
@@ -235,11 +161,9 @@ class Keithley6221DeltaBackend:
                 f"{type(exc).__name__}: {exc}",
             )
 
-        # 新模块协议刻意不把持久设置传给 open()。因此这里不能猜测 7001
-        # 地址；只有用户明确 Apply 后，configure() 才按当前设置探测仪表。
-        self.switcher_detection_complete = False
-        self.switcher_available = False
-        self.identity_7001 = ""
+        # Enable 不读取保存设置，也不探测切换器；只有 Apply 才按用户的明确选择连接。
+        self.switcher_type = SWITCHER_NONE
+        self.identity_switcher = ""
         self.applied_settings = None
         self.sequence_active = False
         self.armed = False
@@ -258,35 +182,30 @@ class Keithley6221DeltaBackend:
     ) -> Mapping[str, Any]:
         """连接、识别并写入一套安全的待 ARM 设置，但不开始输出。"""
 
-        # 先完整验证地址和四通道设置，再使用用户明确 Apply 的地址探测
-        # 可选 7001。探测失败仅降级为 CH1；运行期间的通信失败仍是 Error。
-        candidate = self._normalized_settings(
+        normalized = self._normalized_settings(
             settings,
             require_6221=True,
             require_measurement=True,
             operation_timeout_seconds=(
                 api.timeout
             ),
-            ch1_only=False,
         )
-        self.desired_settings = deepcopy(candidate)
-        self._detect_switcher(api)
-        normalized = (
-            candidate
-            if self.switcher_available
-            else self._normalized_settings(
-                settings,
-                require_6221=True,
-                require_measurement=True,
-                operation_timeout_seconds=api.timeout,
-                ch1_only=True,
-            )
-        )
+        # 重新 Apply 可能改变切换器类型或地址。必须先按“旧配置”确认零电流和全部
+        # 路由断开，再释放旧会话；不能先覆盖 switcher_type 后让清理走错协议。
+        if (
+            self.transport_6221 is not None
+            or self.transport_switcher is not None
+        ):
+            self._enter_safe_state(api)
+            self._close_transports()
         self.desired_settings = deepcopy(normalized)
+        self.switcher_type = str(normalized["switcher_type"])
         try:
             self._connect_6221(normalized, api)
-            if self.switcher_available:
-                self._connect_7001(normalized, api)
+            if self.switcher_type != SWITCHER_NONE:
+                self._connect_switcher(normalized, api)
+            else:
+                self._close_transport_switcher()
             self._enter_safe_state(api)
             self._verify_2182a(api)
             first_channel = self._enabled_channels(
@@ -539,20 +458,20 @@ class Keithley6221DeltaBackend:
         self,
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """只读刷新 Armed、输出和 7001 状态，不隐式 Apply。"""
+        """只读刷新 Armed 与输出状态，不隐式 Apply 或操作切换器。"""
 
         if self.transport_6221 is not None:
             armed = self._query_6221(
-                "SOUR:DELT:ARM?",
+                keithley_6221.ARM_QUERY,
                 api,
             )
             self.armed = self._parse_switch(
                 armed,
-                "SOUR:DELT:ARM?",
+                keithley_6221.ARM_QUERY,
             )
             output = self._parse_switch(
-                self._query_6221("OUTP?", api),
-                "OUTP?",
+                self._query_6221(keithley_6221.OUTPUT_QUERY, api),
+                keithley_6221.OUTPUT_QUERY,
             )
             self.last_status = (
                 "Armed" if self.armed else "Connected"
@@ -647,57 +566,6 @@ class Keithley6221DeltaBackend:
             return self._action(str(data.get("name", "")), payload, api)
         return {}
 
-    def _detect_switcher(
-        self,
-        api: ModuleAPI,
-    ) -> None:
-        """按本次 Apply 的设置探测 7001；缺失时降级为 CH1-only。"""
-
-        resource = str(
-            self.desired_settings["resource_7001"]
-        ).strip()
-        self.switcher_detection_complete = True
-        self.switcher_available = False
-        self.identity_7001 = ""
-        if not resource:
-            api.warn("K6221_SWITCHER_UNAVAILABLE", None)
-            return
-        transport: InstrumentTransport | None = None
-        try:
-            transport = self._transport_factory(
-                resource,
-                float(
-                    self.desired_settings[
-                        "io_timeout_seconds"
-                    ]
-                ),
-            )
-            identity = transport.query("*IDN?").strip()
-            self._validate_identity(
-                identity,
-                "7001",
-                "Keithley 7001",
-            )
-        except Exception as exc:
-            api.warn(
-                "K6221_SWITCHER_UNAVAILABLE",
-                "Keithley 7001 was not available during Apply; "
-                "the module will measure CH1 only until settings "
-                "are applied again: "
-                f"{type(exc).__name__}: {exc}",
-                resource,
-            )
-            return
-        finally:
-            if transport is not None:
-                try:
-                    transport.close()
-                except Exception:
-                    pass
-        self.switcher_available = True
-        self.identity_7001 = identity
-        api.warn("K6221_SWITCHER_UNAVAILABLE", None, resource)
-
     def _test_connections(
         self,
         settings: Mapping[str, Any],
@@ -705,32 +573,27 @@ class Keithley6221DeltaBackend:
     ) -> None:
         """临时连接并识别仪表，不改变当前 Apply/Armed 状态。"""
 
-        test_6221: InstrumentTransport | None = None
-        test_7001: InstrumentTransport | None = None
+        test_6221: keithley_6221.Transport | None = None
+        test_switcher: keithley_6221.Transport | None = None
         try:
             test_6221 = self._transport_factory(
                 str(settings["resource_6221"]),
                 float(settings["io_timeout_seconds"]),
             )
-            identity_6221 = test_6221.query("*IDN?").strip()
-            self._validate_identity(
-                identity_6221,
-                "6221",
-                "Keithley 6221",
-            )
+            identity_6221 = test_6221.query(keithley_6221.IDENTIFY).strip()
+            self._validate_6221_identity(identity_6221)
             self.identity_6221 = identity_6221
-            if str(settings["resource_7001"]).strip():
-                test_7001 = self._transport_factory(
-                    str(settings["resource_7001"]),
+            switcher_type = str(settings["switcher_type"])
+            if switcher_type != SWITCHER_NONE:
+                test_switcher = self._transport_factory(
+                    str(settings["resource_switcher"]),
                     float(settings["io_timeout_seconds"]),
                 )
-                identity_7001 = test_7001.query("*IDN?").strip()
-                self._validate_identity(
-                    identity_7001,
-                    "7001",
-                    "Keithley 7001",
-                )
-                self.identity_7001 = identity_7001
+                identity_switcher = test_switcher.query(
+                    self._switcher_identify_command(switcher_type)
+                ).strip()
+                self._validate_switcher_identity(switcher_type, identity_switcher)
+                self.identity_switcher = identity_switcher
             api.warn("K6221_CONNECTION_TEST_FAILED", None)
             self.last_status = "Connection test passed"
         except Exception as exc:
@@ -740,7 +603,7 @@ class Keithley6221DeltaBackend:
                 "K6221_CONNECTION_TEST_FAILED",
             ) from exc
         finally:
-            for transport in (test_7001, test_6221):
+            for transport in (test_switcher, test_6221):
                 if transport is not None:
                     try:
                         transport.close()
@@ -758,14 +621,8 @@ class Keithley6221DeltaBackend:
                 str(settings["resource_6221"]),
                 float(settings["io_timeout_seconds"]),
             )
-            identity = self.transport_6221.query(
-                "*IDN?"
-            ).strip()
-            self._validate_identity(
-                identity,
-                "6221",
-                "Keithley 6221",
-            )
+            identity = self.transport_6221.query(keithley_6221.IDENTIFY).strip()
+            self._validate_6221_identity(identity)
         except ModuleError:
             self._close_transport_6221()
             raise
@@ -780,53 +637,67 @@ class Keithley6221DeltaBackend:
         self.identity_6221 = identity
         api.sleep(0)
 
-    def _connect_7001(
+    def _connect_switcher(
         self,
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        """初始化时存在的 7001 此后失败即为 Error，不再静默降级。"""
+        """按明确类型连接切换器；失败直接终止 Apply，不做自动降级。"""
 
-        self._close_transport_7001()
-        resource = str(settings["resource_7001"])
+        self._close_transport_switcher()
+        switcher_type = str(settings["switcher_type"])
+        resource = str(settings["resource_switcher"])
         try:
-            self.transport_7001 = self._transport_factory(
+            self.transport_switcher = self._transport_factory(
                 resource,
                 float(settings["io_timeout_seconds"]),
             )
-            identity = self.transport_7001.query(
-                "*IDN?"
+            identity = self.transport_switcher.query(
+                self._switcher_identify_command(switcher_type)
             ).strip()
-            self._validate_identity(
-                identity,
-                "7001",
-                "Keithley 7001",
-            )
+            self._validate_switcher_identity(switcher_type, identity)
         except ModuleError:
-            self._close_transport_7001()
+            self._close_transport_switcher()
             raise
         except Exception as exc:
-            self._close_transport_7001()
+            self._close_transport_switcher()
             raise ModuleError(
-                "Keithley 7001 was present during Enable but "
-                "could not be connected for Apply",
+                f"Keithley {switcher_type} could not be connected for Apply: "
+                f"{type(exc).__name__}: {exc}",
                 "K6221_SWITCHER_CONNECTION_FAILED",
                 resource,
             ) from exc
-        self.identity_7001 = identity
+        self.identity_switcher = identity
         api.sleep(0)
 
     @staticmethod
-    def _validate_identity(
-        identity: str,
-        model: str,
-        label: str,
-    ) -> None:
-        normalized = identity.upper()
-        if "KEITHLEY" not in normalized or model not in normalized:
+    def _validate_6221_identity(identity: str) -> None:
+        if not keithley_6221.validate_identity(identity):
             raise ModuleError(
-                f"Expected {label}, received {identity!r}",
+                f"Expected Keithley 6221, received {identity!r}",
                 "K6221_IDENTITY_MISMATCH",
+                identity,
+            )
+
+    @staticmethod
+    def _switcher_identify_command(switcher_type: str) -> str:
+        return (
+            keithley_7001.IDENTIFY
+            if switcher_type == SWITCHER_7001
+            else keithley_3706a.IDENTIFY
+        )
+
+    @staticmethod
+    def _validate_switcher_identity(switcher_type: str, identity: str) -> None:
+        valid = (
+            keithley_7001.validate_identity(identity)
+            if switcher_type == SWITCHER_7001
+            else keithley_3706a.validate_identity(identity)
+        )
+        if not valid:
+            raise ModuleError(
+                f"Expected Keithley {switcher_type}, received {identity!r}",
+                "K6221_SWITCHER_IDENTITY_MISMATCH",
                 identity,
             )
 
@@ -835,12 +706,12 @@ class Keithley6221DeltaBackend:
         api: ModuleAPI,
     ) -> None:
         present = self._query_6221(
-            "SOUR:DELT:NVPRESENT?",
+            keithley_6221.NANOVOLTMETER_PRESENT_QUERY,
             api,
         )
         if not self._parse_switch(
             present,
-            "SOUR:DELT:NVPRESENT?",
+            keithley_6221.NANOVOLTMETER_PRESENT_QUERY,
         ):
             raise ModuleError(
                 "6221 does not report a compatible 2182A on "
@@ -848,11 +719,10 @@ class Keithley6221DeltaBackend:
                 "K6221_2182A_NOT_PRESENT",
             )
         identity = self._serial_query(
-            "*IDN?",
+            keithley_2182a.IDENTIFY,
             api,
         )
-        normalized = identity.upper()
-        if "KEITHLEY" not in normalized or "2182A" not in normalized:
+        if not keithley_2182a.validate_identity(identity):
             raise ModuleError(
                 "Expected Keithley 2182A through the 6221 "
                 f"serial link, received {identity!r}",
@@ -875,52 +745,38 @@ class Keithley6221DeltaBackend:
         count = int(settings["count"])
 
         # 明确使用预数学电压，软件再按有效反转电流换算电阻。
-        for command in (
-            "UNIT V",
-            "FORM:DATA ASC",
-            "FORM:ELEM READ",
-            "SENS:AVER:STAT OFF",
-            f"SOUR:CURR:COMP {self._scpi_number(compliance)}",
-            f"SOUR:DELT:HIGH {self._scpi_number(high)}",
-            f"SOUR:DELT:LOW {self._scpi_number(low)}",
-            f"SOUR:DELT:DEL {self._scpi_number(delay)}",
-            f"SOUR:DELT:COUN {count}",
-            "SOUR:SWE:COUN 1",
-            "SOUR:DELT:CSW ON",
-            "SOUR:DELT:CAB ON",
-            f"TRAC:POIN {count}",
-        ):
+        for command in keithley_6221.configuration_commands(settings):
             self._write_6221(command, api)
 
         self._configure_2182a(settings, api)
         self._expect_float(
-            "SOUR:CURR:COMP?",
+            keithley_6221.COMPLIANCE_QUERY,
             compliance,
             api,
         )
         self._expect_float(
-            "SOUR:DELT:HIGH?",
+            keithley_6221.HIGH_CURRENT_QUERY,
             high,
             api,
         )
         self._expect_float(
-            "SOUR:DELT:LOW?",
+            keithley_6221.LOW_CURRENT_QUERY,
             low,
             api,
         )
         self._expect_float(
-            "SOUR:DELT:DEL?",
+            keithley_6221.DELAY_QUERY,
             delay,
             api,
         )
         self._expect_integer(
-            "SOUR:DELT:COUN?",
+            keithley_6221.COUNT_QUERY,
             count,
             api,
         )
         for query in (
-            "SOUR:DELT:CSW?",
-            "SOUR:DELT:CAB?",
+            keithley_6221.COLD_SWITCH_QUERY,
+            keithley_6221.COMPLIANCE_ABORT_QUERY,
         ):
             if not self._parse_switch(
                 self._query_6221(query, api),
@@ -943,38 +799,28 @@ class Keithley6221DeltaBackend:
             key: value
             for key, _label, value in VOLTAGE_RANGES
         }
+        for command in keithley_2182a.range_commands(voltage_range, ranges):
+            self._serial_write(command, api)
         if voltage_range == "auto":
-            self._serial_write(
-                "VOLT:RANG:AUTO ON",
-                api,
-            )
             self._expect_serial_switch(
-                "VOLT:RANG:AUTO?",
+                keithley_2182a.RANGE_AUTO_QUERY,
                 True,
                 api,
             )
         else:
             value = ranges[voltage_range]
             assert value is not None
-            self._serial_write(
-                "VOLT:RANG:AUTO OFF",
-                api,
-            )
-            self._serial_write(
-                f"VOLT:RANG {self._scpi_number(value)}",
-                api,
-            )
             self._expect_serial_switch(
-                "VOLT:RANG:AUTO?",
+                keithley_2182a.RANGE_AUTO_QUERY,
                 False,
                 api,
             )
             actual = self._parse_float(
                 self._serial_query(
-                    "VOLT:RANG?",
+                    keithley_2182a.RANGE_QUERY,
                     api,
                 ),
-                "VOLT:RANG?",
+                keithley_2182a.RANGE_QUERY,
             )
             if not math.isclose(
                 actual,
@@ -986,17 +832,17 @@ class Keithley6221DeltaBackend:
                     "2182A voltage range readback does not "
                     "match the requested setting",
                     "K6221_SETTINGS_VERIFY_FAILED",
-                    "VOLT:RANG",
+                    keithley_2182a.RANGE_SETTING,
                 )
 
         nplc = int(settings["nplc"])
         self._serial_write(
-            f"VOLT:NPLC {nplc}",
+            keithley_2182a.nplc_command(nplc),
             api,
         )
         actual_nplc = self._parse_float(
-            self._serial_query("VOLT:NPLC?", api),
-            "VOLT:NPLC?",
+            self._serial_query(keithley_2182a.NPLC_QUERY, api),
+            keithley_2182a.NPLC_QUERY,
         )
         if not math.isclose(
             actual_nplc,
@@ -1007,48 +853,22 @@ class Keithley6221DeltaBackend:
             raise ModuleError(
                 "2182A NPLC readback does not match",
                 "K6221_SETTINGS_VERIFY_FAILED",
-                "VOLT:NPLC",
+                keithley_2182a.NPLC_SETTING,
             )
 
         analog = bool(settings["analog_filter_enabled"])
         digital = bool(
             settings["digital_filter_enabled"]
         )
-        self._serial_write(
-            f"VOLT:LPAS {'ON' if analog else 'OFF'}",
-            api,
-        )
-        self._serial_write(
-            "VOLT:DFIL:TCON MOV",
-            api,
-        )
-        self._serial_write(
-            "VOLT:DFIL:COUN "
-            f"{int(settings['digital_filter_count'])}",
-            api,
-        )
-        self._serial_write(
-            "VOLT:DFIL:WIND "
-            + self._scpi_number(
-                float(
-                    settings[
-                        "digital_filter_window_percent"
-                    ]
-                )
-            ),
-            api,
-        )
-        self._serial_write(
-            f"VOLT:DFIL:STAT {'ON' if digital else 'OFF'}",
-            api,
-        )
+        for command in keithley_2182a.filter_commands(settings):
+            self._serial_write(command, api)
         self._expect_serial_switch(
-            "VOLT:LPAS?",
+            keithley_2182a.ANALOG_FILTER_QUERY,
             analog,
             api,
         )
         self._expect_serial_switch(
-            "VOLT:DFIL:STAT?",
+            keithley_2182a.DIGITAL_FILTER_QUERY,
             digital,
             api,
         )
@@ -1059,7 +879,7 @@ class Keithley6221DeltaBackend:
     ) -> None:
         """发送 ARM，等待用户指定的 3 秒，再查询确认。"""
 
-        self._write_6221("SOUR:DELT:ARM", api)
+        self._write_6221(keithley_6221.ARM, api)
         self.armed = False
         self.last_status = "Arming"
         api.status(self._status())
@@ -1074,12 +894,12 @@ class Keithley6221DeltaBackend:
         api: ModuleAPI,
     ) -> None:
         reply = self._query_6221(
-            "SOUR:DELT:ARM?",
+            keithley_6221.ARM_QUERY,
             api,
         )
         self.armed = self._parse_switch(
             reply,
-            "SOUR:DELT:ARM?",
+            keithley_6221.ARM_QUERY,
         )
         if not self.armed:
             raise ModuleError(
@@ -1100,7 +920,7 @@ class Keithley6221DeltaBackend:
         """软件触发有限 Delta 采集并读取预数学电压缓冲。"""
 
         self._verify_armed(api)
-        self._write_6221("INIT:IMM", api)
+        self._write_6221(keithley_6221.TRIGGER, api)
         completion_timeout = (
             operation_deadline - time.monotonic()
         )
@@ -1114,7 +934,7 @@ class Keithley6221DeltaBackend:
                 "K6221_MEASURE_TIMEOUT_UNSAFE",
             )
         completion = self._query_6221(
-            "*OPC?",
+            keithley_6221.COMPLETE_QUERY,
             api,
             timeout_seconds=completion_timeout,
         )
@@ -1125,7 +945,7 @@ class Keithley6221DeltaBackend:
                 "K6221_MEASUREMENT_NOT_COMPLETE",
             )
         trace = self._query_6221(
-            "TRAC:DATA?",
+            keithley_6221.TRACE_QUERY,
             api,
         )
         self._raise_if_instrument_error(api)
@@ -1147,62 +967,13 @@ class Keithley6221DeltaBackend:
     ]:
         """解析纯 READ 格式，并产生本模块自己的整数数据质量码。"""
 
-        stripped = reply.strip()
-        tokens = (
-            re.split(r"[,;\r\n]+", stripped)
-            if stripped
-            else []
+        values, issues, invalid_trace, over_range = keithley_2182a.parse_trace(
+            reply,
+            expected_count,
         )
-        values: list[float] = []
-        issues: list[str] = []
-        invalid_trace = False
-        over_range = False
-        for index, token in enumerate(tokens, start=1):
-            item = token.strip()
-            if self._TRACE_TOKEN.fullmatch(item) is None:
-                invalid_trace = True
-                issues.append(
-                    f"sample {index} is not numeric ({item!r})"
-                )
-                continue
-            try:
-                value = float(
-                    re.sub(r"[vV]\s*$", "", item).strip()
-                )
-            except ValueError:
-                invalid_trace = True
-                issues.append(
-                    f"sample {index} cannot be parsed"
-                )
-                continue
-            if not math.isfinite(value):
-                invalid_trace = True
-                issues.append(
-                    f"sample {index} is not finite"
-                )
-                continue
-            values.append(value)
-            # 2182A DCV1 最大 100 V 量程允许约 20% overrange；超过 120 V 的
-            # 数字通常是 overflow sentinel 或格式错位，仍原样写 rawdata。
-            if abs(value) > 120.0:
-                over_range = True
-                issues.append(
-                    f"sample {index} exceeds the 2182A range"
-                )
-        if len(tokens) != expected_count:
-            invalid_trace = True
-            issues.append(
-                f"expected {expected_count} samples, "
-                f"received {len(tokens)}"
-            )
-        if len(values) != len(tokens):
-            invalid_trace = True
-            issues.append(
-                f"only {len(values)} samples were numeric"
-            )
         return (
-            tuple(values),
-            tuple(dict.fromkeys(issues)),
+            values,
+            issues,
             (
                 STATUS_CODE_INVALID_TRACE
                 if invalid_trace
@@ -1220,49 +991,54 @@ class Keithley6221DeltaBackend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        if not self.switcher_available:
+        if self.switcher_type == SWITCHER_NONE:
             if channel != "ch1":
                 raise ModuleError(
-                    "7001 is unavailable; only CH1 may be measured",
+                    "Switcher type is None; only CH1 may be measured",
                     "K6221_SWITCHER_UNAVAILABLE",
                     channel,
                 )
             self.active_channel = "CH1"
             return
-        if self.transport_7001 is None:
+        if self.transport_switcher is None:
             raise ModuleError(
-                "7001 transport is not connected",
+                f"{self.switcher_type} transport is not connected",
                 "K6221_SWITCHER_NOT_CONNECTED",
             )
-
-        # Break-before-make：先打开全部触点并查询所有配置路由，再闭合目标四路并
-        # 逐项确认。任何不确定状态都在触发电流前成为 Error。
-        self._write_7001("ROUT:OPEN ALL", api)
-        opened = self._query_7001(
-            "ROUT:OPEN? " + self.routing.all_list_text,
-            api,
-        )
-        self._expect_route_states(
-            opened,
-            len(self.routing.all_routes),
-            expected=True,
-            command="ROUT:OPEN?",
-        )
-        target = self.routing.list_text(channel)
-        self._write_7001(
-            "ROUT:CLOS " + target,
-            api,
-        )
-        closed = self._query_7001(
-            "ROUT:CLOS? " + target,
-            api,
-        )
-        self._expect_route_states(
-            closed,
-            len(self.routing.channels[channel]),
-            expected=True,
-            command="ROUT:CLOS?",
-        )
+        routing = self.routing_table.for_switcher(self.switcher_type)
+        target = routing.channels[channel]
+        # 两种切换器都严格执行 break-before-make，并在触发电流前读回整机状态。
+        if self.switcher_type == SWITCHER_7001:
+            self._write_switcher(keithley_7001.OPEN_ALL, api)
+            self._expect_7001_states(
+                self._query_switcher(
+                    keithley_7001.open_query(routing.all_routes),
+                    api,
+                ),
+                len(routing.all_routes),
+                expected=True,
+                command=keithley_7001.open_query(routing.all_routes),
+            )
+            self._write_switcher(keithley_7001.close_command(target), api)
+            self._expect_7001_states(
+                self._query_switcher(keithley_7001.close_query(target), api),
+                len(target),
+                expected=True,
+                command=keithley_7001.close_query(target),
+            )
+        else:
+            self._write_switcher(keithley_3706a.OPEN_ALL, api)
+            self._expect_3706a_routes(
+                self._query_switcher(keithley_3706a.CLOSED_QUERY, api),
+                frozenset(),
+                keithley_3706a.OPEN_ALL,
+            )
+            self._write_switcher(keithley_3706a.close_command(target), api)
+            self._expect_3706a_routes(
+                self._query_switcher(keithley_3706a.CLOSED_QUERY, api),
+                frozenset(target),
+                keithley_3706a.close_command(target),
+            )
         self.active_channel = channel.upper()
         api.status(self._status())
         self._waiter(
@@ -1271,26 +1047,46 @@ class Keithley6221DeltaBackend:
         )
 
     @staticmethod
-    def _expect_route_states(
+    def _expect_7001_states(
         reply: str,
         count: int,
         *,
         expected: bool,
         command: str,
     ) -> None:
-        tokens = [
-            item.strip()
-            for item in re.split(r"[,;\s]+", reply.strip())
-            if item.strip()
-        ]
-        wanted = "1" if expected else "0"
-        if len(tokens) != count or any(
-            token not in {wanted, f"+{wanted}"}
-            for token in tokens
-        ):
+        try:
+            states = keithley_7001.parse_route_states(reply, count)
+        except ValueError as exc:
             raise ModuleError(
-                f"{command} returned {reply!r}; expected "
-                f"{count} confirmed states of {wanted}",
+                f"{command} returned invalid route states {reply!r}",
+                "K6221_SWITCHER_VERIFY_FAILED",
+                command,
+            ) from exc
+        if any(state is not expected for state in states):
+            raise ModuleError(
+                f"{command} did not confirm every route as {expected}",
+                "K6221_SWITCHER_VERIFY_FAILED",
+                command,
+            )
+
+    @staticmethod
+    def _expect_3706a_routes(
+        reply: str,
+        expected: frozenset[str],
+        command: str,
+    ) -> None:
+        try:
+            actual = keithley_3706a.parse_closed_routes(reply)
+        except ValueError as exc:
+            raise ModuleError(
+                f"{command} returned invalid closed routes {reply!r}",
+                "K6221_SWITCHER_VERIFY_FAILED",
+                command,
+            ) from exc
+        if actual != expected:
+            raise ModuleError(
+                f"{command} left {sorted(actual)!r} closed; expected "
+                f"{sorted(expected)!r}",
                 "K6221_SWITCHER_VERIFY_FAILED",
                 command,
             )
@@ -1306,31 +1102,37 @@ class Keithley6221DeltaBackend:
         # 成“安全关闭失败”。
         if (
             self.transport_6221 is None
-            and self.transport_7001 is None
+            and self.transport_switcher is None
         ):
             self.armed = False
             self.active_channel = ""
             return
         self._enter_safe_source_state(api)
-        if self.switcher_available:
-            if self.transport_7001 is None:
+        if self.switcher_type != SWITCHER_NONE:
+            if self.transport_switcher is None:
                 raise ModuleError(
-                    "Cannot confirm 7001 routes are open because "
+                    f"Cannot confirm {self.switcher_type} routes are open because "
                     "the switcher is not connected",
                     "K6221_SAFE_STATE_FAILED",
-                    "7001",
+                    self.switcher_type,
                 )
-            self._write_7001("ROUT:OPEN ALL", api)
-            reply = self._query_7001(
-                "ROUT:OPEN? " + self.routing.all_list_text,
-                api,
-            )
-            self._expect_route_states(
-                reply,
-                len(self.routing.all_routes),
-                expected=True,
-                command="ROUT:OPEN?",
-            )
+            routing = self.routing_table.for_switcher(self.switcher_type)
+            if self.switcher_type == SWITCHER_7001:
+                self._write_switcher(keithley_7001.OPEN_ALL, api)
+                command = keithley_7001.open_query(routing.all_routes)
+                self._expect_7001_states(
+                    self._query_switcher(command, api),
+                    len(routing.all_routes),
+                    expected=True,
+                    command=command,
+                )
+            else:
+                self._write_switcher(keithley_3706a.OPEN_ALL, api)
+                self._expect_3706a_routes(
+                    self._query_switcher(keithley_3706a.CLOSED_QUERY, api),
+                    frozenset(),
+                    keithley_3706a.OPEN_ALL,
+                )
         self.active_channel = ""
 
     def _enter_safe_source_state(
@@ -1340,15 +1142,15 @@ class Keithley6221DeltaBackend:
         if self.transport_6221 is None:
             self.armed = False
             return
-        self._write_6221("SOUR:SWE:ABOR", api)
-        self._write_6221("SOUR:CLE", api)
+        self._write_6221(keithley_6221.ABORT, api)
+        self._write_6221(keithley_6221.CLEAR, api)
         output = self._parse_switch(
-            self._query_6221("OUTP?", api),
-            "OUTP?",
+            self._query_6221(keithley_6221.OUTPUT_QUERY, api),
+            keithley_6221.OUTPUT_QUERY,
         )
         current = self._parse_float(
-            self._query_6221("SOUR:CURR?", api),
-            "SOUR:CURR?",
+            self._query_6221(keithley_6221.CURRENT_QUERY, api),
+            keithley_6221.CURRENT_QUERY,
         )
         self.armed = False
         if output or not self._is_zero_current(current):
@@ -1365,10 +1167,10 @@ class Keithley6221DeltaBackend:
     ) -> None:
         current = self._parse_float(
             self._query_6221(
-                "SOUR:CURR?",
+                keithley_6221.CURRENT_QUERY,
                 api,
             ),
-            "SOUR:CURR?",
+            keithley_6221.CURRENT_QUERY,
         )
         if not self._is_zero_current(current):
             raise ModuleError(
@@ -1391,19 +1193,23 @@ class Keithley6221DeltaBackend:
 
         if self.transport_6221 is not None:
             for command in (
-                "SOUR:SWE:ABOR",
-                "SOUR:CLE",
+                keithley_6221.ABORT,
+                keithley_6221.CLEAR,
             ):
                 try:
                     self.transport_6221.write(command)
                 except Exception:
                     pass
         if (
-            self.switcher_available
-            and self.transport_7001 is not None
+            self.switcher_type != SWITCHER_NONE
+            and self.transport_switcher is not None
         ):
             try:
-                self.transport_7001.write("ROUT:OPEN ALL")
+                self.transport_switcher.write(
+                    keithley_7001.OPEN_ALL
+                    if self.switcher_type == SWITCHER_7001
+                    else keithley_3706a.OPEN_ALL
+                )
             except Exception:
                 pass
         self.armed = False
@@ -1465,15 +1271,15 @@ class Keithley6221DeltaBackend:
         api.sleep(0)
         return str(result).strip()
 
-    def _write_7001(
+    def _write_switcher(
         self,
         command: str,
         api: ModuleAPI,
     ) -> None:
-        transport = self.transport_7001
+        transport = self.transport_switcher
         if transport is None:
             raise ModuleError(
-                "7001 is not connected",
+                f"{self.switcher_type} is not connected",
                 "K6221_SWITCHER_NOT_CONNECTED",
             )
         api.sleep(0)
@@ -1481,22 +1287,22 @@ class Keithley6221DeltaBackend:
             transport.write(command)
         except Exception as exc:
             raise ModuleError(
-                f"7001 command failed: {command}: "
+                f"{self.switcher_type} command failed: {command}: "
                 f"{type(exc).__name__}: {exc}",
                 "K6221_SWITCHER_COMMUNICATION_FAILED",
                 command,
             ) from exc
         api.sleep(0)
 
-    def _query_7001(
+    def _query_switcher(
         self,
         command: str,
         api: ModuleAPI,
     ) -> str:
-        transport = self.transport_7001
+        transport = self.transport_switcher
         if transport is None:
             raise ModuleError(
-                "7001 is not connected",
+                f"{self.switcher_type} is not connected",
                 "K6221_SWITCHER_NOT_CONNECTED",
             )
         api.sleep(0)
@@ -1504,7 +1310,7 @@ class Keithley6221DeltaBackend:
             result = transport.query(command)
         except Exception as exc:
             raise ModuleError(
-                f"7001 query failed: {command}: "
+                f"{self.switcher_type} query failed: {command}: "
                 f"{type(exc).__name__}: {exc}",
                 "K6221_SWITCHER_COMMUNICATION_FAILED",
                 command,
@@ -1517,9 +1323,8 @@ class Keithley6221DeltaBackend:
         command: str,
         api: ModuleAPI,
     ) -> None:
-        escaped = command.replace('"', '""')
         self._write_6221(
-            f'SYST:COMM:SER:SEND "{escaped}"',
+            keithley_6221.serial_send(command),
             api,
         )
 
@@ -1530,7 +1335,7 @@ class Keithley6221DeltaBackend:
     ) -> str:
         self._serial_write(command, api)
         return self._query_6221(
-            "SYST:COMM:SER:ENT?",
+            keithley_6221.SERIAL_ENTER_QUERY,
             api,
         )
 
@@ -1538,18 +1343,16 @@ class Keithley6221DeltaBackend:
         self,
         api: ModuleAPI,
     ) -> None:
-        reply = self._query_6221("SYST:ERR?", api)
-        matched = re.match(
-            r"^\s*([+-]?\d+)\s*(?:,|$)",
-            reply,
-        )
-        if matched is None:
+        reply = self._query_6221(keithley_6221.ERROR_QUERY, api)
+        try:
+            error_code = keithley_6221.parse_error_code(reply)
+        except ValueError as exc:
             raise ModuleError(
                 f"6221 returned invalid error status {reply!r}",
                 "K6221_INVALID_REPLY",
-                "SYST:ERR?",
-            )
-        if int(matched.group(1)) != 0:
+                keithley_6221.ERROR_QUERY,
+            ) from exc
+        if error_code != 0:
             raise ModuleError(
                 f"6221 reported an instrument error: {reply}",
                 "K6221_INSTRUMENT_ERROR",
@@ -1628,42 +1431,28 @@ class Keithley6221DeltaBackend:
         reply: str,
         command: str,
     ) -> bool:
-        normalized = reply.strip().upper()
-        if normalized in {"1", "+1", "ON"}:
-            return True
-        if normalized in {"0", "+0", "OFF"}:
-            return False
-        raise ModuleError(
-            f"{command} returned invalid state {reply!r}",
-            "K6221_INVALID_REPLY",
-            command,
-        )
+        try:
+            return keithley_6221.parse_switch(reply)
+        except ValueError as exc:
+            raise ModuleError(
+                f"{command} returned invalid state {reply!r}",
+                "K6221_INVALID_REPLY",
+                command,
+            ) from exc
 
     @staticmethod
     def _parse_float(
         reply: str,
         command: str,
     ) -> float:
-        token = reply.strip().split(",", 1)[0].strip()
         try:
-            result = float(token)
-        except ValueError as exc:
+            return keithley_6221.parse_number(reply)
+        except (TypeError, ValueError) as exc:
             raise ModuleError(
                 f"{command} returned invalid number {reply!r}",
                 "K6221_INVALID_REPLY",
                 command,
             ) from exc
-        if not math.isfinite(result):
-            raise ModuleError(
-                f"{command} returned a non-finite number",
-                "K6221_INVALID_REPLY",
-                command,
-            )
-        return result
-
-    @staticmethod
-    def _scpi_number(value: float) -> str:
-        return f"{float(value):.12g}"
 
     @staticmethod
     def _effective_current(
@@ -1679,10 +1468,10 @@ class Keithley6221DeltaBackend:
         self,
         settings: Mapping[str, Any],
     ) -> list[str]:
-        if not self.switcher_available:
+        if self.switcher_type == SWITCHER_NONE:
             if not bool(settings["channels"]["ch1"]["enabled"]):
                 raise ModuleError(
-                    "Enable CH1 when 7001 is unavailable",
+                    "Enable CH1 when Switcher is None",
                     "K6221_INVALID_SETTINGS",
                     "channels.ch1.enabled",
                 )
@@ -1721,11 +1510,11 @@ class Keithley6221DeltaBackend:
                 "K6221_NOT_CONNECTED",
             )
         if (
-            self.switcher_available
-            and self.transport_7001 is None
+            self.switcher_type != SWITCHER_NONE
+            and self.transport_switcher is None
         ):
             raise ModuleError(
-                "7001 transport is not connected",
+                f"{self.switcher_type} transport is not connected",
                 "K6221_SWITCHER_NOT_CONNECTED",
             )
         return self.applied_settings
@@ -1748,20 +1537,17 @@ class Keithley6221DeltaBackend:
             "State": self.last_status,
             "6221": self.identity_6221 or "Not connected",
             "2182A": self.identity_2182a or "Not verified",
-            "7001": (
-                "Not checked"
-                if not self.switcher_detection_complete
-                else (
-                    self.identity_7001
-                    if self.switcher_available
-                    else "Unavailable - CH1 only"
-                )
+            "Switcher Type": self.switcher_type,
+            "Switcher": (
+                "None - CH1 only"
+                if self.switcher_type == SWITCHER_NONE
+                else (self.identity_switcher or "Not connected")
             ),
             "Armed": self.armed,
             "Sequence Active": self.sequence_active,
             "Active Channel": self.active_channel or "-",
             "Routing Config": str(
-                self.routing.source_path
+                self.routing_table.source_path
             ),
             "ARM Wait": f"{ARM_SETTLE_SECONDS:g} s",
         }
@@ -1786,17 +1572,18 @@ class Keithley6221DeltaBackend:
             finally:
                 self.transport_6221 = None
 
-    def _close_transport_7001(self) -> None:
-        if self.transport_7001 is not None:
+    def _close_transport_switcher(self) -> None:
+        if self.transport_switcher is not None:
             try:
-                self.transport_7001.close()
+                self.transport_switcher.close()
             finally:
-                self.transport_7001 = None
+                self.transport_switcher = None
+                self.identity_switcher = ""
 
     def _close_transports(self) -> None:
         first_error: Exception | None = None
         for closer in (
-            self._close_transport_7001,
+            self._close_transport_switcher,
             self._close_transport_6221,
         ):
             try:
@@ -1805,7 +1592,7 @@ class Keithley6221DeltaBackend:
                 first_error = first_error or exc
         # close 方法异常时也必须丢弃本地引用；不能让后续 UI 误以为还能复用一个
         # 已经部分关闭、状态未知的 VISA 会话。
-        self.transport_7001 = None
+        self.transport_switcher = None
         self.transport_6221 = None
         if first_error is not None:
             raise ModuleError(
@@ -1821,7 +1608,6 @@ class Keithley6221DeltaBackend:
         require_6221: bool,
         require_measurement: bool,
         operation_timeout_seconds: float,
-        ch1_only: bool = False,
     ) -> dict[str, Any]:
         """合并默认值并在 worker 内重做全部边界验证。"""
 
@@ -1832,13 +1618,26 @@ class Keithley6221DeltaBackend:
             )
         defaults = default_settings()
         result: dict[str, Any] = {}
+        switcher_type = str(
+            raw.get("switcher_type", defaults["switcher_type"])
+        ).strip().casefold()
+        allowed_switchers = {key for key, _label in SWITCHER_TYPES}
+        if switcher_type not in allowed_switchers:
+            raise ModuleError(
+                "switcher_type must be none, 7001, or 3706a",
+                "K6221_INVALID_SETTINGS",
+                "switcher_type",
+            )
+        result["switcher_type"] = switcher_type
         for key in (
             "resource_6221",
-            "resource_7001",
+            "resource_switcher",
         ):
             value = str(
                 raw.get(key, defaults[key])
             ).strip()
+            if key == "resource_switcher" and switcher_type == SWITCHER_NONE:
+                value = ""
             if value and not value.upper().startswith(
                 "GPIB"
             ):
@@ -1853,6 +1652,23 @@ class Keithley6221DeltaBackend:
                 "Select the Keithley 6221 GPIB resource",
                 "K6221_INVALID_SETTINGS",
                 "resource_6221",
+            )
+        if switcher_type != SWITCHER_NONE and not result["resource_switcher"]:
+            raise ModuleError(
+                "Select the switcher GPIB resource",
+                "K6221_INVALID_SETTINGS",
+                "resource_switcher",
+            )
+        if (
+            switcher_type != SWITCHER_NONE
+            and result["resource_switcher"]
+            and result["resource_6221"].casefold()
+            == result["resource_switcher"].casefold()
+        ):
+            raise ModuleError(
+                "Keithley 6221 and switcher must use different VISA resources",
+                "K6221_INVALID_SETTINGS",
+                "resource_switcher",
             )
 
         mode = str(
@@ -1949,25 +1765,28 @@ class Keithley6221DeltaBackend:
             )
 
         if require_measurement:
-            enabled = (
-                ["ch1"]
-                if ch1_only
-                else [
-                    key
-                    for key, channel in result[
-                        "channels"
-                    ].items()
-                    if channel["enabled"]
-                ]
-            )
-            if ch1_only and not result["channels"][
-                "ch1"
-            ]["enabled"]:
+            enabled = [
+                key
+                for key, channel in result["channels"].items()
+                if channel["enabled"]
+            ]
+            if switcher_type == SWITCHER_NONE and not result["channels"]["ch1"]["enabled"]:
                 raise ModuleError(
-                    "Enable CH1 because 7001 is unavailable",
+                    "Enable CH1 when Switcher is None",
                     "K6221_INVALID_SETTINGS",
                     "channels.ch1.enabled",
                 )
+            if switcher_type == SWITCHER_NONE and any(
+                result["channels"][f"ch{index}"]["enabled"]
+                for index in range(2, 5)
+            ):
+                raise ModuleError(
+                    "Disable CH2-CH4 when Switcher is None",
+                    "K6221_INVALID_SETTINGS",
+                    "channels",
+                )
+            if switcher_type == SWITCHER_NONE:
+                enabled = ["ch1"]
             if not enabled:
                 raise ModuleError(
                     "Enable at least one channel",
@@ -2350,8 +2169,6 @@ class Keithley6221DeltaBackend:
 Module = Keithley6221DeltaBackend
 
 __all__ = [
-    "InstrumentTransport",
     "Keithley6221DeltaBackend",
     "Module",
-    "PyVisaTransport",
 ]

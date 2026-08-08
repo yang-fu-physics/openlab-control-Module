@@ -7,12 +7,10 @@ NPLC、autorange 和高阻输出关闭模式，并逐项通过 ``print(...)`` �
 
 from __future__ import annotations
 
-import importlib
 import math
-import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from typing import Any, Protocol
+from typing import Any
 
 from labcontrol.module_api import (
     ModuleError,
@@ -40,67 +38,14 @@ from .constants import (
     default_settings,
 )
 from .quantities import parse_quantity
+from . import keithley_2614b as instrument
 
 
 _READING_SENTINEL = 9.0e36
 _CLEANUP_RESERVE_SECONDS = 4.0
-_MEASUREMENT_SPLIT = re.compile(r"[\s,]+")
-
-
-class InstrumentTransport(Protocol):
-    def write(self, command: str) -> None: ...
-
-    def query(self, command: str) -> str: ...
-
-    def close(self) -> None: ...
-
-
-TransportFactory = Callable[[str, float], InstrumentTransport]
+TransportFactory = Callable[[str, float], instrument.Transport]
 ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
-
-
-class PyVisaTransport:
-    """2614B GPIB/TSP 的有限超时 PyVISA 适配器。"""
-
-    def __init__(self, resource_name: str, timeout_seconds: float) -> None:
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        try:
-            self._instrument = self._manager.open_resource(resource_name)
-            self._instrument.timeout = max(1, int(timeout_seconds * 1000))
-            self._instrument.read_termination = "\n"
-            self._instrument.write_termination = "\n"
-        except Exception:
-            self._manager.close()
-            raise
-
-    @staticmethod
-    def list_resources() -> tuple[str, ...]:
-        pyvisa = importlib.import_module("pyvisa")
-        manager = pyvisa.ResourceManager()
-        try:
-            resources = tuple(str(item) for item in manager.list_resources())
-        finally:
-            manager.close()
-        return tuple(
-            sorted(
-                {item for item in resources if item.upper().startswith("GPIB")},
-                key=str.casefold,
-            )
-        )
-
-    def write(self, command: str) -> None:
-        self._instrument.write(command)
-
-    def query(self, command: str) -> str:
-        return str(self._instrument.query(command))
-
-    def close(self) -> None:
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
 
 
 class Keithley2614BBackend:
@@ -123,12 +68,14 @@ class Keithley2614BBackend:
         resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
     ) -> None:
-        self._transport_factory = transport_factory or PyVisaTransport
-        self._resource_lister = resource_lister or PyVisaTransport.list_resources
+        self._transport_factory = transport_factory or instrument.PyVisaTransport
+        self._resource_lister = (
+            resource_lister or instrument.PyVisaTransport.list_resources
+        )
         self._waiter = waiter or (
             lambda api, seconds: api.sleep(seconds)
         )
-        self.transport: InstrumentTransport | None = None
+        self.transport: instrument.Transport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
         self.applied_settings: dict[str, Any] | None = None
         self.available_resources: tuple[str, ...] = ()
@@ -286,7 +233,7 @@ class Keithley2614BBackend:
                 # 防止联锁或前面板动作已经关闭某一路却让状态页继续显示 retained。
                 for key, smu, _number in channels:
                     if not self._query_bool(
-                        f"print({smu}.source.output == {smu}.OUTPUT_ON)",
+                        instrument.output_query(smu),
                         api,
                     ):
                         raise ModuleError(
@@ -401,7 +348,7 @@ class Keithley2614BBackend:
             states: list[str] = []
             for key, smu, _number in CHANNELS:
                 enabled = self._query_bool(
-                    f"print({smu}.source.output == {smu}.OUTPUT_ON)",
+                    instrument.output_query(smu),
                     api,
                 )
                 self.output_states[key] = "On" if enabled else "Off"
@@ -497,7 +444,7 @@ class Keithley2614BBackend:
                 resource,
             ) from exc
         try:
-            identity = self._query("*IDN?", api)
+            identity = self._query(instrument.IDENTIFY, api)
             self._validate_identity(identity)
         except Exception:
             self._close_transport_silently()
@@ -513,7 +460,9 @@ class Keithley2614BBackend:
         timeout = float(settings["io_timeout_seconds"])
         if self.transport is not None and self.applied_settings is not None:
             if str(self.applied_settings["resource"]) == resource:
-                self._validate_identity(self._query("*IDN?", api))
+                self._validate_identity(
+                    self._query(instrument.IDENTIFY, api)
+                )
                 return
         try:
             temporary = self._transport_factory(resource, timeout)
@@ -526,7 +475,9 @@ class Keithley2614BBackend:
             ) from exc
         try:
             api.sleep(0)
-            self._validate_identity(str(temporary.query("*IDN?")).strip())
+            self._validate_identity(
+                str(temporary.query(instrument.IDENTIFY)).strip()
+            )
             api.sleep(0)
         except ModuleError:
             raise
@@ -534,19 +485,18 @@ class Keithley2614BBackend:
             raise ModuleError(
                 f"2614B identity query failed: {type(exc).__name__}: {exc}",
                 "K2614B_IO_FAILED",
-                "*IDN?",
+                instrument.IDENTIFY,
             ) from exc
         finally:
             temporary.close()
 
     @staticmethod
     def _validate_identity(identity: str) -> None:
-        normalized = " ".join(identity.upper().replace(",", " ").split())
-        if "KEITHLEY" not in normalized or "2614B" not in normalized:
+        if not instrument.validate_identity(identity):
             raise ModuleError(
                 f"Expected Keithley Model 2614B, received {identity!r}",
                 "K2614B_IDENTITY_MISMATCH",
-                "*IDN?",
+                instrument.IDENTIFY,
             )
 
     def _configure_high_impedance_off(
@@ -555,11 +505,11 @@ class Keithley2614BBackend:
     ) -> None:
         for key, smu, _number in CHANNELS:
             self._write(
-                f"{smu}.source.offmode = {smu}.OUTPUT_HIGH_Z",
+                instrument.high_impedance_command(smu),
                 api,
             )
             high_z = self._query_bool(
-                f"print({smu}.source.offmode == {smu}.OUTPUT_HIGH_Z)",
+                instrument.high_impedance_query(smu),
                 api,
             )
             if not high_z:
@@ -571,7 +521,7 @@ class Keithley2614BBackend:
     ) -> None:
         for key, smu, _number in CHANNELS:
             if not self._query_bool(
-                f"print({smu}.source.offmode == {smu}.OUTPUT_HIGH_Z)",
+                instrument.high_impedance_query(smu),
                 api,
             ):
                 self._settings_mismatch(f"{key}.offmode", "HIGH_Z", "other")
@@ -584,67 +534,8 @@ class Keithley2614BBackend:
         api: ModuleAPI,
     ) -> None:
         self._set_channel_output(key, smu, False, api)
-        self._write(
-            f"{smu}.source.offmode = {smu}.OUTPUT_HIGH_Z",
-            api,
-        )
-        mode = str(settings["source_mode"])
-        if mode == SOURCE_CURRENT:
-            self._write(
-                f"{smu}.source.func = {smu}.OUTPUT_DCAMPS",
-                api,
-            )
-            self._write(
-                f"{smu}.source.autorangei = {smu}.AUTORANGE_ON",
-                api,
-            )
-            self._write(f"{smu}.source.leveli = 0", api)
-            self._write(
-                f"{smu}.source.limitv = {self._tsp(settings['voltage_limit'])}",
-                api,
-            )
-        else:
-            self._write(
-                f"{smu}.source.func = {smu}.OUTPUT_DCVOLTS",
-                api,
-            )
-            self._write(
-                f"{smu}.source.autorangev = {smu}.AUTORANGE_ON",
-                api,
-            )
-            self._write(f"{smu}.source.levelv = 0", api)
-            self._write(
-                f"{smu}.source.limiti = {self._tsp(settings['current_limit'])}",
-                api,
-            )
-        self._write(
-            f"{smu}.measure.autorangev = {smu}.AUTORANGE_ON",
-            api,
-        )
-        self._write(
-            f"{smu}.measure.autorangei = {smu}.AUTORANGE_ON",
-            api,
-        )
-        self._write(
-            f"{smu}.measure.nplc = {self._tsp(settings['nplc'])}",
-            api,
-        )
-        self._write(
-            f"{smu}.sense = {smu}.SENSE_REMOTE"
-            if settings["sense_mode"] == SENSE_4WIRE
-            else f"{smu}.sense = {smu}.SENSE_LOCAL",
-            api,
-        )
-        if mode == SOURCE_CURRENT:
-            self._write(
-                f"{smu}.source.leveli = {self._tsp(settings['source_current'])}",
-                api,
-            )
-        else:
-            self._write(
-                f"{smu}.source.levelv = {self._tsp(settings['source_voltage'])}",
-                api,
-            )
+        for command in instrument.configuration_commands(smu, settings):
+            self._write(command, api)
         self._verify_channel(key, smu, settings, api)
 
     def _verify_channel(
@@ -657,7 +548,7 @@ class Keithley2614BBackend:
         require_output_off: bool = True,
     ) -> None:
         output_on = self._query_bool(
-            f"print({smu}.source.output == {smu}.OUTPUT_ON)",
+            instrument.output_query(smu),
             api,
         )
         self.output_states[key] = "On" if output_on else "Off"
@@ -668,30 +559,27 @@ class Keithley2614BBackend:
                 key,
             )
         if not self._query_bool(
-            f"print({smu}.source.offmode == {smu}.OUTPUT_HIGH_Z)",
+            instrument.high_impedance_query(smu),
             api,
         ):
             self._settings_mismatch(f"{key}.offmode", "HIGH_Z", "other")
         mode = str(settings["source_mode"])
-        expected_function = (
-            f"{smu}.OUTPUT_DCAMPS"
-            if mode == SOURCE_CURRENT
-            else f"{smu}.OUTPUT_DCVOLTS"
-        )
         if not self._query_bool(
-            f"print({smu}.source.func == {expected_function})",
+            instrument.source_function_query(
+                smu, mode == SOURCE_CURRENT
+            ),
             api,
         ):
             self._settings_mismatch(f"{key}.source_mode", mode, "other")
         if mode == SOURCE_CURRENT:
             self._expect_number(
-                f"print({smu}.source.leveli)",
+                instrument.source_level_query(smu, True),
                 float(settings["source_current"]),
                 f"{key}.source_current",
                 api,
             )
             self._expect_number(
-                f"print({smu}.source.limitv)",
+                instrument.source_limit_query(smu, True),
                 float(settings["voltage_limit"]),
                 f"{key}.voltage_limit",
                 api,
@@ -699,28 +587,33 @@ class Keithley2614BBackend:
             source_autorange = "autorangei"
         else:
             self._expect_number(
-                f"print({smu}.source.levelv)",
+                instrument.source_level_query(smu, False),
                 float(settings["source_voltage"]),
                 f"{key}.source_voltage",
                 api,
             )
             self._expect_number(
-                f"print({smu}.source.limiti)",
+                instrument.source_limit_query(smu, False),
                 float(settings["current_limit"]),
                 f"{key}.current_limit",
                 api,
             )
             source_autorange = "autorangev"
         if not self._query_bool(
-            f"print({smu}.source.{source_autorange} == {smu}.AUTORANGE_ON)",
+            instrument.source_autorange_query(
+                smu, mode == SOURCE_CURRENT
+            ),
             api,
         ):
             self._settings_mismatch(
                 f"{key}.{source_autorange}", "AUTORANGE_ON", "other"
             )
-        for measure_range in ("autorangev", "autorangei"):
+        for measure_range, quantity in (
+            ("autorangev", "v"),
+            ("autorangei", "i"),
+        ):
             if not self._query_bool(
-                f"print({smu}.measure.{measure_range} == {smu}.AUTORANGE_ON)",
+                instrument.measure_autorange_query(smu, quantity),
                 api,
             ):
                 self._settings_mismatch(
@@ -729,13 +622,13 @@ class Keithley2614BBackend:
                     "other",
                 )
         self._expect_number(
-            f"print({smu}.measure.nplc)",
+            instrument.nplc_query(smu),
             float(settings["nplc"]),
             f"{key}.nplc",
             api,
         )
         remote = self._query_bool(
-            f"print({smu}.sense == {smu}.SENSE_REMOTE)",
+            instrument.remote_sense_query(smu),
             api,
         )
         expected_remote = settings["sense_mode"] == SENSE_4WIRE
@@ -750,30 +643,15 @@ class Keithley2614BBackend:
         api: ModuleAPI,
     ) -> tuple[float, float, bool]:
         # 两个测量函数处于同一条 TSP 请求，减少主机往返；返回顺序固定为 V、I、limit。
-        reply = self._query(
-            f"print({smu}.measure.v(), {smu}.measure.i(), "
-            f"{smu}.source.compliance)",
-            api,
-        )
-        parts = [item for item in _MEASUREMENT_SPLIT.split(reply.strip()) if item]
-        if len(parts) != 3:
-            raise ModuleError(
-                f"{smu.upper()} returned {reply!r}; expected voltage, current, "
-                "compliance",
-                "K2614B_INVALID_RESPONSE",
-                smu,
-            )
+        reply = self._query(instrument.measurement_query(smu), api)
         try:
-            voltage = float(parts[0])
-            current = float(parts[1])
+            return instrument.parse_measurement(reply)
         except ValueError as exc:
             raise ModuleError(
-                f"{smu.upper()} returned non-numeric V/I data: {reply!r}",
+                f"{smu.upper()} returned invalid measurement data: {reply!r}",
                 "K2614B_INVALID_RESPONSE",
                 smu,
             ) from exc
-        compliance = self._parse_bool(parts[2], smu)
-        return voltage, current, compliance
 
     @staticmethod
     def _classify_reading(
@@ -804,13 +682,9 @@ class Keithley2614BBackend:
         enabled: bool,
         api: ModuleAPI,
     ) -> None:
-        self._write(
-            f"{smu}.source.output = "
-            f"{smu}.{'OUTPUT_ON' if enabled else 'OUTPUT_OFF'}",
-            api,
-        )
+        self._write(instrument.output_command(smu, enabled), api)
         actual = self._query_bool(
-            f"print({smu}.source.output == {smu}.OUTPUT_ON)",
+            instrument.output_query(smu),
             api,
         )
         self.output_states[key] = "On" if actual else "Off"
@@ -843,12 +717,8 @@ class Keithley2614BBackend:
         failures: list[str] = []
         for key, smu, _number in CHANNELS:
             try:
-                self.transport.write(
-                    f"{smu}.source.output = {smu}.OUTPUT_OFF"
-                )
-                reply = self.transport.query(
-                    f"print({smu}.source.output == {smu}.OUTPUT_ON)"
-                )
+                self.transport.write(instrument.output_command(smu, False))
+                reply = self.transport.query(instrument.output_query(smu))
                 enabled = self._parse_bool(reply, smu)
                 self.output_states[key] = "On" if enabled else "Off"
                 if enabled:
@@ -901,16 +771,14 @@ class Keithley2614BBackend:
 
     @staticmethod
     def _parse_bool(value: object, api: str) -> bool:
-        token = str(value).strip().strip('"').casefold()
-        if token in {"true", "1", "on"}:
-            return True
-        if token in {"false", "0", "off"}:
-            return False
-        raise ModuleError(
-            f"2614B returned invalid boolean {value!r}",
-            "K2614B_INVALID_RESPONSE",
-            api,
-        )
+        try:
+            return instrument.parse_bool(value)
+        except ValueError as exc:
+            raise ModuleError(
+                f"2614B returned invalid boolean {value!r}",
+                "K2614B_INVALID_RESPONSE",
+                api,
+            ) from exc
 
     def _expect_number(
         self,
@@ -921,7 +789,7 @@ class Keithley2614BBackend:
     ) -> None:
         reply = self._query(command, api)
         try:
-            actual = float(reply)
+            actual = instrument.parse_number(reply)
         except ValueError as exc:
             raise ModuleError(
                 f"2614B returned non-numeric readback {reply!r}",
@@ -943,9 +811,9 @@ class Keithley2614BBackend:
 
     @staticmethod
     def _tsp(value: object) -> str:
-        return f"{float(value):.12g}"
+        return instrument.number(value)
 
-    def _require_transport(self) -> InstrumentTransport:
+    def _require_transport(self) -> instrument.Transport:
         if self.transport is None:
             raise ModuleError(
                 "Keithley 2614B is not connected; Apply Settings first",
@@ -1255,4 +1123,4 @@ class Keithley2614BBackend:
 
 Module = Keithley2614BBackend
 
-__all__ = ["Keithley2614BBackend", "Module", "PyVisaTransport"]
+__all__ = ["Keithley2614BBackend", "Module"]

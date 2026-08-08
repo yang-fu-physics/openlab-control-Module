@@ -3,12 +3,13 @@
 这是 Measurement Module 的共享仓库。框架负责加载、进程隔离、Pause/Stop、操作总
 timeout、跨模块并行和 DAT 写入；模块负责仪表协议、通道、状态码和安全动作。
 
-## 最小模块
+## 最小硬件模块
 
 ```text
 modules/my_meter/
 ├─ module.toml
-└─ backend.py
+├─ backend.py
+└─ my_meter.py
 ```
 
 ```toml
@@ -17,32 +18,46 @@ version = "0.1.0"
 ```
 
 ```python
-from labcontrol.module_api import ModuleAPI, ModuleError
+from labcontrol.module_api import ModuleAPI
+from . import my_meter
 
 
 class Module:
     columns = {"Resistance": "Ohm", "StatusCode": ""}
 
     def open(self, api: ModuleAPI):
-        self.instrument = open_instrument(timeout=3.0)
+        self.instrument = my_meter.PyVisaTransport("GPIB0::1::INSTR", 3.0)
 
     def measure(self, slot: int, api: ModuleAPI):
         api.sleep(0)
         return {
-            "Resistance": self.instrument.read(),
+            "Resistance": my_meter.parse_number(
+                self.instrument.query(my_meter.READ)
+            ),
             "StatusCode": 0,
         }
 
     def close(self, api: ModuleAPI):
-        self.instrument.output_off()
+        self.instrument.write(my_meter.OUTPUT_OFF)
         self.instrument.close()
 ```
 
 不继承框架基类。目录名就是 ID，入口固定为 `backend:Module`。`columns` 是有序的
 `{列名: 单位}`。
 
-除此以外，作者可自由增加内部文件、类和相对导入；协议命令与仪表状态机不需要套用
-框架基类、Mixin 或固定目录层次。
+`backend.py` 只保留框架生命周期和流程编排：`open/configure/measure/close`、SEQ
+事件、通道循环、总超时预算、重试决策、Warning/Error 和安全清理。每个物理仪表使用
+一个同名 Python 文件，例如 `my_meter.py`；其中集中放置 VISA/串口适配器、命令常量、
+绝对设置命令构造、身份判断和响应解析。多仪表模块仍只保留一个 `backend.py`，并按
+物理仪表分别建立 `keithley_6221.py`、`keithley_2182a.py` 等文件。
+
+仪表文件不调用 `ModuleAPI`，也不决定重试、报警级别或 SEQ 是否终止。`backend.py`
+不直接拼接 SCPI/TSP 文本；它只调用仪表文件导出的命令和解析函数。这样更换某个仪表
+协议时不会同时改动框架生命周期。纯仿真模块没有物理仪表，可只保留
+`module.toml + backend.py`。
+
+除此以外，作者可自由增加界面、配置或辅助文件；不需要继承框架基类、Mixin，也不
+要求更深的固定目录层次。
 
 ## 接口
 

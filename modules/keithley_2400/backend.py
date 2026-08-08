@@ -10,12 +10,10 @@
 
 from __future__ import annotations
 
-import importlib
 import math
-import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from typing import Any, Protocol
+from typing import Any
 
 from labcontrol.module_api import (
     ModuleError,
@@ -37,68 +35,16 @@ from .constants import (
     default_settings,
 )
 from .quantities import parse_quantity
+from . import keithley_2400 as instrument
 
 
 _READING_SENTINEL = 9.0e36
 _MEASURE_CLEANUP_RESERVE_SECONDS = 3.0
 
 
-class InstrumentTransport(Protocol):
-    """后端实际需要的最小 VISA 接口，便于测试注入内存仪表。"""
-
-    def write(self, command: str) -> None: ...
-
-    def query(self, command: str) -> str: ...
-
-    def close(self) -> None: ...
-
-
-TransportFactory = Callable[[str, float], InstrumentTransport]
+TransportFactory = Callable[[str, float], instrument.Transport]
 ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
-
-
-class PyVisaTransport:
-    """只在独立 Measurement Module worker 内惰性打开 PyVISA。"""
-
-    def __init__(self, resource_name: str, timeout_seconds: float) -> None:
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        try:
-            self._instrument = self._manager.open_resource(resource_name)
-            self._instrument.timeout = max(1, int(timeout_seconds * 1000))
-            self._instrument.read_termination = "\n"
-            self._instrument.write_termination = "\n"
-        except Exception:
-            self._manager.close()
-            raise
-
-    @staticmethod
-    def list_resources() -> tuple[str, ...]:
-        pyvisa = importlib.import_module("pyvisa")
-        manager = pyvisa.ResourceManager()
-        try:
-            resources = tuple(str(item) for item in manager.list_resources())
-        finally:
-            manager.close()
-        return tuple(
-            sorted(
-                {item for item in resources if item.upper().startswith("GPIB")},
-                key=str.casefold,
-            )
-        )
-
-    def write(self, command: str) -> None:
-        self._instrument.write(command)
-
-    def query(self, command: str) -> str:
-        return str(self._instrument.query(command))
-
-    def close(self) -> None:
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
 
 
 class Keithley2400Backend:
@@ -117,12 +63,14 @@ class Keithley2400Backend:
         resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
     ) -> None:
-        self._transport_factory = transport_factory or PyVisaTransport
-        self._resource_lister = resource_lister or PyVisaTransport.list_resources
+        self._transport_factory = transport_factory or instrument.PyVisaTransport
+        self._resource_lister = (
+            resource_lister or instrument.PyVisaTransport.list_resources
+        )
         self._waiter = waiter or (
             lambda api, seconds: api.sleep(seconds)
         )
-        self.transport: InstrumentTransport | None = None
+        self.transport: instrument.Transport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
         self.applied_settings: dict[str, Any] | None = None
         self.available_resources: tuple[str, ...] = ()
@@ -185,7 +133,7 @@ class Keithley2400Backend:
                 self._close_transport()
             self._connect(normalized, api)
             self._set_output(False, api)
-            self._write("*CLS", api)
+            self._write(instrument.CLEAR_STATUS, api)
             self._configure(normalized, api)
             self._set_output(False, api)
             self._raise_if_instrument_error(api)
@@ -257,12 +205,12 @@ class Keithley2400Backend:
         try:
             if output_off:
                 self._set_output(False, api)
-            elif not self._query_switch("OUTP?", api):
+            elif not self._query_switch(instrument.OUTPUT_QUERY, api):
                 raise ModuleError(
                     "2400 output turned off unexpectedly while row-boundary "
                     "retention was enabled",
                     "K2400_OUTPUT_MISMATCH",
-                    "OUTP?",
+                    instrument.OUTPUT_QUERY,
                 )
         except Exception as exc:
             cleanup = self._best_effort_output_off()
@@ -368,9 +316,11 @@ class Keithley2400Backend:
         """只读查询当前输出和基本配置，不隐式连接或 Apply。"""
 
         if self.transport is not None:
-            output = self._query_switch("OUTP?", api)
-            source = self._clean_token(self._query("SOUR:FUNC?", api))
-            sense = self._query_switch("SYST:RSEN?", api)
+            output = self._query_switch(instrument.OUTPUT_QUERY, api)
+            source = self._clean_token(
+                self._query(instrument.SOURCE_FUNCTION_QUERY, api)
+            )
+            sense = self._query_switch(instrument.REMOTE_SENSE_QUERY, api)
             self.last_status = (
                 f"Connected / {source} / "
                 f"{'4-wire' if sense else '2-wire'} / "
@@ -471,7 +421,7 @@ class Keithley2400Backend:
             ) from exc
         self.transport = transport
         try:
-            identity = self._query("*IDN?", api)
+            identity = self._query(instrument.IDENTIFY, api)
             self._validate_identity(identity)
         except Exception:
             self._close_transport_silently()
@@ -488,7 +438,9 @@ class Keithley2400Backend:
         # 已有同一会话时只做身份查询，避免 VISA implementation 拒绝第二个独占 session。
         if self.transport is not None and self.applied_settings is not None:
             if str(self.applied_settings["resource"]) == resource:
-                self._validate_identity(self._query("*IDN?", api))
+                self._validate_identity(
+                    self._query(instrument.IDENTIFY, api)
+                )
                 return
         try:
             temporary = self._transport_factory(resource, timeout)
@@ -501,7 +453,9 @@ class Keithley2400Backend:
             ) from exc
         try:
             api.sleep(0)
-            self._validate_identity(str(temporary.query("*IDN?")).strip())
+            self._validate_identity(
+                str(temporary.query(instrument.IDENTIFY)).strip()
+            )
             api.sleep(0)
         except ModuleError:
             raise
@@ -509,22 +463,18 @@ class Keithley2400Backend:
             raise ModuleError(
                 f"2400 identity query failed: {type(exc).__name__}: {exc}",
                 "K2400_IO_FAILED",
-                "*IDN?",
+                instrument.IDENTIFY,
             ) from exc
         finally:
             temporary.close()
 
     @staticmethod
     def _validate_identity(identity: str) -> None:
-        normalized = " ".join(identity.upper().replace(",", " ").split())
-        if "KEITHLEY" not in normalized or not re.search(
-            r"\bMODEL\s*2400\b|\b2400\b",
-            normalized,
-        ):
+        if not instrument.validate_identity(identity):
             raise ModuleError(
                 f"Expected Keithley Model 2400, received {identity!r}",
                 "K2400_IDENTITY_MISMATCH",
-                "*IDN?",
+                instrument.IDENTIFY,
             )
 
     def _configure(
@@ -532,58 +482,11 @@ class Keithley2400Backend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        mode = str(settings["source_mode"])
         # 电阻必须由同一次触发得到的实际 V/I 计算。2400 手册明确规定 CONC OFF 时
         # 只能启用一个测量函数，因此这里固定同时启用电压和电流；否则 FORM:ELEM 虽然
         # 列出两个字段，未启用的那一项也不代表一次有效测量。
-        self._write("SENS:FUNC:CONC ON", api)
-        self._write("SENS:FUNC:OFF:ALL", api)
-        self._write("SENS:FUNC:ON 'VOLT:DC','CURR:DC'", api)
-        if mode == SOURCE_CURRENT:
-            self._write("SOUR:FUNC CURR", api)
-            self._write("SOUR:CURR:MODE FIX", api)
-            self._write("SOUR:CURR:RANG:AUTO ON", api)
-            self._write(
-                f"SOUR:CURR:LEV {self._scpi(settings['source_current'])}",
-                api,
-            )
-            self._write(
-                "SENS:VOLT:PROT "
-                f"{self._scpi(settings['voltage_compliance'])}",
-                api,
-            )
-            self._write("SENS:VOLT:RANG:AUTO ON", api)
-        else:
-            self._write("SOUR:FUNC VOLT", api)
-            self._write("SOUR:VOLT:MODE FIX", api)
-            self._write("SOUR:VOLT:RANG:AUTO ON", api)
-            self._write(
-                f"SOUR:VOLT:LEV {self._scpi(settings['source_voltage'])}",
-                api,
-            )
-            self._write(
-                "SENS:CURR:PROT "
-                f"{self._scpi(settings['current_compliance'])}",
-                api,
-            )
-            self._write("SENS:CURR:RANG:AUTO ON", api)
-        # 两个实际测量函数使用相同积分时间，避免一项仍沿用前面板旧值。
-        self._write(
-            f"SENS:VOLT:NPLC {self._scpi(settings['nplc'])}",
-            api,
-        )
-        self._write(
-            f"SENS:CURR:NPLC {self._scpi(settings['nplc'])}",
-            api,
-        )
-        self._write(
-            "SYST:RSEN ON"
-            if settings["sense_mode"] == SENSE_4WIRE
-            else "SYST:RSEN OFF",
-            api,
-        )
-        self._write("FORM:DATA ASC", api)
-        self._write("FORM:ELEM VOLT,CURR", api)
+        for command in instrument.configuration_commands(settings):
+            self._write(command, api)
         self._verify_configuration(settings, api)
 
     def _verify_configuration(
@@ -592,38 +495,40 @@ class Keithley2400Backend:
         api: ModuleAPI,
     ) -> None:
         mode = str(settings["source_mode"])
-        actual_source = self._clean_token(self._query("SOUR:FUNC?", api))
+        actual_source = self._clean_token(
+            self._query(instrument.SOURCE_FUNCTION_QUERY, api)
+        )
         expected_source = "CURR" if mode == SOURCE_CURRENT else "VOLT"
         if not actual_source.startswith(expected_source):
             self._settings_mismatch("source_mode", expected_source, actual_source)
 
         if mode == SOURCE_CURRENT:
             self._expect_number(
-                "SOUR:CURR:LEV?",
+                instrument.SOURCE_CURRENT_LEVEL_QUERY,
                 float(settings["source_current"]),
                 "source_current",
                 api,
             )
             self._expect_number(
-                "SENS:VOLT:PROT?",
+                instrument.VOLTAGE_COMPLIANCE_QUERY,
                 float(settings["voltage_compliance"]),
                 "voltage_compliance",
                 api,
             )
         else:
             self._expect_number(
-                "SOUR:VOLT:LEV?",
+                instrument.SOURCE_VOLTAGE_LEVEL_QUERY,
                 float(settings["source_voltage"]),
                 "source_voltage",
                 api,
             )
             self._expect_number(
-                "SENS:CURR:PROT?",
+                instrument.CURRENT_COMPLIANCE_QUERY,
                 float(settings["current_compliance"]),
                 "current_compliance",
                 api,
             )
-        if not self._query_switch("SENS:FUNC:CONC?", api):
+        if not self._query_switch(instrument.CONCURRENT_QUERY, api):
             self._settings_mismatch(
                 "concurrent_measurements",
                 True,
@@ -631,7 +536,9 @@ class Keithley2400Backend:
             )
         actual_functions = {
             self._clean_token(item).split(":", 1)[0]
-            for item in self._query("SENS:FUNC:ON?", api).split(",")
+            for item in self._query(
+                instrument.SENSE_FUNCTIONS_QUERY, api
+            ).split(",")
             if item.strip()
         }
         if actual_functions != {"VOLT", "CURR"}:
@@ -641,8 +548,8 @@ class Keithley2400Backend:
                 ",".join(sorted(actual_functions)),
             )
         for command, field in (
-            ("SENS:VOLT:NPLC?", "voltage_nplc"),
-            ("SENS:CURR:NPLC?", "current_nplc"),
+            (instrument.VOLTAGE_NPLC_QUERY, "voltage_nplc"),
+            (instrument.CURRENT_NPLC_QUERY, "current_nplc"),
         ):
             self._expect_number(
                 command,
@@ -650,13 +557,15 @@ class Keithley2400Backend:
                 field,
                 api,
             )
-        remote = self._query_switch("SYST:RSEN?", api)
+        remote = self._query_switch(instrument.REMOTE_SENSE_QUERY, api)
         expected_remote = settings["sense_mode"] == SENSE_4WIRE
         if remote != expected_remote:
             self._settings_mismatch("sense_mode", expected_remote, remote)
         elements = {
             self._clean_token(item)
-            for item in self._query("FORM:ELEM?", api).split(",")
+            for item in self._query(
+                instrument.DATA_ELEMENTS_QUERY, api
+            ).split(",")
         }
         if elements != {"VOLT", "CURR"}:
             self._settings_mismatch(
@@ -669,21 +578,14 @@ class Keithley2400Backend:
         self,
         api: ModuleAPI,
     ) -> tuple[float, float]:
-        reply = self._query("READ?", api)
-        parts = [item.strip() for item in reply.split(",") if item.strip()]
-        if len(parts) != 2:
-            raise ModuleError(
-                f"2400 READ? returned {reply!r}; expected VOLT,CURR",
-                "K2400_INVALID_RESPONSE",
-                "READ?",
-            )
+        reply = self._query(instrument.READ, api)
         try:
-            return float(parts[0]), float(parts[1])
+            return instrument.parse_voltage_current(reply)
         except ValueError as exc:
             raise ModuleError(
-                f"2400 READ? returned non-numeric data: {reply!r}",
+                f"2400 {instrument.READ} returned invalid data: {reply!r}",
                 "K2400_INVALID_RESPONSE",
-                "READ?",
+                instrument.READ,
             ) from exc
 
     def _read_compliance(
@@ -691,11 +593,7 @@ class Keithley2400Backend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> bool:
-        command = (
-            "SENS:VOLT:PROT:TRIP?"
-            if settings["source_mode"] == SOURCE_CURRENT
-            else "SENS:CURR:PROT:TRIP?"
-        )
+        command = instrument.compliance_query(settings["source_mode"])
         return self._query_switch(command, api)
 
     @staticmethod
@@ -725,13 +623,13 @@ class Keithley2400Backend:
         enabled: bool,
         api: ModuleAPI,
     ) -> None:
-        self._write("OUTP ON" if enabled else "OUTP OFF", api)
-        actual = self._query_switch("OUTP?", api)
+        self._write(instrument.output_command(enabled), api)
+        actual = self._query_switch(instrument.OUTPUT_QUERY, api)
         if actual != enabled:
             raise ModuleError(
                 "2400 output readback did not match the requested state",
                 "K2400_OUTPUT_MISMATCH",
-                "OUTP?",
+                instrument.OUTPUT_QUERY,
             )
 
     def _best_effort_output_off(self) -> str | None:
@@ -740,10 +638,13 @@ class Keithley2400Backend:
         if self.transport is None:
             return None
         try:
-            self.transport.write("OUTP OFF")
-            actual = self._parse_switch(self.transport.query("OUTP?"), "OUTP?")
+            self.transport.write(instrument.OUTPUT_OFF)
+            actual = self._parse_switch(
+                self.transport.query(instrument.OUTPUT_QUERY),
+                instrument.OUTPUT_QUERY,
+            )
             if actual:
-                return "OUTP? still reports ON"
+                return f"{instrument.OUTPUT_QUERY} still reports ON"
         except Exception as exc:
             return f"{type(exc).__name__}: {exc}"
         return None
@@ -752,19 +653,20 @@ class Keithley2400Backend:
         self,
         api: ModuleAPI,
     ) -> None:
-        reply = self._query("SYST:ERR?", api)
-        matched = re.match(r"\s*([+-]?\d+)", reply)
-        if matched is None:
+        reply = self._query(instrument.ERROR_QUERY, api)
+        try:
+            error_code = instrument.parse_error_code(reply)
+        except ValueError as exc:
             raise ModuleError(
                 f"2400 returned an invalid error-queue response: {reply!r}",
                 "K2400_INVALID_RESPONSE",
-                "SYST:ERR?",
-            )
-        if int(matched.group(1)) != 0:
+                instrument.ERROR_QUERY,
+            ) from exc
+        if error_code != 0:
             raise ModuleError(
                 f"2400 reported an instrument error: {reply}",
                 "K2400_INSTRUMENT_ERROR",
-                "SYST:ERR?",
+                instrument.ERROR_QUERY,
             )
 
     def _write(self, command: str, api: ModuleAPI) -> None:
@@ -811,16 +713,14 @@ class Keithley2400Backend:
 
     @staticmethod
     def _parse_switch(value: object, command: str) -> bool:
-        token = str(value).strip().strip('"').upper()
-        if token in {"1", "ON"}:
-            return True
-        if token in {"0", "OFF"}:
-            return False
-        raise ModuleError(
-            f"2400 returned invalid switch state {value!r}",
-            "K2400_INVALID_RESPONSE",
-            command,
-        )
+        try:
+            return instrument.parse_switch(value)
+        except ValueError as exc:
+            raise ModuleError(
+                f"2400 returned invalid switch state {value!r}",
+                "K2400_INVALID_RESPONSE",
+                command,
+            ) from exc
 
     def _expect_number(
         self,
@@ -831,7 +731,7 @@ class Keithley2400Backend:
     ) -> None:
         reply = self._query(command, api)
         try:
-            actual = float(reply)
+            actual = instrument.parse_number(reply)
         except ValueError as exc:
             raise ModuleError(
                 f"2400 returned non-numeric readback {reply!r}",
@@ -853,13 +753,13 @@ class Keithley2400Backend:
 
     @staticmethod
     def _clean_token(value: object) -> str:
-        return str(value).strip().strip('"').strip("'").upper()
+        return instrument.clean_token(value)
 
     @staticmethod
     def _scpi(value: object) -> str:
-        return f"{float(value):.12g}"
+        return instrument.number(value)
 
-    def _require_transport(self) -> InstrumentTransport:
+    def _require_transport(self) -> instrument.Transport:
         if self.transport is None:
             raise ModuleError(
                 "Keithley 2400 is not connected; Apply Settings first",
@@ -1095,4 +995,4 @@ class Keithley2400Backend:
 
 Module = Keithley2400Backend
 
-__all__ = ["Keithley2400Backend", "Module", "PyVisaTransport"]
+__all__ = ["Keithley2400Backend", "Module"]
