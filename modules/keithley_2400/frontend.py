@@ -118,12 +118,27 @@ class Keithley2400Frontend(QWidget):
         self.io_timeout.setDecimals(1)
         self.io_timeout.setSingleStep(0.5)
         self.io_timeout.setSuffix(" s")
+        self.output_off_at_sequence_end = QCheckBox(
+            "Output OFF at SEQ end"
+        )
+        self.output_off_at_sequence_end.setToolTip(
+            "Clear this only when a valid retained bias, such as a gate "
+            "voltage, must remain active after run_end. Disable, Apply, and "
+            "measurement-failure cleanup still request output OFF."
+        )
         communication_layout.addWidget(QLabel("VISA resource"), 0, 0)
         communication_layout.addWidget(self.resource, 0, 1, 1, 3)
         communication_layout.addWidget(self.refresh_resources_button, 0, 4)
         communication_layout.addWidget(self.test_connection_button, 1, 4)
         communication_layout.addWidget(QLabel("I/O timeout"), 1, 0)
         communication_layout.addWidget(self.io_timeout, 1, 1)
+        communication_layout.addWidget(
+            self.output_off_at_sequence_end,
+            1,
+            2,
+            1,
+            2,
+        )
         layout.addWidget(communication)
 
         source = QGroupBox("Source and Measurement", content)
@@ -184,8 +199,9 @@ class Keithley2400Frontend(QWidget):
             "Enable only discovers resources. Apply Settings connects while output is "
             "off and reads every critical setting back. By default a Measure confirms "
             "OUTP? = 0 before emitting a DAT row; the row-boundary option may retain "
-            "output only while the SEQ is running. Stop, Error, completed and Disable "
-            "always request output OFF. "
+            "output between rows. The separate SEQ-end option may retain that valid "
+            "bias after completed, Stop, or Error. Disable, Apply, and measurement "
+            "failure cleanup always request output OFF. "
             "4-wire mode requires both sense leads to remain connected.",
             content,
         )
@@ -261,6 +277,9 @@ class Keithley2400Frontend(QWidget):
             "output_off_between_measurements": (
                 self.output_off_between_measurements.isChecked()
             ),
+            "output_off_at_sequence_end": (
+                self.output_off_at_sequence_end.isChecked()
+            ),
         }
 
     def load(self, settings: Mapping[str, Any]) -> None:
@@ -280,6 +299,9 @@ class Keithley2400Frontend(QWidget):
         self.settle_seconds.setValue(float(merged["settle_seconds"]))
         self.output_off_between_measurements.setChecked(
             bool(merged["output_off_between_measurements"])
+        )
+        self.output_off_at_sequence_end.setChecked(
+            bool(merged["output_off_at_sequence_end"])
         )
         del blockers
         self._update_source_mode()
@@ -342,6 +364,7 @@ class Keithley2400Frontend(QWidget):
         return [
             self.resource,
             self.io_timeout,
+            self.output_off_at_sequence_end,
             self.source_mode,
             self.source_current,
             self.voltage_compliance,

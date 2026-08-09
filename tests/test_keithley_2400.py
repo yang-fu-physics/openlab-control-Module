@@ -375,6 +375,66 @@ class Keithley2400BackendTests(unittest.TestCase):
             2,
         )
 
+    def test_output_can_remain_on_after_sequence_end_until_disable(self) -> None:
+        state = _FakeState()
+        state.read_reply = "2.0,0.001"
+        backend = self._backend(state, [])
+        context = self._context([])
+        settings = _settings(
+            source_current="1m",
+            output_off_between_measurements=False,
+            output_off_at_sequence_end=False,
+        )
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context)
+        self.assertTrue(state.output)
+
+        run_end(backend, "completed", context)
+
+        self.assertTrue(state.output)
+        self.assertIn("output retained", backend.last_status)
+        off_count = sum(
+            command == "OUTP OFF"
+            for kind, command in state.commands
+            if kind == "write"
+        )
+        # 下一次 SEQ 开始也不得制造一次短暂的栅压掉电。
+        run_start(backend, context)
+        self.assertTrue(state.output)
+        self.assertEqual(
+            sum(
+                command == "OUTP OFF"
+                for kind, command in state.commands
+                if kind == "write"
+            ),
+            off_count,
+        )
+
+        backend.close(context)
+        self.assertFalse(state.output)
+
+    def test_sequence_end_does_not_retain_front_panel_changed_bias(self) -> None:
+        state = _FakeState()
+        backend = self._backend(state, [])
+        context = self._context([])
+        settings = _settings(
+            source_current="1m",
+            output_off_between_measurements=False,
+            output_off_at_sequence_end=False,
+        )
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context)
+        state.source_current = 2.0e-3
+
+        with self.assertRaisesRegex(ModuleError, "readback mismatch"):
+            run_end(backend, "completed", context)
+
+        self.assertFalse(state.output)
+
     def test_overrange_sentinel_is_data_warning_not_framework_error(self) -> None:
         state = _FakeState()
         state.read_reply = "9.91e37,0.001"
@@ -560,6 +620,7 @@ class Keithley2400FrontendTests(unittest.TestCase):
             sense_mode="4wire",
             nplc=3.0,
             settle_seconds=0.75,
+            output_off_at_sequence_end=False,
         )
 
         frontend.load(supplied)
@@ -577,6 +638,7 @@ class Keithley2400FrontendTests(unittest.TestCase):
             500.0e-6,
         )
         self.assertEqual(saved["sense_mode"], "4wire")
+        self.assertFalse(saved["output_off_at_sequence_end"])
         self.assertFalse(frontend.source_current.isEnabled())
         self.assertTrue(frontend.source_voltage.isEnabled())
 

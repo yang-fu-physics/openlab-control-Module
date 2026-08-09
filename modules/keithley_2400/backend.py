@@ -158,13 +158,40 @@ class Keithley2400Backend:
         self,
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """Run 开始时确认配置仍一致且输出关闭。"""
+        """Run 开始时确认配置；按设置关闭或保留上一轮的有效偏置。"""
 
         settings = self._require_applied()
-        self._set_output(False, api)
-        self._verify_configuration(settings, api)
+        output_off_at_end = bool(
+            settings["output_off_at_sequence_end"]
+        )
+        try:
+            if output_off_at_end:
+                self._set_output(False, api)
+                output_on = False
+            else:
+                # 上一轮可能有意保留栅压。这里只读确认当前状态，不制造一次
+                # OFF→ON 的短暂掉电；第一轮 Apply 后通常仍读到 OFF。
+                output_on = self._query_switch(
+                    instrument.OUTPUT_QUERY,
+                    api,
+                )
+            self._verify_configuration(settings, api)
+        except Exception as exc:
+            cleanup = self._best_effort_output_off()
+            if cleanup:
+                raise ModuleError(
+                    "2400 sequence start failed and output-off could not be "
+                    f"confirmed: {cleanup}",
+                    "K2400_SAFE_STATE_UNCONFIRMED",
+                    "run_start",
+                ) from exc
+            raise
         self.sequence_active = True
-        self.last_status = "Sequence ready - output off"
+        self.last_status = (
+            "Sequence ready - output retained"
+            if output_on
+            else "Sequence ready - output off"
+        )
         status = self._status()
         api.status(status)
         return status
@@ -201,7 +228,8 @@ class Keithley2400Backend:
             raise
 
         # 默认在正式行之前严格关闭。选择行间保持时，仍在每次读取后查询输出，确认
-        # 它确实处于有意的 ON 状态；Stop/Error/completed/Disable 始终走关闭路径。
+        # 它确实处于有意的 ON 状态；Disable 和任何测量异常始终走关闭路径，run_end
+        # 是否保留则由独立设置决定。
         try:
             if output_off:
                 self._set_output(False, api)
@@ -267,11 +295,38 @@ class Keithley2400Backend:
         reason: str,
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """completed、stopped 和 error 都关闭并确认输出。"""
+        """结束本轮 SEQ；可选择保留上一条成功测量留下的连续偏置。"""
 
         self.sequence_active = False
-        self._set_output(False, api)
-        self.last_status = f"Sequence {reason} - output off"
+        settings = self._require_applied()
+        if bool(settings["output_off_at_sequence_end"]):
+            self._set_output(False, api)
+            state_text = "output off"
+        else:
+            try:
+                output_on = self._query_switch(
+                    instrument.OUTPUT_QUERY,
+                    api,
+                )
+                # “保留”只适用于仍与 Apply 设置一致的输出；若前面板在运行中
+                # 修改了源值或 compliance，不能把未知偏置跨 SEQ 留下。
+                self._verify_configuration(settings, api)
+            except Exception as exc:
+                cleanup = self._best_effort_output_off()
+                if cleanup:
+                    raise ModuleError(
+                        "2400 sequence end state was uncertain and output-off "
+                        f"could not be confirmed: {cleanup}",
+                        "K2400_SAFE_STATE_UNCONFIRMED",
+                        "run_end",
+                    ) from exc
+                raise
+            state_text = (
+                "output retained"
+                if output_on
+                else "output already off"
+            )
+        self.last_status = f"Sequence {reason} - {state_text}"
         status = self._status()
         api.status(status)
         return status
@@ -915,6 +970,13 @@ class Keithley2400Backend:
                 "K2400_INVALID_SETTINGS",
                 "output_off_between_measurements",
             )
+        output_off_at_end = merged["output_off_at_sequence_end"]
+        if not isinstance(output_off_at_end, bool):
+            raise ModuleError(
+                "output_off_at_sequence_end must be true or false",
+                "K2400_INVALID_SETTINGS",
+                "output_off_at_sequence_end",
+            )
         operation_timeout = self._finite_number(
             operation_timeout_seconds,
             "operation_timeout_seconds",
@@ -946,6 +1008,7 @@ class Keithley2400Backend:
             "nplc": nplc,
             "settle_seconds": settle,
             "output_off_between_measurements": output_off,
+            "output_off_at_sequence_end": output_off_at_end,
         }
 
     @staticmethod

@@ -7,7 +7,7 @@
 - 2-wire local sense；
 - 4-wire remote sense。
 
-尚未用真实 2400、GPIB 控制器和样品验证，因此版本保持 `0.1.0b1`。自动化测试只验证
+尚未用真实 2400、GPIB 控制器和样品验证，因此版本保持 `0.1.0b2`。自动化测试只验证
 协议状态机、异常路径和资源释放，不是仪表或接线的安全认证。
 
 ## 接线
@@ -29,7 +29,8 @@ Model 2400 的绝对命令能力约为 ±210 V、±1.05 A，连续工作边界�
 - **Measure**：本模块没有声明 `slots`，所以核心在每个逻辑槽位都调用一次
   `measure(slot, api)`；确认设置未被前面板改变，打开输出，等待 settle，并读取
   电压/电流和 compliance。
-- **Stop / Error / completed**：`run_end` 关闭并确认输出，但模块保持 Enabled 和连接状态。
+- **Stop / Error / completed**：`run_end` 默认关闭并确认输出；取消 SEQ-end 选项时，
+  保留上一条成功测量留下的输出状态。模块保持 Enabled 和连接状态。
 - **Disable / 应用退出**：`close(api)` 关闭并确认输出后释放 VISA session。
 
 任何无法确认输出已经关闭、设置读回不一致、通信中断或型号不匹配都属于框架 Error，
@@ -43,8 +44,12 @@ Model 2400 的绝对命令能力约为 ±210 V、±1.05 A，连续工作边界�
 
 Settings 中的 `Turn output off after each DAT row` 默认勾选：每行发送前确认输出 OFF，
 采样后关闭并读回。取消勾选后，输出会在成功行之间以及 SEQ Pause 期间保持活动，以免
-每个通道行反复开关；下一行仍重新采样。无论该选项如何，Stop、Error、completed、
-Disable、通信异常或应用退出都必须请求并确认输出 OFF。
+每个通道行反复开关；下一行仍重新采样。
+
+`Output OFF at SEQ end` 也默认勾选。只有同时取消两个选项，成功测量留下的连续偏置才会
+跨过 `completed`、Stop 或 Error 的 `run_end`，并在下一次 SEQ 开始时保持不间断。该选项
+不会主动打开原本关闭的输出。Disable、重新 Apply、应用退出，以及 Measure 自身发生
+通信/配置/取消异常时，仍会请求并确认输出 OFF。
 
 DAT 列：
 
