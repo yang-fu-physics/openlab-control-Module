@@ -539,6 +539,36 @@ class LakeShore372ABackendTests(unittest.TestCase):
             "Shunted",
         )
 
+    def test_reapply_shunts_old_inputs_before_closing_session(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state)
+        settings = default_settings()
+        settings["resource"] = "GPIB0::12::INSTR"
+        context = self._context([])
+        open_module(backend, context)
+        backend.configure(settings, context)
+
+        # 模拟 Idle 期间有人从前面板解除 R1 分流。重新 Apply 必须先通过旧
+        # session 把旧配置中的 Enabled 输入重新分流，之后才能关闭并换 session。
+        old = state.intypes[1]
+        state.intypes[1] = (*old[:4], 0, old[5])
+        state.commands.clear()
+
+        backend.configure(settings, context)
+
+        close_index = state.commands.index(("close", ""))
+        shunt_index = next(
+            index
+            for index, item in enumerate(state.commands)
+            if item[0] == "write"
+            and item[1].startswith("INTYPE 1,")
+            and item[1].endswith(",1,2")
+        )
+        self.assertLess(shunt_index, close_index)
+        self.assertEqual(state.intypes[1][4], 1)
+
     def test_run_start_reconfirms_shunt_after_idle_change(
         self,
     ) -> None:
@@ -857,9 +887,15 @@ class LakeShore372ABackendTests(unittest.TestCase):
 
         self.assertEqual(
             captured.exception.code,
+            "LS372_SHUNT_FAILED",
+        )
+        self.assertIsInstance(captured.exception.__cause__, ModuleError)
+        self.assertEqual(
+            captured.exception.__cause__.code,
             "LS372_SETTINGS_VERIFY_FAILED",
         )
         self.assertIsNone(backend.transport)
+        self.assertEqual(backend.applied_settings, {})
 
     def test_incompatible_excitation_and_resistance_fail_before_connect(
         self,

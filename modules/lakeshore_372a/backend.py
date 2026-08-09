@@ -177,11 +177,22 @@ class LakeShore372ABackend:
             ),
         )
         self.desired_settings = deepcopy(desired)
-        self._connect(
-            desired["resource"],
-            float(desired["io_timeout_seconds"]),
-        )
+
+        # 重新 Apply 之前不能直接由 ``_connect`` 丢弃旧 session。Idle 期间
+        # 操作者可能从前面板解除过分流；必须先依据旧的已应用配置逐通道重新
+        # 分流并读回，确认后才允许释放旧连接。
+        if self.transport is not None:
+            if self.applied_settings:
+                self._shunt_all(api)
+            self._close_transport()
+        self.applied_settings = {}
+        connected = False
         try:
+            self._connect(
+                desired["resource"],
+                float(desired["io_timeout_seconds"]),
+            )
+            connected = True
             # FREQ 的第一个参数 0 表示全局/测量输入组；写后立即 FREQ? 核对索引。
             self._write(
                 instrument.frequency_command(
@@ -217,10 +228,26 @@ class LakeShore372ABackend:
                     shunted=True,
                     api=api,
                 )
-        except Exception:
+        except Exception as failure:
             # 清理路径不依赖 api checkpoint，Stop 已到达时仍会直接尝试分流。
-            self._best_effort_shunt_settings(desired)
+            # 只有身份验证成功、可能已经写过设置的新 session 才需要按新配置
+            # 分流；单纯连接/身份失败没有改变该仪表，不能伪报“分流失败”。
+            errors = (
+                self._best_effort_shunt_settings(desired)
+                if connected
+                else []
+            )
             self._close_transport()
+            self.applied_settings = {}
+            self.sequence_active = False
+            if errors:
+                raise ModuleError(
+                    "Model 372 Apply failed and one or more enabled inputs "
+                    "could not be confirmed shunted: "
+                    + "; ".join(errors),
+                    "LS372_SHUNT_FAILED",
+                    "configure",
+                ) from failure
             raise
         # 只有全部读回一致后才把 desired 提升为 applied，Measure 绝不使用半套设置。
         self.applied_settings = deepcopy(desired)
