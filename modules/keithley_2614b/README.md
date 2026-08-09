@@ -9,7 +9,7 @@ Measurement Module。每个通道可独立选择：
 - 独立 source level、compliance 和 NPLC。
 
 尚未用真实 2614B、GPIB 控制器、双通道接线和联锁测试夹具验证，因此版本保持
-`0.1.0b1`。自动化测试验证 TSP 状态机和异常清理，不是硬件安全认证。
+`0.1.0b2`。自动化测试验证 TSP 状态机和异常清理，不是硬件安全认证。
 
 ## 测量顺序
 
@@ -53,12 +53,17 @@ maximum limits 检查组合：
   读回两个 Enabled 通道；结束保持全部输出 OFF。
 - **Measure**：默认只在采样事务内输出；取消逐行关闭选项时可跨成功行保持 Enabled
   输出。Stop、通信异常或任一通道失败会直接请求 A/B OFF。
-- **completed / stopped / error**：`run_end` 严格读回 A/B 都是 OFF，连接保持。
+- **completed / stopped / error**：`run_end` 默认严格读回 A/B 都是 OFF；取消 SEQ-end
+  选项时保留上一条成功测量留下的 Enabled 输出。连接保持。
 - **Disable / 退出**：`close(api)` 确认 A/B OFF 后关闭 VISA session。
 
 Settings 中的 `Turn SMU A/B outputs off after each DAT row` 默认勾选。取消勾选后，
 Enabled 输出会在成功行之间以及 SEQ Pause 期间保持活动；每个逻辑槽位仍重新读取 A/B。
-Stop、Error、completed、Disable、通信异常和应用退出始终请求两个输出 OFF。
+
+`Output OFF at SEQ end` 也默认勾选。只有同时取消两个选项，成功测量留下的连续偏置才会
+跨过 `completed`、Stop 或 Error 的 `run_end`，并在下一次 SEQ 开始时保持不间断。该选项
+不会主动打开原本关闭的输出，也不允许 Disabled 通道保持输出。Disable、重新 Apply、
+应用退出，以及 Measure 自身发生通信、配置或取消异常时，仍会请求并确认 A/B 输出 OFF。
 
 ## DAT 列和状态码
 

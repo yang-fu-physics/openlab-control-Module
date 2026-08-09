@@ -121,20 +121,35 @@ class Keithley2614BFrontend(QWidget):
         self.output_off_between_measurements = QCheckBox(
             "Turn SMU A/B outputs off after each DAT row"
         )
+        self.output_off_at_sequence_end = QCheckBox(
+            "Output OFF at SEQ end"
+        )
+        self.output_off_at_sequence_end.setToolTip(
+            "Clear this only when a valid retained bias must remain active "
+            "after run_end. Disable, Apply, and measurement-failure cleanup "
+            "still request both outputs OFF."
+        )
         communication_layout.addWidget(QLabel("VISA resource"), 0, 0)
         communication_layout.addWidget(self.resource, 0, 1, 1, 3)
         communication_layout.addWidget(self.refresh_resources_button, 0, 4)
         communication_layout.addWidget(QLabel("I/O timeout"), 1, 0)
         communication_layout.addWidget(self.io_timeout, 1, 1)
-        communication_layout.addWidget(QLabel("Shared source settle"), 1, 2)
-        communication_layout.addWidget(self.settle_seconds, 1, 3)
+        communication_layout.addWidget(
+            self.output_off_at_sequence_end,
+            1,
+            2,
+            1,
+            2,
+        )
         communication_layout.addWidget(self.test_connection_button, 1, 4)
+        communication_layout.addWidget(QLabel("Shared source settle"), 2, 0)
+        communication_layout.addWidget(self.settle_seconds, 2, 1)
         communication_layout.addWidget(
             self.output_off_between_measurements,
             2,
-            0,
+            2,
             1,
-            5,
+            3,
         )
         layout.addWidget(communication)
 
@@ -194,9 +209,10 @@ class Keithley2614BFrontend(QWidget):
             "HIGH VOLTAGE: the 200 V source range is enabled only by the physical "
             "2614B interlock. This module never drives or bypasses that interlock. "
             "Use rated connectors, shielding, protective earth and an interlocked "
-            "fixture. Apply, Stop, Error, completed and Disable always request both "
-            "outputs OFF. The row-boundary option controls only whether outputs remain "
-            "active between successful measurements while a SEQ is running.",
+            "fixture. Apply, Disable, and measurement-failure cleanup always request "
+            "both outputs OFF. The row-boundary option controls whether outputs remain "
+            "active between successful measurements; the separate SEQ-end option can "
+            "retain those valid outputs after completed, Stop, or Error.",
             content,
         )
         high_voltage.setWordWrap(True)
@@ -289,6 +305,9 @@ class Keithley2614BFrontend(QWidget):
             "output_off_between_measurements": (
                 self.output_off_between_measurements.isChecked()
             ),
+            "output_off_at_sequence_end": (
+                self.output_off_at_sequence_end.isChecked()
+            ),
             "channels": channels,
         }
 
@@ -300,6 +319,9 @@ class Keithley2614BFrontend(QWidget):
         self.settle_seconds.setValue(float(merged["settle_seconds"]))
         self.output_off_between_measurements.setChecked(
             bool(merged["output_off_between_measurements"])
+        )
+        self.output_off_at_sequence_end.setChecked(
+            bool(merged["output_off_at_sequence_end"])
         )
         for key, widgets in self.channel_widgets.items():
             values = merged["channels"][key]
@@ -392,6 +414,7 @@ class Keithley2614BFrontend(QWidget):
             self.io_timeout,
             self.settle_seconds,
             self.output_off_between_measurements,
+            self.output_off_at_sequence_end,
         ]
         for widgets in self.channel_widgets.values():
             result.extend(
@@ -411,6 +434,7 @@ class Keithley2614BFrontend(QWidget):
             "io_timeout_seconds",
             "settle_seconds",
             "output_off_between_measurements",
+            "output_off_at_sequence_end",
         ):
             if key in supplied:
                 result[key] = supplied[key]

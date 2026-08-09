@@ -361,6 +361,64 @@ class Keithley2614BBackendTests(unittest.TestCase):
             2,
         )
 
+    def test_outputs_can_remain_on_after_sequence_end_until_disable(self) -> None:
+        state = _FakeState()
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state)
+        context = self._context(messages)
+        settings = _settings(two_channels=True)
+        settings["output_off_between_measurements"] = False
+        settings["output_off_at_sequence_end"] = False
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context)
+        self.assertTrue(state.channels["smua"]["output"])
+        self.assertTrue(state.channels["smub"]["output"])
+
+        run_end(backend, "completed", context)
+
+        self.assertTrue(state.channels["smua"]["output"])
+        self.assertTrue(state.channels["smub"]["output"])
+        off_count = sum(
+            command.endswith("OUTPUT_OFF")
+            for kind, command in state.commands
+            if kind == "write"
+        )
+        # 下一次 SEQ 开始只读确认，不能让连续偏置短暂掉电。
+        run_start(backend, context)
+        self.assertEqual(
+            sum(
+                command.endswith("OUTPUT_OFF")
+                for kind, command in state.commands
+                if kind == "write"
+            ),
+            off_count,
+        )
+
+        backend.close(context)
+        self.assertFalse(state.channels["smua"]["output"])
+        self.assertFalse(state.channels["smub"]["output"])
+
+    def test_sequence_end_does_not_retain_front_panel_changed_bias(self) -> None:
+        state = _FakeState()
+        backend = self._backend(state)
+        context = self._context([])
+        settings = _settings(two_channels=True)
+        settings["output_off_between_measurements"] = False
+        settings["output_off_at_sequence_end"] = False
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context)
+        state.channels["smua"]["leveli"] = 2.0e-3
+
+        with self.assertRaisesRegex(ModuleError, "readback mismatch"):
+            run_end(backend, "completed", context)
+
+        self.assertFalse(state.channels["smua"]["output"])
+        self.assertFalse(state.channels["smub"]["output"])
+
     def test_cancel_during_shared_settle_turns_both_outputs_off(self) -> None:
         state = _FakeState()
 
@@ -546,6 +604,7 @@ class Keithley2614BFrontendTests(unittest.TestCase):
         settings_page = frontend
         status_page = frontend.status_widget
         supplied = _settings(two_channels=True)
+        supplied["output_off_at_sequence_end"] = False
         supplied["channels"]["ch2"].update(
             source_voltage="5V",
             current_limit="500uA",
@@ -562,6 +621,7 @@ class Keithley2614BFrontendTests(unittest.TestCase):
         self.assertEqual(saved["channels"]["ch2"]["source_voltage"], "5")
         self.assertEqual(saved["channels"]["ch2"]["current_limit"], "500u")
         self.assertEqual(saved["channels"]["ch2"]["sense_mode"], "4wire")
+        self.assertFalse(saved["output_off_at_sequence_end"])
 
     def test_resource_refresh_preserves_manual_address(self) -> None:
         frontend = Keithley2614BFrontend(ModuleUIAPI())

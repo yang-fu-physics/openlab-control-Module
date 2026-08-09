@@ -168,17 +168,61 @@ class Keithley2614BBackend:
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
         settings = self._require_applied()
-        self._enter_safe_state(api)
-        self._verify_high_impedance_off(api)
-        for key, smu, _number in self._enabled_channels(settings):
-            self._verify_channel(
-                key,
-                smu,
-                settings["channels"][key],
-                api,
-            )
+        output_off_at_end = bool(
+            settings["output_off_at_sequence_end"]
+        )
+        try:
+            if output_off_at_end:
+                self._enter_safe_state(api)
+            self._verify_high_impedance_off(api)
+            enabled_keys: set[str] = set()
+            for key, smu, _number in self._enabled_channels(settings):
+                enabled_keys.add(key)
+                self._verify_channel(
+                    key,
+                    smu,
+                    settings["channels"][key],
+                    api,
+                    require_output_off=output_off_at_end,
+                )
+            if not output_off_at_end:
+                # 未启用通道绝不能因为前面板遗留状态而带电；Enabled 通道则允许
+                # 保留上一轮已验证的偏置，不制造一次 OFF→ON 的短暂中断。
+                for key, smu, _number in CHANNELS:
+                    if key in enabled_keys:
+                        continue
+                    output_on = self._query_bool(
+                        instrument.output_query(smu),
+                        api,
+                    )
+                    self.output_states[key] = "On" if output_on else "Off"
+                    if output_on:
+                        raise ModuleError(
+                            f"Disabled {key.upper()} output is ON at sequence start",
+                            "K2614B_OUTPUT_MISMATCH",
+                            key,
+                        )
+        except Exception as exc:
+            cleanup = self._best_effort_safe_state()
+            if cleanup:
+                raise ModuleError(
+                    "2614B sequence start failed and both outputs could not "
+                    f"be confirmed OFF: {cleanup}",
+                    "K2614B_SAFE_STATE_UNCONFIRMED",
+                    "run_start",
+                ) from exc
+            raise
         self.sequence_active = True
-        self.last_status = "Sequence ready - SMU A/B output off"
+        retained = [
+            key.upper()
+            for key, _smu, _number in CHANNELS
+            if self.output_states[key] == "On"
+        ]
+        self.last_status = (
+            "Sequence ready - retained " + ", ".join(retained)
+            if retained
+            else "Sequence ready - SMU A/B output off"
+        )
         status = self._status()
         api.status(status)
         return status
@@ -303,8 +347,51 @@ class Keithley2614BBackend:
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
-        self._enter_safe_state(api)
-        self.last_status = f"Sequence {reason} - SMU A/B output off"
+        settings = self._require_applied()
+        if bool(settings["output_off_at_sequence_end"]):
+            self._enter_safe_state(api)
+            state_text = "SMU A/B output off"
+        else:
+            try:
+                states = self._read_output_states(api)
+                self._verify_high_impedance_off(api)
+                for key, smu, _number in self._enabled_channels(settings):
+                    self._verify_channel(
+                        key,
+                        smu,
+                        settings["channels"][key],
+                        api,
+                        require_output_off=False,
+                    )
+                disabled_on = [
+                    key
+                    for key, enabled in states.items()
+                    if enabled and not settings["channels"][key]["enabled"]
+                ]
+                if disabled_on:
+                    raise ModuleError(
+                        "Disabled 2614B channel output is ON at sequence end: "
+                        + ", ".join(key.upper() for key in disabled_on),
+                        "K2614B_OUTPUT_MISMATCH",
+                        disabled_on[0],
+                    )
+            except Exception as exc:
+                cleanup = self._best_effort_safe_state()
+                if cleanup:
+                    raise ModuleError(
+                        "2614B sequence end state was uncertain and both "
+                        f"outputs could not be confirmed OFF: {cleanup}",
+                        "K2614B_SAFE_STATE_UNCONFIRMED",
+                        "run_end",
+                    ) from exc
+                raise
+            retained = [key.upper() for key, enabled in states.items() if enabled]
+            state_text = (
+                "retained " + ", ".join(retained)
+                if retained
+                else "SMU A/B already off"
+            )
+        self.last_status = f"Sequence {reason} - {state_text}"
         status = self._status()
         api.status(status)
         return status
@@ -709,6 +796,16 @@ class Keithley2614BBackend:
                 "K2614B_SAFE_STATE_UNCONFIRMED",
             )
 
+    def _read_output_states(self, api: ModuleAPI) -> dict[str, bool]:
+        """只读 A/B 输出，供保留偏置的生命周期边界确认使用。"""
+
+        states: dict[str, bool] = {}
+        for key, smu, _number in CHANNELS:
+            enabled = self._query_bool(instrument.output_query(smu), api)
+            self.output_states[key] = "On" if enabled else "Off"
+            states[key] = enabled
+        return states
+
     def _best_effort_safe_state(self) -> str | None:
         """取消时不经过 checkpoint，始终尝试 A/B 两个输出。"""
 
@@ -933,6 +1030,16 @@ class Keithley2614BBackend:
                 "K2614B_INVALID_SETTINGS",
                 "output_off_between_measurements",
             )
+        output_off_at_end = supplied.get(
+            "output_off_at_sequence_end",
+            defaults["output_off_at_sequence_end"],
+        )
+        if not isinstance(output_off_at_end, bool):
+            raise ModuleError(
+                "output_off_at_sequence_end must be true or false",
+                "K2614B_INVALID_SETTINGS",
+                "output_off_at_sequence_end",
+            )
 
         raw_channels = supplied.get("channels", defaults["channels"])
         if not isinstance(raw_channels, Mapping):
@@ -1074,6 +1181,7 @@ class Keithley2614BBackend:
             "io_timeout_seconds": io_timeout,
             "settle_seconds": settle,
             "output_off_between_measurements": output_off,
+            "output_off_at_sequence_end": output_off_at_end,
             "channels": channels,
         }
 

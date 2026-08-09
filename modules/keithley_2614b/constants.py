@@ -60,6 +60,7 @@ def default_settings() -> dict[str, Any]:
         "io_timeout_seconds": 2.0,
         "settle_seconds": 0.2,
         "output_off_between_measurements": True,
+        "output_off_at_sequence_end": True,
         "channels": channels,
     }
 
