@@ -76,6 +76,11 @@ class Module:
 `run_end` 的 `data["reason"]` 为 `completed`、`stopped` 或 `error`。`action` 的 data 为
 `{"name": str, "payload": dict}`。
 
+会打开输出的模块默认应在三种 `run_end` 中关闭。确有连续栅压等需求时，可以提供默认
+勾选的“SEQ 结束关闭输出”设置；用户取消后，只有在读回确认输出和关键设置仍正确时才可
+保持，下一次 `run_start` 不能先关再开。Apply、Disable、应用退出、测量异常或状态无法
+确认时仍要关闭，`close(api)` 始终关闭输出并释放资源。
+
 ## 槽位、行与 rawdata
 
 - `slots = 4` 等价于 `(1, 2, 3, 4)`。
