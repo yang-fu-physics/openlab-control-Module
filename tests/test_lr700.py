@@ -639,6 +639,39 @@ class LR700BackendTests(unittest.TestCase):
             "Disconnected",
         )
 
+    def test_reapply_confirms_minimum_excitation_before_closing_old_session(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        settings = default_settings()
+        settings["resource"] = "GPIB0::18::INSTR"
+        backend = self._backend(state)
+        context = self._context([])
+        open_module(backend, context)
+        backend.configure(settings, context)
+
+        # 模拟 Idle 期间前面板把激励调高。重新 Apply 不能先关闭旧 session；
+        # 必须先发绝对最低激励命令并通过 GET 6 确认。
+        state.excitation_index = 6
+        state.excitation_percent = 100
+        state.commands.clear()
+
+        backend.configure(settings, context)
+
+        close_index = state.commands.index(("close", ""))
+        for command in (
+            "AUTORANGE 0",
+            "EXCITATION 0",
+            "VAREXC =05",
+            "VAREXC 1",
+        ):
+            self.assertLess(
+                state.commands.index(("write", command)),
+                close_index,
+            )
+        self.assertEqual(state.excitation_index, 0)
+        self.assertEqual(state.excitation_percent, 5)
+
     def test_disable_before_apply_does_not_open_or_change_instrument(
         self,
     ) -> None:
@@ -709,6 +742,7 @@ class LR700BackendTests(unittest.TestCase):
             "LR700_SAFE_STATE_FAILED",
         )
         self.assertIsNone(backend.transport)
+        self.assertEqual(backend.applied_settings, {})
         self.assertGreaterEqual(len(state.opened), 2)
 
     def test_invalid_filter_timing_and_per_slot_duration_fail_closed(

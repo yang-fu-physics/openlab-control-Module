@@ -177,17 +177,44 @@ class LR700Backend:
             ),
         )
         self.desired_settings = deepcopy(desired)
-        self._connect(
-            desired["resource"],
-            float(desired["io_timeout_seconds"]),
-        )
+
+        # 重新 Apply 前不能直接关闭旧 session。LR-700 没有真正的 Output Off，
+        # Idle 期间前面板也可能把激励调高，因此必须先按旧连接写入并读回最低
+        # 激励；确认失败时保留旧配置，等待用户处理或重试。
+        if self.transport is not None:
+            if self.applied_settings:
+                try:
+                    self._set_safe_state(api)
+                except Exception as failure:
+                    cleanup_error = self._best_effort_safe_state()
+                    if cleanup_error is not None:
+                        raise ModuleError(
+                            "Cannot replace the existing LR-700 session because "
+                            "minimum excitation could not be confirmed: "
+                            f"{cleanup_error}",
+                            "LR700_SAFE_STATE_FAILED",
+                            "configure",
+                        ) from failure
+                    raise
+            self._close_transport()
+        self.applied_settings = {}
+        connected = False
         try:
+            self._connect(
+                desired["resource"],
+                float(desired["io_timeout_seconds"]),
+            )
+            connected = True
             self._set_safe_state(api)
         except Exception as failure:
             cleanup_error = (
                 self._best_effort_safe_state()
+                if connected
+                else None
             )
             self._close_transport()
+            self.applied_settings = {}
+            self.sequence_active = False
             if cleanup_error is not None:
                 raise ModuleError(
                     "Apply failed and LR-700 minimum "
