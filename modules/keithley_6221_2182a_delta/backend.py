@@ -197,7 +197,12 @@ class Keithley6221DeltaBackend:
             or self.transport_switcher is not None
         ):
             self._enter_safe_state(api)
+            # 从这一刻起旧配置不再可用。即使释放 VISA 句柄失败，也不能让
+            # ``_require_applied`` 把已经拆除的旧会话误认为仍可运行。
+            self.applied_settings = None
             self._close_transports()
+        else:
+            self.applied_settings = None
         self.desired_settings = deepcopy(normalized)
         self.switcher_type = str(normalized["switcher_type"])
         try:
@@ -219,8 +224,17 @@ class Keithley6221DeltaBackend:
             # Apply 结束时再次清零。配置命令本身不应打开输出，但这一确认可捕获
             # 前面遗留状态或仪表异常行为。
             self._enter_safe_state(api)
-        except Exception:
+        except Exception as failure:
+            # 部分初始化可能已经打开 6221，而切换器或 2182A 随后才失败。
+            # 先直接请求安全状态，再释放全部会话；失败后的半套连接和旧配置
+            # 都不得留给下一次 Apply/SEQ 使用。
+            self.applied_settings = None
             self._best_effort_safe_state(api)
+            self.last_status = "Apply failed - disconnected"
+            try:
+                self._close_transports()
+            except ModuleError as cleanup_error:
+                raise cleanup_error from failure
             raise
 
         self.applied_settings = normalized
@@ -1566,11 +1580,14 @@ class Keithley6221DeltaBackend:
         return status
 
     def _close_transport_6221(self) -> None:
-        if self.transport_6221 is not None:
-            try:
-                self.transport_6221.close()
-            finally:
-                self.transport_6221 = None
+        transport = self.transport_6221
+        # 先丢弃本地连接和身份状态。即使底层 close 抛错，界面和下一次
+        # Apply 也不能继续把这个状态未知的 session 显示为已连接。
+        self.transport_6221 = None
+        self.identity_6221 = ""
+        self.identity_2182a = ""
+        if transport is not None:
+            transport.close()
 
     def _close_transport_switcher(self) -> None:
         if self.transport_switcher is not None:

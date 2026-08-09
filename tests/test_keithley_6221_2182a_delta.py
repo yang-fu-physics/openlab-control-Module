@@ -761,7 +761,17 @@ class BackendTests(unittest.TestCase):
             "K6221_SWITCHER_CONNECTION_FAILED",
         )
         self.assertEqual(waits, [])
-        # Enable 探测失败后，Apply/Measure 不再尝试 7001，也不会在未知路由上触发。
+        # 7001 身份查询失败时，已经打开的 6221 也必须释放，不能把半套会话
+        # 和旧的身份信息留给下一次 Apply/SEQ 复用。
+        self.assertIsNone(backend.transport_6221)
+        self.assertIsNone(backend.transport_switcher)
+        self.assertIsNone(backend.applied_settings)
+        self.assertEqual(backend.identity_6221, "")
+        self.assertEqual(backend.identity_2182a, "")
+        self.assertEqual(backend.identity_switcher, "")
+        self.assertIn("GPIB0::12::INSTR", state.closed)
+        self.assertIn("GPIB0::7::INSTR", state.closed)
+        # 身份查询失败前不能在未知路由上执行切换命令。
         self.assertEqual(
             sum(
                 action == "write"
@@ -772,6 +782,32 @@ class BackendTests(unittest.TestCase):
             ),
             0,
         )
+
+    def test_failed_reapply_discards_old_applied_state_and_new_sessions(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state)
+        context = _context([])
+        settings = _settings(channels=2)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        self.assertIsNotNone(backend.applied_settings)
+
+        state.fail(
+            "GPIB0::7::INSTR",
+            "query",
+            "*IDN?",
+        )
+        with self.assertRaises(ModuleError):
+            backend.configure(settings, context)
+
+        self.assertIsNone(backend.applied_settings)
+        self.assertIsNone(backend.transport_6221)
+        self.assertIsNone(backend.transport_switcher)
+        self.assertEqual(backend.identity_6221, "")
+        self.assertEqual(backend.identity_2182a, "")
+        self.assertEqual(backend.identity_switcher, "")
 
     def test_shared_mode_arms_once_at_sequence_start_and_emits_raw_rows(
         self,
