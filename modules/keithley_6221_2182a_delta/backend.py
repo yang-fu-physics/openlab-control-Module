@@ -448,24 +448,41 @@ class Keithley6221DeltaBackend:
 
         self.sequence_active = False
         self.armed = False
-        failure: ModuleError | None = None
+        safe_failure: Exception | None = None
+        release_failure: Exception | None = None
         try:
             self._enter_safe_state(api)
-        except ModuleError as exc:
-            failure = exc
+        except Exception as exc:
+            safe_failure = exc
         finally:
-            self._close_transports()
+            try:
+                self._close_transports()
+            except Exception as exc:
+                release_failure = exc
+            # 这些本地状态必须无条件清除。底层 close 抛错只表示资源释放未
+            # 确认，不能让窗口继续显示旧配置、旧通道或“已连接”身份。
             self.active_channel = ""
             self.applied_settings = None
         self.last_status = (
             "Disabled - safe state unconfirmed"
-            if failure is not None
-            else "Disabled"
+            if safe_failure is not None
+            else (
+                "Disabled - resource release failed"
+                if release_failure is not None
+                else "Disabled"
+            )
         )
         status = self._status()
         api.status(status)
+        failure = safe_failure or release_failure
         if failure is not None:
-            raise failure
+            if isinstance(failure, ModuleError):
+                raise failure
+            raise ModuleError(
+                "Delta module shutdown failed: "
+                f"{type(failure).__name__}: {failure}",
+                "K6221_SHUTDOWN_FAILED",
+            ) from failure
         return status
 
     def _read_status(

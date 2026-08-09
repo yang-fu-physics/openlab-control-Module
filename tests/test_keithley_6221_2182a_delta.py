@@ -387,6 +387,11 @@ class _Fake6221:
         self.state.commands.append(
             (self.resource, "close", "")
         )
+        self.state.maybe_fail(
+            self.resource,
+            "close",
+            "",
+        )
 
 
 class _Fake7001:
@@ -472,6 +477,11 @@ class _Fake7001:
         self.state.closed.append(self.resource)
         self.state.commands.append(
             (self.resource, "close", "")
+        )
+        self.state.maybe_fail(
+            self.resource,
+            "close",
+            "",
         )
 
 
@@ -808,6 +818,36 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(backend.identity_6221, "")
         self.assertEqual(backend.identity_2182a, "")
         self.assertEqual(backend.identity_switcher, "")
+
+    def test_close_failure_still_clears_all_local_runtime_state(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state)
+        context = _context([])
+        open_module(backend, context)
+        backend.configure(_settings(channels=2), context)
+        backend.active_channel = "CH1"
+        state.fail(
+            "GPIB0::12::INSTR",
+            "close",
+            "",
+        )
+
+        with self.assertRaises(ModuleError) as captured:
+            backend.close(context)
+
+        self.assertEqual(
+            captured.exception.code,
+            "K6221_RESOURCE_RELEASE_FAILED",
+        )
+        self.assertIsNone(backend.applied_settings)
+        self.assertIsNone(backend.transport_6221)
+        self.assertIsNone(backend.transport_switcher)
+        self.assertEqual(backend.identity_6221, "")
+        self.assertEqual(backend.identity_2182a, "")
+        self.assertEqual(backend.identity_switcher, "")
+        self.assertEqual(backend.active_channel, "")
 
     def test_shared_mode_arms_once_at_sequence_start_and_emits_raw_rows(
         self,
