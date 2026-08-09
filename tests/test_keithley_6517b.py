@@ -360,6 +360,73 @@ class Keithley6517BBackendTests(unittest.TestCase):
             2,
         )
 
+    def test_output_can_remain_on_after_sequence_end_until_disable(self) -> None:
+        state = _FakeState()
+        state.read_reply = "+1.0E-9A,N,+100.0V"
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state, [])
+        context = self._context(messages)
+        settings = _settings(
+            source_voltage="100",
+            voltage_limit="100",
+            output_off_between_measurements=False,
+            output_off_at_sequence_end=False,
+        )
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context)
+        self.assertTrue(state.output)
+        self.assertFalse(state.zero_check)
+
+        run_end(backend, "completed", context)
+
+        self.assertTrue(state.output)
+        self.assertFalse(state.zero_check)
+        standby_count = sum(
+            command == "OUTP1 OFF"
+            for kind, command in state.commands
+            if kind == "write"
+        )
+        # 下一次 SEQ 开始只读确认，不得让栅压短暂掉电。
+        run_start(backend, context)
+        self.assertTrue(state.output)
+        self.assertFalse(state.zero_check)
+        self.assertEqual(
+            sum(
+                command == "OUTP1 OFF"
+                for kind, command in state.commands
+                if kind == "write"
+            ),
+            standby_count,
+        )
+
+        backend.close(context)
+        self.assertFalse(state.output)
+        self.assertTrue(state.zero_check)
+
+    def test_sequence_end_does_not_retain_front_panel_changed_bias(self) -> None:
+        state = _FakeState()
+        backend = self._backend(state, [])
+        context = self._context([])
+        settings = _settings(
+            source_voltage="100",
+            voltage_limit="100",
+            output_off_between_measurements=False,
+            output_off_at_sequence_end=False,
+        )
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context)
+        state.source_voltage = 50.0
+
+        with self.assertRaisesRegex(ModuleError, "readback mismatch"):
+            run_end(backend, "completed", context)
+
+        self.assertFalse(state.output)
+        self.assertTrue(state.zero_check)
+
     def test_overflow_status_writes_blank_row_and_continues(self) -> None:
         state = _FakeState()
         state.read_reply = "9.9E37,O,100"
@@ -536,6 +603,7 @@ class Keithley6517BFrontendTests(unittest.TestCase):
             voltage_limit="750V",
             nplc=3.0,
             settle_seconds=5.0,
+            output_off_at_sequence_end=False,
         )
 
         frontend.load(supplied)
@@ -547,6 +615,7 @@ class Keithley6517BFrontendTests(unittest.TestCase):
         self.assertEqual(saved["source_voltage"], "500")
         self.assertEqual(saved["voltage_limit"], "750")
         self.assertAlmostEqual(saved["settle_seconds"], 5.0)
+        self.assertFalse(saved["output_off_at_sequence_end"])
 
     def test_resource_refresh_preserves_manual_address(self) -> None:
         frontend = Keithley6517BFrontend(ModuleUIAPI())

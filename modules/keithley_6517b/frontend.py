@@ -111,11 +111,26 @@ class Keithley6517BFrontend(QWidget):
         self.io_timeout.setDecimals(1)
         self.io_timeout.setSingleStep(0.5)
         self.io_timeout.setSuffix(" s")
+        self.output_off_at_sequence_end = QCheckBox(
+            "Output OFF at SEQ end"
+        )
+        self.output_off_at_sequence_end.setToolTip(
+            "Clear this only when a valid retained bias must remain active "
+            "after run_end. Disable, Apply, and measurement-failure cleanup "
+            "still request standby with zero check ON."
+        )
         communication_layout.addWidget(QLabel("VISA resource"), 0, 0)
         communication_layout.addWidget(self.resource, 0, 1, 1, 3)
         communication_layout.addWidget(self.refresh_resources_button, 0, 4)
         communication_layout.addWidget(QLabel("I/O timeout"), 1, 0)
         communication_layout.addWidget(self.io_timeout, 1, 1)
+        communication_layout.addWidget(
+            self.output_off_at_sequence_end,
+            1,
+            2,
+            1,
+            2,
+        )
         communication_layout.addWidget(self.test_connection_button, 1, 4)
         layout.addWidget(communication)
 
@@ -178,9 +193,10 @@ class Keithley6517BFrontend(QWidget):
             "module cannot certify the fixture and never bypasses the instrument "
             "interlock. Default source voltage is 0 V. Standby and zero check are "
             "confirmed before a DAT row is emitted by default. The row-boundary "
-            "option may retain operate with zero check off only while the SEQ is "
-            "running; Stop, Error, completed and Disable always request standby "
-            "and zero check ON.",
+            "option may retain operate with zero check off between rows; the separate "
+            "SEQ-end option may retain that valid state after completed, Stop, or "
+            "Error. Apply, Disable, and measurement-failure cleanup always request "
+            "standby and zero check ON.",
             content,
         )
         high_voltage.setWordWrap(True)
@@ -251,6 +267,9 @@ class Keithley6517BFrontend(QWidget):
             "output_off_between_measurements": (
                 self.output_off_between_measurements.isChecked()
             ),
+            "output_off_at_sequence_end": (
+                self.output_off_at_sequence_end.isChecked()
+            ),
         }
 
     def load(self, settings: Mapping[str, Any]) -> None:
@@ -265,6 +284,9 @@ class Keithley6517BFrontend(QWidget):
         self.settle_seconds.setValue(float(merged["settle_seconds"]))
         self.output_off_between_measurements.setChecked(
             bool(merged["output_off_between_measurements"])
+        )
+        self.output_off_at_sequence_end.setChecked(
+            bool(merged["output_off_at_sequence_end"])
         )
         del blockers
 
@@ -310,6 +332,7 @@ class Keithley6517BFrontend(QWidget):
         return [
             self.resource,
             self.io_timeout,
+            self.output_off_at_sequence_end,
             self.source_range,
             self.source_voltage,
             self.voltage_limit,

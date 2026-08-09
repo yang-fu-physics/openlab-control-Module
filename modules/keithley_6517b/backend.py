@@ -155,10 +155,33 @@ class Keithley6517BBackend:
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
         settings = self._require_applied()
-        self._enter_safe_state(api)
-        self._verify_configuration(settings, api)
+        output_off_at_end = bool(
+            settings["output_off_at_sequence_end"]
+        )
+        try:
+            if output_off_at_end:
+                self._enter_safe_state(api)
+                output_on = False
+            else:
+                # 保留栅压时只读确认生命周期边界状态，不能先切到 standby 再打开。
+                output_on = self._read_bias_state(api)
+            self._verify_configuration(settings, api)
+        except Exception as exc:
+            cleanup = self._best_effort_safe_state()
+            if cleanup:
+                raise ModuleError(
+                    "6517B sequence start failed and standby/zero-check could "
+                    f"not be confirmed: {cleanup}",
+                    "K6517B_SAFE_STATE_UNCONFIRMED",
+                    "run_start",
+                ) from exc
+            raise
         self.sequence_active = True
-        self.last_status = "Sequence ready - standby / zero check on"
+        self.last_status = (
+            "Sequence ready - output retained / zero check off"
+            if output_on
+            else "Sequence ready - standby / zero check on"
+        )
         status = self._status()
         api.status(status)
         return status
@@ -299,8 +322,30 @@ class Keithley6517BBackend:
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
-        self._enter_safe_state(api)
-        self.last_status = f"Sequence {reason} - standby / zero check on"
+        settings = self._require_applied()
+        if bool(settings["output_off_at_sequence_end"]):
+            self._enter_safe_state(api)
+            state_text = "standby / zero check on"
+        else:
+            try:
+                output_on = self._read_bias_state(api)
+                self._verify_configuration(settings, api)
+            except Exception as exc:
+                cleanup = self._best_effort_safe_state()
+                if cleanup:
+                    raise ModuleError(
+                        "6517B sequence end state was uncertain and standby/"
+                        f"zero-check could not be confirmed: {cleanup}",
+                        "K6517B_SAFE_STATE_UNCONFIRMED",
+                        "run_end",
+                    ) from exc
+                raise
+            state_text = (
+                "output retained / zero check off"
+                if output_on
+                else "standby / zero check on"
+            )
+        self.last_status = f"Sequence {reason} - {state_text}"
         status = self._status()
         api.status(status)
         return status
@@ -643,6 +688,24 @@ class Keithley6517BBackend:
                 "K6517B_SAFE_STATE_UNCONFIRMED",
             )
 
+    def _read_bias_state(self, api: ModuleAPI) -> bool:
+        """只读并确认连续偏置所允许的两个完整状态。"""
+
+        output = self._query_switch(instrument.OUTPUT_QUERY, api)
+        zero_check = self._query_switch(instrument.ZERO_CHECK_QUERY, api)
+        self.last_output = "Operate" if output else "Standby"
+        self.last_zero_check = "On" if zero_check else "Off"
+        # 生命周期边界只允许完整的测量态或完整的安全态。若前面板留下了
+        # Operate+ZCH ON / Standby+ZCH OFF，先让调用方执行强制安全清理。
+        if output == zero_check:
+            raise ModuleError(
+                "6517B output/zero-check state is inconsistent; expected "
+                "operate with zero check OFF or standby with zero check ON",
+                "K6517B_BIAS_STATE_MISMATCH",
+                "run_lifecycle",
+            )
+        return output
+
     def _set_output(
         self,
         enabled: bool,
@@ -978,6 +1041,13 @@ class Keithley6517BBackend:
                 "K6517B_INVALID_SETTINGS",
                 "output_off_between_measurements",
             )
+        output_off_at_end = merged["output_off_at_sequence_end"]
+        if not isinstance(output_off_at_end, bool):
+            raise ModuleError(
+                "output_off_at_sequence_end must be true or false",
+                "K6517B_INVALID_SETTINGS",
+                "output_off_at_sequence_end",
+            )
         operation_timeout = self._finite_number(
             operation_timeout_seconds, "operation_timeout_seconds"
         )
@@ -1004,6 +1074,7 @@ class Keithley6517BBackend:
             "nplc": nplc,
             "settle_seconds": settle,
             "output_off_between_measurements": output_off,
+            "output_off_at_sequence_end": output_off_at_end,
         }
 
     @staticmethod

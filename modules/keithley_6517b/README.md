@@ -5,7 +5,7 @@
 使用 `R = V / I` 计算电阻。
 
 尚未用真实 6517B、高压测试夹具、联锁、GPIB 控制器和样品验证，因此版本保持
-`0.1.0b1`。自动化 fake-instrument 测试不能替代高压安全认证。
+`0.1.0b2`。自动化 fake-instrument 测试不能替代高压安全认证。
 
 ## 接线和固定 METER-CONNECT 条件
 
@@ -47,7 +47,8 @@
 - **Measure**：本模块没有声明 `slots`，所以核心在每个逻辑槽位都调用一次
   `measure(slot, api)`；再次确认全部配置和 METER-CONNECT，关闭 zero check，进入
   operate，等待并读取。
-- **Stop / Error / completed**：`run_end` 恢复 standby + zero check ON，模块仍保持 Enabled。
+- **Stop / Error / completed**：`run_end` 默认恢复 standby + zero check ON；取消 SEQ-end
+  选项时保留上一条成功测量留下的 operate + zero check OFF。模块仍保持 Enabled。
 - **Disable / 应用退出**：`close(api)` 确认上述安全状态后释放 VISA session。
 
 通信或设置错误、METER-CONNECT 不确定、standby/zero-check 无法确认都属于框架 Error。
@@ -55,10 +56,13 @@
 
 Settings 中的 `Return to standby + zero check after each DAT row` 默认勾选：每行完成后
 回到 standby 并确认 zero check ON。取消勾选后，V-source operate 和 zero check OFF 会在
-成功行之间以及 SEQ Pause 期间保持；每个逻辑通道行仍重新读取一次。Stop、Error、
-completed、Disable、通信异常和应用退出不受该选项影响，始终恢复 standby + zero check
-ON。若同时启用四槽位扫描模块，一条 `T Measure` 因此会产生四个独立 6517B 读数；没有
-扫描模块时只产生一个。
+成功行之间以及 SEQ Pause 期间保持；每个逻辑通道行仍重新读取一次。
+
+`Output OFF at SEQ end` 也默认勾选。只有同时取消两个选项，成功测量留下的连续偏置才会
+跨过 `completed`、Stop 或 Error 的 `run_end`，并在下一次 SEQ 开始时保持不间断。该选项
+不会主动打开原本处于 standby 的输出。Disable、重新 Apply、应用退出，以及 Measure
+自身发生通信、配置或取消异常时，仍会恢复 standby + zero check ON。若同时启用四槽位
+扫描模块，一条 `T Measure` 会产生四个独立 6517B 读数；没有扫描模块时只产生一个。
 
 ## DAT 状态码
 
