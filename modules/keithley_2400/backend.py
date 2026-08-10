@@ -56,6 +56,7 @@ class Keithley2400Backend:
         "Current": "A",
         "StatusCode": "",
     }
+    display_columns = ("Resistance",)
 
     def __init__(
         self,

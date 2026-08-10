@@ -83,6 +83,7 @@ class Keithley6221DeltaBackend:
         "SampleCount": "",
         "StatusCode": "",
     }
+    display_columns = ("Resistance",)
 
     def __init__(
         self,

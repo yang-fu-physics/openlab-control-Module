@@ -61,6 +61,7 @@ class Keithley2614BBackend:
         "Current2": "A",
         "StatusCode2": "",
     }
+    display_columns = ("R1", "R2")
 
     def __init__(
         self,

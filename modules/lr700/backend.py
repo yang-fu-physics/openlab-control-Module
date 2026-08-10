@@ -79,6 +79,7 @@ class LR700Backend:
         "X4": "Ohm",
         "StatusCode": "",
     }
+    display_columns = ("R1", "R2", "R3", "R4")
 
     def __init__(
         self,

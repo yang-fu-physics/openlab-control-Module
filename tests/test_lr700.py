@@ -1001,7 +1001,7 @@ class LR700ManifestTests(unittest.TestCase):
         self.assertEqual(descriptor.id, "lr700")
         self.assertEqual(
             descriptor.version,
-            "0.1.0b5",
+            "0.1.0b6",
         )
         self.assertEqual(descriptor.dependencies, ())
         names = list(LR700Backend.columns)

@@ -1,6 +1,6 @@
 # Keithley 6221 + 2182A Delta
 
-版本 `0.2.0b1`。本模块用 Keithley 6221 电流源和通过其 RS-232/Trigger Link
+版本 `0.2.0b2`。本模块用 Keithley 6221 电流源和通过其 RS-232/Trigger Link
 连接的 2182A 纳伏表执行 Delta 测量，并可明确选择以下通道路由方式：
 
 - `None`：不连接切换器，只允许 CH1；

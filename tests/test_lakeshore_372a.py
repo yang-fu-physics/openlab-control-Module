@@ -1279,7 +1279,7 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b9",
+            "0.1.0b10",
         )
         self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(

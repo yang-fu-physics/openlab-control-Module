@@ -24,6 +24,7 @@ from . import my_meter
 
 class Module:
     columns = {"Resistance": "Ohm", "StatusCode": ""}
+    display_columns = ("Resistance",)  # 可选：主窗口卡片显示的已有列
 
     def open(self, api: ModuleAPI):
         self.instrument = my_meter.PyVisaTransport("GPIB0::1::INSTR", 3.0)
@@ -69,12 +70,17 @@ class Module:
 
 可选：
 
+- `display_columns`：最多八个已有 DAT 列名，供主窗口卡片显示最近结果。
 - `configure(settings, api)`：用户明确 Apply 时调用。
 - `on_event(event, data, api)`：统一处理 `run_start`、`run_end`、`status`、`action`。
 - `slots`：正整数、正整数序列或动态 property。
 
 `run_end` 的 `data["reason"]` 为 `completed`、`stopped` 或 `error`。`action` 的 data 为
 `{"name": str, "payload": dict}`。
+
+卡片只显示本次 `measure` 已返回并通过核心校验的缓存值，不会为了界面刷新再次访问
+仪表。声明 `slots` 时按逻辑通道显示；未声明时只保留最新一行。不写
+`display_columns` 不影响 Enable、测量或 DAT。
 
 会打开输出的模块默认应在三种 `run_end` 中关闭。确有连续栅压等需求时，可以提供默认
 勾选的“SEQ 结束关闭输出”设置；用户取消后，只有在读回确认输出和关键设置仍正确时才可

@@ -78,6 +78,7 @@ class LakeShore372ABackend:
         "Current4": "A",
         "StatusCode": "",
     }
+    display_columns = ("R1", "R2", "R3", "R4")
 
     def __init__(
         self,
