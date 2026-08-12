@@ -15,7 +15,7 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from labcontrol.extensions.loading import load_source_object  # noqa: E402
+from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from labcontrol.module_api import (  # noqa: E402
     ModuleError,
     _ModuleOperationCancelled as ModuleOperationCancelled,
@@ -25,6 +25,7 @@ from labcontrol.measurement.frontend_api import (  # noqa: E402
 )
 from module_contract import (  # noqa: E402
     TestModuleAPI,
+    measurement_resources,
     measure_module,
     module_slots,
     open_module,
@@ -213,10 +214,6 @@ class Keithley6517BBackendTests(unittest.TestCase):
     def _backend(state: _FakeState, waits: list[float] | None = None):
         return Keithley6517BBackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::27::INSTR",
-                "GPIB0::8::INSTR",
-            ),
             waiter=(
                 (lambda _context, seconds: waits.append(seconds))
                 if waits is not None
@@ -224,7 +221,7 @@ class Keithley6517BBackendTests(unittest.TestCase):
             ),
         )
 
-    def test_open_discovers_without_connection_or_high_voltage_writes(self) -> None:
+    def test_open_reads_registry_without_connection_or_high_voltage_writes(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
@@ -234,6 +231,7 @@ class Keithley6517BBackendTests(unittest.TestCase):
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
         self.assertEqual(status["Applied Settings"], "Not applied")
+        self.assertNotIn("Available GPIB Resources", status)
 
     def test_apply_sets_and_verifies_meter_connect_in_safe_state(self) -> None:
         state = _FakeState()
@@ -484,7 +482,6 @@ class Keithley6517BBackendTests(unittest.TestCase):
 
         backend = Keithley6517BBackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (),
             waiter=cancel,
         )
         messages: list[tuple[str, dict]] = []
@@ -617,18 +614,19 @@ class Keithley6517BFrontendTests(unittest.TestCase):
         self.assertAlmostEqual(saved["settle_seconds"], 5.0)
         self.assertFalse(saved["output_off_at_sequence_end"])
 
-    def test_resource_refresh_preserves_manual_address(self) -> None:
-        frontend = Keithley6517BFrontend(ModuleUIAPI())
+    def test_resource_dropdown_uses_central_registry_ids(self) -> None:
+        frontend = Keithley6517BFrontend(ModuleUIAPI(resources=measurement_resources({
+            "electrometer": "GPIB0::27::INSTR",
+        })))
         settings_page = frontend
         status_page = frontend.status_widget
-        frontend.resource.setCurrentText("GPIB9::27::INSTR")
+        supplied = _settings()
+        supplied["resource"] = "electrometer"
+        frontend.load(supplied)
 
-        frontend.show_status(
-            {"Available GPIB Resources": ["GPIB0::27::INSTR"]}
-        )
-
-        self.assertEqual(frontend.resource.currentText(), "GPIB9::27::INSTR")
-        self.assertGreaterEqual(frontend.resource.findText("GPIB0::27::INSTR"), 0)
+        self.assertFalse(frontend.resource.isEditable())
+        self.assertEqual(frontend.resource.currentData(), "electrometer")
+        self.assertEqual(frontend.dump()["resource"], "electrometer")
         self.assertIsInstance(settings_page, QWidget)
         self.assertIsInstance(status_page, QWidget)
 

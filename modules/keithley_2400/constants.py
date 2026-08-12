@@ -16,9 +16,9 @@ SENSE_2WIRE: Final = "2wire"
 SENSE_4WIRE: Final = "4wire"
 
 # Series 2400 用户手册给出的 Model 2400 实际最大输出幅度。
-DEVICE_MAX_CURRENT_A: Final = 1.05
-DEVICE_MAX_VOLTAGE_V: Final = 210.0
-DEVICE_MAX_CONTINUOUS_POWER_W: Final = 22.0
+INSTRUMENT_MAX_CURRENT_A: Final = 1.05
+INSTRUMENT_MAX_VOLTAGE_V: Final = 210.0
+INSTRUMENT_MAX_CONTINUOUS_POWER_W: Final = 22.0
 
 # DAT 状态码只表示本行数据质量；框架 Warning/Error 仍使用独立事件。
 STATUS_CODE_NORMAL: Final = 0
@@ -51,9 +51,9 @@ def default_settings() -> dict[str, Any]:
 
 
 __all__ = [
-    "DEVICE_MAX_CONTINUOUS_POWER_W",
-    "DEVICE_MAX_CURRENT_A",
-    "DEVICE_MAX_VOLTAGE_V",
+    "INSTRUMENT_MAX_CONTINUOUS_POWER_W",
+    "INSTRUMENT_MAX_CURRENT_A",
+    "INSTRUMENT_MAX_VOLTAGE_V",
     "SENSE_2WIRE",
     "SENSE_4WIRE",
     "SOURCE_CURRENT",

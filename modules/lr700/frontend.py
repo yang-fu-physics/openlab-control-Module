@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from PySide6.QtCore import QSize, QSignalBlocker
+from PySide6.QtCore import QSize, QSignalBlocker, Qt
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
@@ -80,17 +80,8 @@ class LR700Frontend(QWidget):
             communication
         )
         self.resource = QComboBox()
-        # 自动发现只用于方便选择；允许手动输入已知 GPIB 地址，便于离线配置。
-        self.resource.setEditable(True)
         self.resource.setMinimumContentsLength(24)
-        self.refresh_resources_button = QPushButton(
-            "Refresh GPIB"
-        )
-        self.refresh_resources_button.clicked.connect(
-            lambda: self.api.action(
-                "refresh_resources"
-            )
-        )
+        self._load_resources()
         self.io_timeout = QDoubleSpinBox()
         self.io_timeout.setRange(0.1, 30.0)
         self.io_timeout.setDecimals(1)
@@ -99,7 +90,7 @@ class LR700Frontend(QWidget):
         self.retry_attempts = QSpinBox()
         self.retry_attempts.setRange(1, 5)
         communication_layout.addWidget(
-            QLabel("VISA resource"),
+            QLabel("Instrument resource"),
             0,
             0,
         )
@@ -109,11 +100,6 @@ class LR700Frontend(QWidget):
             1,
             1,
             3,
-        )
-        communication_layout.addWidget(
-            self.refresh_resources_button,
-            0,
-            4,
         )
         communication_layout.addWidget(
             QLabel("I/O timeout"),
@@ -304,7 +290,6 @@ class LR700Frontend(QWidget):
             "Applied Settings",
             "Sequence",
             "Excitation Safety",
-            "Resource Discovery",
             "Estimated Measure Time (s)",
             "Current Sensor",
             "Current Range Index",
@@ -327,9 +312,6 @@ class LR700Frontend(QWidget):
         self.test_connection_button = QPushButton(
             "Test Connection"
         )
-        self.status_refresh_resources_button = (
-            QPushButton("Refresh GPIB")
-        )
         self.refresh_status_button = QPushButton(
             "Refresh Status"
         )
@@ -339,19 +321,11 @@ class LR700Frontend(QWidget):
                 {"settings": self.dump()},
             )
         )
-        self.status_refresh_resources_button.clicked.connect(
-            lambda: self.api.action(
-                "refresh_resources"
-            )
-        )
         self.refresh_status_button.clicked.connect(
             self.api.refresh
         )
         buttons.addWidget(
             self.test_connection_button
-        )
-        buttons.addWidget(
-            self.status_refresh_resources_button
         )
         buttons.addWidget(self.refresh_status_button)
         buttons.addStretch(1)
@@ -412,9 +386,7 @@ class LR700Frontend(QWidget):
                 ),
             }
         return {
-            "resource": (
-                self.resource.currentText().strip()
-            ),
+            "resource": str(self.resource.currentData() or ""),
             "switch_settle_seconds": (
                 self.switch_settle_seconds.value()
             ),
@@ -541,13 +513,6 @@ class LR700Frontend(QWidget):
         self,
         status: Mapping[str, Any],
     ) -> None:
-        resources = status.get(
-            "Available GPIB Resources"
-        )
-        if isinstance(resources, (list, tuple)):
-            self._update_resources(
-                tuple(str(item) for item in resources)
-            )
         for key, value in status.items():
             label = self.status_labels.get(str(key))
             if label is None:
@@ -562,34 +527,30 @@ class LR700Frontend(QWidget):
             else:
                 label.setText(str(value))
 
-    def _update_resources(
-        self,
-        resources: tuple[str, ...],
-    ) -> None:
-        current = self.resource.currentText().strip()
+    def _load_resources(self) -> None:
+        """从核心资源快照创建不可编辑下拉框，不在模块内扫描 VISA。"""
+
         blocker = QSignalBlocker(self.resource)
         self.resource.clear()
-        for resource in sorted(
-            set(resources),
-            key=str.casefold,
-        ):
-            self.resource.addItem(resource)
-        if (
-            current
-            and self.resource.findText(current) < 0
-        ):
-            self.resource.addItem(current)
-        self.resource.setCurrentText(current)
+        self.resource.addItem("Select instrument…", "")
+        for resource_id, info in sorted(self.api.resources().items()):
+            identity = str(info.get("identity") or "").strip()
+            label = resource_id if not identity else f"{resource_id} — {identity}"
+            self.resource.addItem(label, resource_id)
+            self.resource.setItemData(
+                self.resource.count() - 1,
+                str(info.get("address", "")),
+                Qt.ItemDataRole.ToolTipRole,
+            )
         del blocker
 
     def _select_resource(self, resource: str) -> None:
         value = resource.strip()
-        if (
-            value
-            and self.resource.findText(value) < 0
-        ):
-            self.resource.addItem(value)
-        self.resource.setCurrentText(value)
+        index = self.resource.findData(value)
+        if index < 0 and value:
+            self.resource.addItem(f"Unavailable — {value}", value)
+            index = self.resource.count() - 1
+        self.resource.setCurrentIndex(max(0, index))
 
     @staticmethod
     def _select_data(

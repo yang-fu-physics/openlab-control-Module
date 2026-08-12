@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import QSize, QSignalBlocker
+from PySide6.QtCore import QSize, QSignalBlocker, Qt
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
@@ -101,12 +101,8 @@ class Keithley2400Frontend(QWidget):
         communication = QGroupBox("GPIB Communication", content)
         communication_layout = QGridLayout(communication)
         self.resource = QComboBox()
-        self.resource.setEditable(True)
         self.resource.setMinimumContentsLength(24)
-        self.refresh_resources_button = QPushButton("Refresh GPIB")
-        self.refresh_resources_button.clicked.connect(
-            lambda: self.api.action("refresh_resources")
-        )
+        self._load_resources()
         self.test_connection_button = QPushButton("Test Connection")
         self.test_connection_button.clicked.connect(
             lambda: self.api.action(
@@ -126,9 +122,8 @@ class Keithley2400Frontend(QWidget):
             "voltage, must remain active after run_end. Disable, Apply, and "
             "measurement-failure cleanup still request output OFF."
         )
-        communication_layout.addWidget(QLabel("VISA resource"), 0, 0)
+        communication_layout.addWidget(QLabel("Instrument resource"), 0, 0)
         communication_layout.addWidget(self.resource, 0, 1, 1, 3)
-        communication_layout.addWidget(self.refresh_resources_button, 0, 4)
         communication_layout.addWidget(self.test_connection_button, 1, 4)
         communication_layout.addWidget(QLabel("I/O timeout"), 1, 0)
         communication_layout.addWidget(self.io_timeout, 1, 1)
@@ -264,7 +259,7 @@ class Keithley2400Frontend(QWidget):
         """返回可保存到 TOML/JSON 的 desired settings；不代表已 Apply。"""
 
         return {
-            "resource": self.resource.currentText().strip(),
+            "resource": str(self.resource.currentData() or ""),
             "io_timeout_seconds": self.io_timeout.value(),
             "source_mode": self.source_mode.currentData(),
             "source_current": self.source_current.text().strip(),
@@ -307,9 +302,6 @@ class Keithley2400Frontend(QWidget):
         self._update_source_mode()
 
     def show_status(self, status: Mapping[str, Any]) -> None:
-        resources = status.get("Available GPIB Resources")
-        if isinstance(resources, (list, tuple)):
-            self._update_resources(tuple(str(item) for item in resources))
         for key, value in status.items():
             label = self.status_labels.get(str(key))
             if label is None:
@@ -337,22 +329,30 @@ class Keithley2400Frontend(QWidget):
             )
         )
 
-    def _update_resources(self, resources: tuple[str, ...]) -> None:
-        current = self.resource.currentText().strip()
+    def _load_resources(self) -> None:
+        """从核心资源快照创建不可编辑下拉框，不再自行扫描 VISA。"""
+
         blocker = QSignalBlocker(self.resource)
         self.resource.clear()
-        for resource in sorted(set(resources), key=str.casefold):
-            self.resource.addItem(resource)
-        if current and self.resource.findText(current) < 0:
-            self.resource.addItem(current)
-        self.resource.setCurrentText(current)
+        self.resource.addItem("Select instrument…", "")
+        for resource_id, info in sorted(self.api.resources().items()):
+            identity = str(info.get("identity") or "").strip()
+            label = resource_id if not identity else f"{resource_id} — {identity}"
+            self.resource.addItem(label, resource_id)
+            self.resource.setItemData(
+                self.resource.count() - 1,
+                str(info.get("address", "")),
+                Qt.ItemDataRole.ToolTipRole,
+            )
         del blocker
 
     def _select_resource(self, resource: str) -> None:
         value = resource.strip()
-        if value and self.resource.findText(value) < 0:
-            self.resource.addItem(value)
-        self.resource.setCurrentText(value)
+        index = self.resource.findData(value)
+        if index < 0 and value:
+            self.resource.addItem(f"Unavailable — {value}", value)
+            index = self.resource.count() - 1
+        self.resource.setCurrentIndex(max(0, index))
 
     @staticmethod
     def _select_data(combo: QComboBox, value: Any) -> None:

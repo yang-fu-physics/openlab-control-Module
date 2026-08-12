@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from PySide6.QtCore import QSize, QSignalBlocker
+from PySide6.QtCore import QSize, QSignalBlocker, Qt
 from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -87,17 +87,8 @@ class LakeShore372AFrontend(QWidget):
             communication
         )
         self.resource = QComboBox()
-        # 下拉框展示自动发现结果，但必须允许手动输入离线配置中已知的 GPIB 地址。
-        self.resource.setEditable(True)
         self.resource.setMinimumContentsLength(24)
-        self.refresh_resources_button = QPushButton(
-            "Refresh GPIB"
-        )
-        self.refresh_resources_button.clicked.connect(
-            lambda: self.api.action(
-                "refresh_resources"
-            )
-        )
+        self._load_resources()
         self.io_timeout = QDoubleSpinBox()
         self.io_timeout.setRange(0.1, 30.0)
         self.io_timeout.setDecimals(1)
@@ -106,7 +97,7 @@ class LakeShore372AFrontend(QWidget):
         self.retry_attempts = QSpinBox()
         self.retry_attempts.setRange(1, 5)
         communication_layout.addWidget(
-            QLabel("VISA resource"),
+            QLabel("Instrument resource"),
             0,
             0,
         )
@@ -116,11 +107,6 @@ class LakeShore372AFrontend(QWidget):
             1,
             1,
             3,
-        )
-        communication_layout.addWidget(
-            self.refresh_resources_button,
-            0,
-            4,
         )
         communication_layout.addWidget(
             QLabel("I/O timeout"),
@@ -279,8 +265,8 @@ class LakeShore372AFrontend(QWidget):
         layout.addLayout(channel_grid)
 
         note = QLabel(
-            "Enable only opens this module and discovers "
-            "GPIB resources. Apply Settings verifies *IDN? and "
+            "The instrument resource is selected from the central "
+            "scanner configuration. Apply Settings verifies *IDN? and "
             "configures the selected inputs while keeping "
             "excitation shunted. Measure temporarily enables "
             "excitation channel by channel."
@@ -329,7 +315,6 @@ class LakeShore372AFrontend(QWidget):
             "Applied Settings",
             "Sequence",
             "Excitation",
-            "Resource Discovery",
             "Estimated Measure Time (s)",
             "Last Channel",
             "Last Resistance (Ohm)",
@@ -350,9 +335,6 @@ class LakeShore372AFrontend(QWidget):
         self.test_connection_button = QPushButton(
             "Test Connection"
         )
-        self.status_refresh_resources_button = (
-            QPushButton("Refresh GPIB")
-        )
         self.refresh_status_button = QPushButton(
             "Refresh Status"
         )
@@ -362,19 +344,11 @@ class LakeShore372AFrontend(QWidget):
                 {"settings": self.dump()},
             )
         )
-        self.status_refresh_resources_button.clicked.connect(
-            lambda: self.api.action(
-                "refresh_resources"
-            )
-        )
         self.refresh_status_button.clicked.connect(
             self.api.refresh
         )
         buttons.addWidget(
             self.test_connection_button
-        )
-        buttons.addWidget(
-            self.status_refresh_resources_button
         )
         buttons.addWidget(self.refresh_status_button)
         buttons.addStretch(1)
@@ -420,7 +394,7 @@ class LakeShore372AFrontend(QWidget):
                 ),
             }
         return {
-            "resource": self.resource.currentText().strip(),
+            "resource": str(self.resource.currentData() or ""),
             "frequency_index": int(
                 self.frequency.currentData()
             ),
@@ -565,15 +539,7 @@ class LakeShore372AFrontend(QWidget):
         self,
         status: Mapping[str, Any],
     ) -> None:
-        """合并 worker 状态到标签，并用资源发现结果刷新可编辑下拉框。"""
-
-        resources = status.get(
-            "Available GPIB Resources"
-        )
-        if isinstance(resources, (list, tuple)):
-            self._update_resources(
-                tuple(str(item) for item in resources)
-            )
+        """把 worker 返回的只读状态合并到标签。"""
         for key, value in status.items():
             label = self.status_labels.get(str(key))
             if label is None:
@@ -733,35 +699,32 @@ class LakeShore372AFrontend(QWidget):
                 f"{allowed[-1]}"
             )
 
-    def _update_resources(
-        self,
-        resources: tuple[str, ...],
-    ) -> None:
-        """更新发现列表，同时保留用户正在编辑但尚未被发现的手动地址。
+    def _load_resources(self) -> None:
+        """从核心资源快照创建不可编辑下拉框，不在模块内扫描 VISA。"""
 
-        更新过程阻断信号，避免一次 Status 自动刷新把设置标成已修改。
-        """
-
-        current = self.resource.currentText().strip()
         blocker = QSignalBlocker(self.resource)
         self.resource.clear()
-        for resource in sorted(
-            set(resources),
-            key=str.casefold,
-        ):
-            self.resource.addItem(resource)
-        if current and self.resource.findText(current) < 0:
-            self.resource.addItem(current)
-        self.resource.setCurrentText(current)
+        self.resource.addItem("Select instrument…", "")
+        for resource_id, info in sorted(self.api.resources().items()):
+            identity = str(info.get("identity") or "").strip()
+            label = resource_id if not identity else f"{resource_id} — {identity}"
+            self.resource.addItem(label, resource_id)
+            self.resource.setItemData(
+                self.resource.count() - 1,
+                str(info.get("address", "")),
+                Qt.ItemDataRole.ToolTipRole,
+            )
         del blocker
 
     def _select_resource(self, resource: str) -> None:
-        """选择保存的资源；不在发现列表时先加入，支持完全离线的手动配置。"""
+        """按稳定资源 ID 选择；缺失项明确标记，不把 ID 当通讯地址。"""
 
         value = resource.strip()
-        if value and self.resource.findText(value) < 0:
-            self.resource.addItem(value)
-        self.resource.setCurrentText(value)
+        index = self.resource.findData(value)
+        if index < 0 and value:
+            self.resource.addItem(f"Unavailable — {value}", value)
+            index = self.resource.count() - 1
+        self.resource.setCurrentIndex(max(0, index))
 
     @staticmethod
     def _select_data(

@@ -102,9 +102,9 @@ class SimulatedTransportBackend:
         return self.applied_settings or self.desired_settings
 
     def _resistance(self, index: int, api: ModuleAPI) -> float:
-        devices = api.devices()
-        temperature = float(devices.get("temperature", {}).get("current") or 300.0)
-        field_oe = float(devices.get("field", {}).get("current") or 0.0)
+        instruments = api.instruments()
+        temperature = float(instruments.get("temperature", {}).get("current") or 300.0)
+        field_oe = float(instruments.get("field", {}).get("current") or 0.0)
         settings = self._settings()
         base = 0.05 * index + 0.003 * temperature
         magnetoresistance = 0.01 * index * (field_oe / 10_000.0) ** 2

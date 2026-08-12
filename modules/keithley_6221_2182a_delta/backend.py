@@ -1,4 +1,4 @@
-﻿"""Keithley 6221 + 2182A Delta 与显式可选切换器的 Measurement Module 后端。
+"""Keithley 6221 + 2182A Delta 与显式可选切换器的 Measurement Module 后端。
 
 协议依据：
 
@@ -37,9 +37,9 @@ from labcontrol.module_api import (
 
 from .constants import (
     ARM_SETTLE_SECONDS,
-    DEVICE_COMPLIANCE_MAX_V,
-    DEVICE_COMPLIANCE_MIN_V,
-    DEVICE_CURRENT_LIMIT_A,
+    INSTRUMENT_COMPLIANCE_MAX_V,
+    INSTRUMENT_COMPLIANCE_MIN_V,
+    INSTRUMENT_CURRENT_LIMIT_A,
     FILTER_TYPES,
     MAX_DELTA_COUNT,
     MODE_INDEPENDENT,
@@ -64,7 +64,6 @@ from . import keithley_7001
 
 
 TransportFactory = Callable[[str, float], keithley_6221.Transport]
-ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
 
 # 长时间 ``*OPC?`` 不再拥有可配置的单通道超时，而是共享本次 Measure 的核心总
@@ -89,15 +88,11 @@ class Keithley6221DeltaBackend:
         self,
         *,
         transport_factory: TransportFactory | None = None,
-        resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
         routing: RoutingTable | None = None,
     ) -> None:
         self._transport_factory = (
             transport_factory or keithley_6221.PyVisaTransport
-        )
-        self._resource_lister = (
-            resource_lister or keithley_6221.PyVisaTransport.list_resources
         )
         self._waiter = (
             waiter
@@ -135,8 +130,9 @@ class Keithley6221DeltaBackend:
         self.last_status = "Idle"
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
-        """只发现资源并建立空闲状态，不连接或配置任何仪表。"""
+        """读取核心资源快照并建立空闲状态，不连接或配置任何仪表。"""
 
+        api.resources()
         self.desired_settings = self._normalized_settings(
             default_settings(),
             require_6221=False,
@@ -145,23 +141,6 @@ class Keithley6221DeltaBackend:
                 api.timeout
             ),
         )
-        resources: tuple[str, ...]
-        try:
-            resources = tuple(
-                sorted(
-                    set(self._resource_lister()),
-                    key=str.casefold,
-                )
-            )
-            api.warn("K6221_RESOURCE_DISCOVERY_FAILED", None)
-        except Exception as exc:
-            resources = ()
-            api.warn(
-                "K6221_RESOURCE_DISCOVERY_FAILED",
-                "GPIB resource discovery failed: "
-                f"{type(exc).__name__}: {exc}",
-            )
-
         # Enable 不读取保存设置，也不探测切换器；只有 Apply 才按用户的明确选择连接。
         self.switcher_type = SWITCHER_NONE
         self.identity_switcher = ""
@@ -170,9 +149,7 @@ class Keithley6221DeltaBackend:
         self.armed = False
         self.active_channel = ""
         self.last_status = "Initialized"
-        status = self._status(
-            available_resources=resources,
-        )
+        status = self._status()
         api.status(status)
         return status
 
@@ -518,28 +495,8 @@ class Keithley6221DeltaBackend:
         payload: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """处理 Idle 时的资源刷新、连接测试和安全关闭。"""
+        """处理 Idle 时的连接测试和安全关闭。"""
 
-        if action == "refresh_resources":
-            try:
-                resources = tuple(
-                    sorted(
-                        set(self._resource_lister()),
-                        key=str.casefold,
-                    )
-                )
-            except Exception as exc:
-                raise ModuleWarning(
-                    "GPIB resource discovery failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    "K6221_RESOURCE_DISCOVERY_FAILED",
-                ) from exc
-            api.warn("K6221_RESOURCE_DISCOVERY_FAILED", None)
-            status = self._status(
-                available_resources=resources,
-            )
-            api.status(status)
-            return status
         if action == "test_connection":
             candidate = payload.get(
                 "settings",
@@ -608,8 +565,11 @@ class Keithley6221DeltaBackend:
         test_6221: keithley_6221.Transport | None = None
         test_switcher: keithley_6221.Transport | None = None
         try:
+            resource_6221 = api.resource_address(
+                str(settings["resource_6221"])
+            )
             test_6221 = self._transport_factory(
-                str(settings["resource_6221"]),
+                resource_6221,
                 float(settings["io_timeout_seconds"]),
             )
             identity_6221 = test_6221.query(keithley_6221.IDENTIFY).strip()
@@ -617,8 +577,11 @@ class Keithley6221DeltaBackend:
             self.identity_6221 = identity_6221
             switcher_type = str(settings["switcher_type"])
             if switcher_type != SWITCHER_NONE:
+                resource_switcher = api.resource_address(
+                    str(settings["resource_switcher"])
+                )
                 test_switcher = self._transport_factory(
-                    str(settings["resource_switcher"]),
+                    resource_switcher,
                     float(settings["io_timeout_seconds"]),
                 )
                 identity_switcher = test_switcher.query(
@@ -648,9 +611,11 @@ class Keithley6221DeltaBackend:
         api: ModuleAPI,
     ) -> None:
         self._close_transport_6221()
+        resource_id = str(settings["resource_6221"])
+        resource = api.resource_address(resource_id)
         try:
             self.transport_6221 = self._transport_factory(
-                str(settings["resource_6221"]),
+                resource,
                 float(settings["io_timeout_seconds"]),
             )
             identity = self.transport_6221.query(keithley_6221.IDENTIFY).strip()
@@ -664,7 +629,7 @@ class Keithley6221DeltaBackend:
                 "Unable to connect to Keithley 6221: "
                 f"{type(exc).__name__}: {exc}",
                 "K6221_CONNECTION_FAILED",
-                str(settings["resource_6221"]),
+                resource_id,
             ) from exc
         self.identity_6221 = identity
         api.sleep(0)
@@ -678,7 +643,8 @@ class Keithley6221DeltaBackend:
 
         self._close_transport_switcher()
         switcher_type = str(settings["switcher_type"])
-        resource = str(settings["resource_switcher"])
+        resource_id = str(settings["resource_switcher"])
+        resource = api.resource_address(resource_id)
         try:
             self.transport_switcher = self._transport_factory(
                 resource,
@@ -697,7 +663,7 @@ class Keithley6221DeltaBackend:
                 f"Keithley {switcher_type} could not be connected for Apply: "
                 f"{type(exc).__name__}: {exc}",
                 "K6221_SWITCHER_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         self.identity_switcher = identity
         api.sleep(0)
@@ -1366,6 +1332,9 @@ class Keithley6221DeltaBackend:
         api: ModuleAPI,
     ) -> str:
         self._serial_write(command, api)
+        # 2182A 以 19.2 kbaud 把响应发回 6221。立即读取 6221 的串口缓冲会得到空串，
+        # 因此给已发送的查询一次固定传输时间；这里不重发命令。
+        self._waiter(api, 0.1)
         return self._query_6221(
             keithley_6221.SERIAL_ENTER_QUERY,
             api,
@@ -1560,11 +1529,7 @@ class Keithley6221DeltaBackend:
             )
         return settings
 
-    def _status(
-        self,
-        *,
-        available_resources: tuple[str, ...] | None = None,
-    ) -> dict[str, Any]:
+    def _status(self) -> dict[str, Any]:
         status: dict[str, Any] = {
             "State": self.last_status,
             "6221": self.identity_6221 or "Not connected",
@@ -1591,10 +1556,6 @@ class Keithley6221DeltaBackend:
             status["Last Current (A)"] = self.last_current
         if self.last_stddev is not None:
             status["Last StdDev (Ohm)"] = self.last_stddev
-        if available_resources is not None:
-            status["Available GPIB Resources"] = list(
-                available_resources
-            )
         return status
 
     def _close_transport_6221(self) -> None:
@@ -1673,24 +1634,16 @@ class Keithley6221DeltaBackend:
             ).strip()
             if key == "resource_switcher" and switcher_type == SWITCHER_NONE:
                 value = ""
-            if value and not value.upper().startswith(
-                "GPIB"
-            ):
-                raise ModuleError(
-                    f"{key} must be a GPIB VISA resource",
-                    "K6221_INVALID_SETTINGS",
-                    key,
-                )
             result[key] = value
         if require_6221 and not result["resource_6221"]:
             raise ModuleError(
-                "Select the Keithley 6221 GPIB resource",
+                "Select the Keithley 6221 instrument resource",
                 "K6221_INVALID_SETTINGS",
                 "resource_6221",
             )
         if switcher_type != SWITCHER_NONE and not result["resource_switcher"]:
             raise ModuleError(
-                "Select the switcher GPIB resource",
+                "Select the switcher instrument resource",
                 "K6221_INVALID_SETTINGS",
                 "resource_switcher",
             )
@@ -1701,7 +1654,7 @@ class Keithley6221DeltaBackend:
             == result["resource_switcher"].casefold()
         ):
             raise ModuleError(
-                "Keithley 6221 and switcher must use different VISA resources",
+                "Keithley 6221 and switcher must use different instrument resources",
                 "K6221_INVALID_SETTINGS",
                 "resource_switcher",
             )
@@ -1892,29 +1845,29 @@ class Keithley6221DeltaBackend:
                 "K6221_INVALID_SETTINGS",
                 prefix,
             ) from exc
-        if not 0 <= high <= DEVICE_CURRENT_LIMIT_A:
+        if not 0 <= high <= INSTRUMENT_CURRENT_LIMIT_A:
             raise ModuleError(
                 f"{prefix}.high_current must be from 0 to "
-                f"{DEVICE_CURRENT_LIMIT_A:g} A",
+                f"{INSTRUMENT_CURRENT_LIMIT_A:g} A",
                 "K6221_INVALID_SETTINGS",
                 f"{prefix}.high_current",
             )
-        if not -DEVICE_CURRENT_LIMIT_A <= low <= 0:
+        if not -INSTRUMENT_CURRENT_LIMIT_A <= low <= 0:
             raise ModuleError(
                 f"{prefix}.low_current must be from "
-                f"{-DEVICE_CURRENT_LIMIT_A:g} to 0 A",
+                f"{-INSTRUMENT_CURRENT_LIMIT_A:g} to 0 A",
                 "K6221_INVALID_SETTINGS",
                 f"{prefix}.low_current",
             )
         if not (
-            DEVICE_COMPLIANCE_MIN_V
+            INSTRUMENT_COMPLIANCE_MIN_V
             <= compliance
-            <= DEVICE_COMPLIANCE_MAX_V
+            <= INSTRUMENT_COMPLIANCE_MAX_V
         ):
             raise ModuleError(
                 f"{prefix}.compliance must be from "
-                f"{DEVICE_COMPLIANCE_MIN_V:g} to "
-                f"{DEVICE_COMPLIANCE_MAX_V:g} V",
+                f"{INSTRUMENT_COMPLIANCE_MIN_V:g} to "
+                f"{INSTRUMENT_COMPLIANCE_MAX_V:g} V",
                 "K6221_INVALID_SETTINGS",
                 f"{prefix}.compliance",
             )

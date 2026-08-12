@@ -17,7 +17,7 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from labcontrol.extensions.loading import load_source_object  # noqa: E402
+from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from labcontrol.module_api import (  # noqa: E402
     ModuleError,
     _ModuleOperationCancelled as ModuleOperationCancelled,
@@ -27,6 +27,7 @@ from labcontrol.measurement.frontend_api import (  # noqa: E402
 )
 from module_contract import (  # noqa: E402
     TestModuleAPI,
+    measurement_resources,
     measure_module,
     module_slots,
     open_module,
@@ -292,10 +293,6 @@ class LakeShore372ABackendTests(unittest.TestCase):
     ) -> LakeShore372ABackend:
         return LakeShore372ABackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::12::INSTR",
-                "GPIB0::7::INSTR",
-            ),
             waiter=(
                 lambda context, seconds: (
                     waits.append(seconds)
@@ -309,6 +306,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
+        resources: dict[str, dict] | None = None,
     ) -> TestModuleAPI:
         iterator = iter(samples or [])
         return TestModuleAPI(
@@ -323,6 +321,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             ),
             lambda _timeout: "running",
             120.0,
+            resources=resources,
         )
 
 
@@ -334,7 +333,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         for logical_slot in module_slots(backend):
             measure_module(backend, context, logical_slot)
 
-    def test_open_discovers_but_does_not_connect_or_apply(
+    def test_open_reads_registry_but_does_not_connect_or_apply(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -348,13 +347,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
             status["Applied Settings"],
             "Not applied",
         )
-        self.assertEqual(
-            status["Available GPIB Resources"],
-            [
-                "GPIB0::12::INSTR",
-                "GPIB0::7::INSTR",
-            ],
-        )
+        self.assertNotIn("Available GPIB Resources", status)
 
     def test_disabled_channel_uses_safe_hardware_range_without_changing_saved_value(
         self,
@@ -698,7 +691,7 @@ class LakeShore372ABackendTests(unittest.TestCase):
         state.failures["RDGR? 1"] = 1
         messages: list[tuple[str, dict]] = []
         settings = default_settings()
-        settings["resource"] = "GPIB0::12::INSTR"
+        settings["resource"] = "bridge-372"
         backend = self._backend(state, [])
         context = self._context(
             messages,
@@ -706,6 +699,9 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 _system_sample(1.0, 1.0, 10.0),
                 _system_sample(2.0, 3.0, 30.0),
             ],
+            measurement_resources({
+                "bridge-372": "GPIB0::12::INSTR",
+            }),
         )
         open_module(backend, context)
         backend.configure(settings, context)
@@ -714,6 +710,12 @@ class LakeShore372ABackendTests(unittest.TestCase):
         measure_module(backend, context)
 
         self.assertGreaterEqual(len(state.opened), 2)
+        self.assertTrue(
+            all(
+                resource == "GPIB0::12::INSTR"
+                for resource, _timeout in state.opened
+            )
+        )
         self.assertEqual(
             sum(
                 action == "query"
@@ -785,7 +787,6 @@ class LakeShore372ABackendTests(unittest.TestCase):
 
         backend = LakeShore372ABackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (),
             waiter=cancel_wait,
         )
         context = self._context(messages, [])
@@ -1107,7 +1108,10 @@ class LakeShore372AFrontendTests(unittest.TestCase):
     def test_settings_round_trip_and_resource_dropdown(
         self,
     ) -> None:
-        context = ModuleUIAPI()
+        context = ModuleUIAPI(resources=measurement_resources({
+            "bridge-372": "GPIB0::12::INSTR",
+            "alternate-bridge": "GPIB0::5::INSTR",
+        }))
         frontend = LakeShore372AFrontend(context)
         owner = QWidget()
         settings_page = frontend
@@ -1121,6 +1125,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
             600,
         )
         settings = _all_channels_settings()
+        settings["resource"] = "bridge-372"
         settings["frequency_index"] = 5
         settings["channels"]["r3"][
             "excitation_mode"
@@ -1130,13 +1135,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
         ] = 7
 
         frontend.load(settings)
-        frontend.show_status({
-            "Available GPIB Resources": [
-                "GPIB0::7::INSTR",
-                "GPIB0::12::INSTR",
-            ],
-            "Connection": "Disconnected",
-        })
+        frontend.show_status({"Connection": "Disconnected"})
 
         self.assertEqual(frontend.dump(), settings)
         self.assertGreaterEqual(
@@ -1155,8 +1154,8 @@ class LakeShore372AFrontendTests(unittest.TestCase):
                 (action, payload)
             )
         )
-        frontend.resource.setCurrentText(
-            "GPIB0::5::INSTR"
+        frontend.resource.setCurrentIndex(
+            frontend.resource.findData("alternate-bridge")
         )
         frontend.test_connection_button.click()
         self.application.processEvents()
@@ -1166,7 +1165,7 @@ class LakeShore372AFrontendTests(unittest.TestCase):
         )
         self.assertEqual(
             actions[-1][1]["settings"]["resource"],
-            "GPIB0::5::INSTR",
+            "alternate-bridge",
         )
         settings_page.deleteLater()
         status_page.deleteLater()
@@ -1279,9 +1278,8 @@ class LakeShore372AManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.1.0b10",
+            "0.1.0b11",
         )
-        self.assertEqual(descriptor.dependencies, ())
         self.assertEqual(
             list(LakeShore372ABackend.columns),
             [
@@ -1303,10 +1301,6 @@ class LakeShore372AManifestTests(unittest.TestCase):
             ],
         )
         self.assertEqual(descriptor.columns, ())
-        self.assertFalse(
-            (MODULE / "requirements.lock").exists()
-        )
-        self.assertFalse((MODULE / "wheels").exists())
 
 
 if __name__ == "__main__":

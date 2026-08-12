@@ -48,7 +48,7 @@ maximum limits 检查组合：
 
 ## 生命周期
 
-- **Enable**：只加载设置和发现 GPIB，不连接。
+- **Enable**：只读取核心已确认的 Measurement 资源表，不扫描 VISA、不连接。
 - **Apply Settings**：连接并验证型号，先关闭 A/B，设置 `OUTPUT_HIGH_Z`，再配置和
   读回两个 Enabled 通道；结束保持全部输出 OFF。
 - **Measure**：默认只在采样事务内输出；取消逐行关闭选项时可跨成功行保持 Enabled

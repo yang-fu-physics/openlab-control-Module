@@ -5,9 +5,8 @@ one LR-720-16 sixteen-sensor multiplexer through a VISA GPIB resource.
 
 ## Framework dependencies
 
-PyVISA is supplied by OpenLab Control and is not repeated in the manifest. This module has no
-additional dependency runtime, `requirements.lock`, wheel directory, or
-`Install Dependencies` step. A system VISA implementation such as NI-VISA or
+PyVISA is supplied by OpenLab Control and is not repeated in the manifest. All modules use the
+core's locked Python dependencies. A system VISA implementation such as NI-VISA or
 Keysight VISA must still be installed and configured on the instrument
 computer.
 
@@ -94,7 +93,8 @@ state back, it reports an Error instead of claiming the excitation is safe.
 Hardware interlocks and the laboratory's manual emergency procedure remain
 necessary.
 
-Enable calls `open(api)` and only discovers resources; saved desired settings remain in the UI. Test
+Enable calls `open(api)` and only reads the core's confirmed Measurement resource table; it does not
+enumerate VISA. Saved desired settings remain in the UI. Test
 Connection uses only `GET 6` and `GET 7`; it does not write settings. Loading a
 SEQ imports the module settings but does not Enable, connect, or Apply them.
 

@@ -17,7 +17,7 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from labcontrol.extensions.loading import load_source_object  # noqa: E402
+from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from labcontrol.module_api import (  # noqa: E402
     ModuleError,
     _ModuleOperationCancelled as ModuleOperationCancelled,
@@ -27,6 +27,7 @@ from labcontrol.measurement.frontend_api import (  # noqa: E402
 )
 from module_contract import (  # noqa: E402
     TestModuleAPI,
+    measurement_resources,
     measure_module,
     module_slots,
     open_module,
@@ -237,14 +238,10 @@ class Keithley2614BBackendTests(unittest.TestCase):
     def _backend(state: _FakeState, waiter=None):
         return Keithley2614BBackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::26::INSTR",
-                "GPIB0::5::INSTR",
-            ),
             waiter=waiter or (lambda context, _seconds: context.sleep(0)),
         )
 
-    def test_open_discovers_without_opening_or_writing(self) -> None:
+    def test_open_reads_registry_without_opening_or_writing(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
@@ -254,6 +251,7 @@ class Keithley2614BBackendTests(unittest.TestCase):
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
         self.assertEqual(status["Applied Settings"], "Not applied")
+        self.assertNotIn("Available GPIB Resources", status)
 
     def test_apply_configures_two_independent_channels_and_high_z_off(self) -> None:
         state = _FakeState()
@@ -623,18 +621,19 @@ class Keithley2614BFrontendTests(unittest.TestCase):
         self.assertEqual(saved["channels"]["ch2"]["sense_mode"], "4wire")
         self.assertFalse(saved["output_off_at_sequence_end"])
 
-    def test_resource_refresh_preserves_manual_address(self) -> None:
-        frontend = Keithley2614BFrontend(ModuleUIAPI())
+    def test_resource_dropdown_uses_central_registry_ids(self) -> None:
+        frontend = Keithley2614BFrontend(ModuleUIAPI(resources=measurement_resources({
+            "dual-smu": "GPIB0::26::INSTR",
+        })))
         settings_page = frontend
         status_page = frontend.status_widget
-        frontend.resource.setCurrentText("GPIB9::26::INSTR")
+        supplied = _settings()
+        supplied["resource"] = "dual-smu"
+        frontend.load(supplied)
 
-        frontend.show_status(
-            {"Available GPIB Resources": ["GPIB0::26::INSTR"]}
-        )
-
-        self.assertEqual(frontend.resource.currentText(), "GPIB9::26::INSTR")
-        self.assertGreaterEqual(frontend.resource.findText("GPIB0::26::INSTR"), 0)
+        self.assertFalse(frontend.resource.isEditable())
+        self.assertEqual(frontend.resource.currentData(), "dual-smu")
+        self.assertEqual(frontend.dump()["resource"], "dual-smu")
         self.assertIsInstance(settings_page, QWidget)
         self.assertIsInstance(status_page, QWidget)
 

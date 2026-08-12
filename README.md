@@ -27,7 +27,14 @@ class Module:
     display_columns = ("Resistance",)  # 可选：主窗口卡片显示的已有列
 
     def open(self, api: ModuleAPI):
-        self.instrument = my_meter.PyVisaTransport("GPIB0::1::INSTR", 3.0)
+        self.instrument = None
+        api.resources()  # 只读取核心给出的 Measurement 资源，不扫描 VISA
+
+    def configure(self, settings, api: ModuleAPI):
+        resource_id = str(settings["resource"])
+        address = api.resource_address(resource_id)
+        self.instrument = my_meter.PyVisaTransport(address, 3.0)
+        # 这里还必须查询身份、写入安全设置并读回确认。
 
     def measure(self, slot: int, api: ModuleAPI):
         api.sleep(0)
@@ -39,8 +46,10 @@ class Module:
         }
 
     def close(self, api: ModuleAPI):
-        self.instrument.write(my_meter.OUTPUT_OFF)
-        self.instrument.close()
+        if self.instrument is not None:
+            self.instrument.write(my_meter.OUTPUT_OFF)
+            self.instrument.close()
+            self.instrument = None
 ```
 
 不继承框架基类。目录名就是 ID，入口固定为 `backend:Module`。`columns` 是有序的
@@ -102,7 +111,8 @@ class Module:
 ## ModuleAPI
 
 - `api.sleep(seconds)`：Pause 不计时、Stop 可打断；`sleep(0)` 为检查点。
-- `api.devices()`：最新温度、磁场和 Monitor 快照副本。
+- `api.instruments()`：请求一次测量专用的即时温度、磁场和 Monitor 快照；同一时刻多个
+  模块请求由核心合并，不复用最多一个前面板周期以前的缓存。
 - `api.warn(code, message, key="")`：报告 Warning；`message=None` 解除。
 - `api.status(mapping)`：更新状态页。
 - `api.timeout`：核心给本次调用的总时限。
@@ -133,8 +143,18 @@ Run 状态钩子；这些由核心处理。
 ## 依赖
 
 PySide6、PyVISA、QtAwesome、packaging 和 typing_extensions 使用主框架版本，模块不得
-重复声明。只有额外库才写入 `dependencies`，并携带完整本地 wheel 与带 SHA-256 的
-精确 `requirements.lock`。安装不访问网络。
+重复声明，也不建立单独 runtime。需要新 Python 包时更新核心 `pyproject.toml` 与
+`requirements-lock.txt`，完成全部测试并重新构建发布包。
+
+## 仪表地址
+
+所有模块使用主框架 `tools/instrument_scanner.py` 生成的统一 Measurement 资源表，不要
+在每个模块里重新全盘扫描 VISA。前端和后台都可调用
+`api.resources()`；设置只保存稳定的资源 ID，真正连接时再取
+`api.resource_address(resource_id)`。这样 GPIB/USB 地址变化只需更新一份本机配置。
+
+资源表只提供人工确认过的身份和地址，不替代模块在 `open`/`configure` 中再次核对型号、
+有限 I/O 超时、安全设置和回读。
 
 ## 安全与协议测试
 

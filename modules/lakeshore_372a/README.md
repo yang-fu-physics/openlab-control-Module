@@ -7,9 +7,8 @@ as NI-VISA or Keysight VISA.
 ## Framework dependency status
 
 PyVISA and typing_extensions are shared framework dependencies provided directly
-by OpenLab Control and are not repeated in the module manifest. This module has
-no additional dependency runtime, lock file, wheel folder, or Install
-Dependencies step.
+by OpenLab Control and are not repeated in the module manifest. All modules use
+the core's locked Python dependencies.
 
 The VISA vendor implementation itself is a system driver, not a Python wheel.
 Install and configure NI-VISA or Keysight VISA separately on the instrument
@@ -68,8 +67,8 @@ mismatch, or unconfirmed shunt are system Errors and stop the SEQ.
 
 ## Safety and first hardware test
 
-- Enable calls `open(api)` and discovers resources only; saved settings remain
-  in the UI and are not applied to the instrument.
+- Enable calls `open(api)` and reads the core's confirmed Measurement resource
+  table only; it does not enumerate VISA, connect, or apply saved settings.
 - Apply Settings verifies `*IDN?`, configures only the four selected physical
   inputs, reads every setting back, and leaves excitation shunted.
 - Each scan switch and excitation-shunt change is read back before a value is

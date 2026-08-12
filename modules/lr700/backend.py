@@ -1,4 +1,4 @@
-﻿"""Linear Research LR-700 + LR-720-16 Measurement Module 后端。
+"""Linear Research LR-700 + LR-720-16 Measurement Module 后端。
 
 实现依据用户提供的 LR-700 v1.3 手册：
 
@@ -47,7 +47,6 @@ TransportFactory = Callable[
     [str, float],
     instrument.Transport,
 ]
-ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
 
 
@@ -84,15 +83,10 @@ class LR700Backend:
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
-        resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
     ) -> None:
         self._transport_factory = (
             transport_factory or instrument.PyVisaTransport
-        )
-        self._resource_lister = (
-            resource_lister
-            or instrument.PyVisaTransport.list_resources
         )
         self._waiter = (
             waiter
@@ -107,10 +101,9 @@ class LR700Backend:
         self.protocol_signature = ""
         self.sequence_active = False
         self.last_values: dict[str, Any] = {}
-        self.available_resources: tuple[str, ...] = ()
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
-        """Enable 只枚举地址，不连接、不写 LR-700。"""
+        """Enable 只读取核心资源表，不连接、不写 LR-700。"""
 
         self._require_live_context(api)
         self.desired_settings = self._normalized_settings(
@@ -120,18 +113,7 @@ class LR700Backend:
                 api.timeout
             ),
         )
-        discovery_message = ""
-        try:
-            self.available_resources = (
-                self._resource_lister()
-            )
-        except Exception as exc:
-            # 没安装厂商 VISA 时仍允许模块窗口打开并手动填写地址；Apply 会再次严格
-            # 连接并把失败报告为 Error。
-            self.available_resources = ()
-            discovery_message = (
-                f"{type(exc).__name__}: {exc}"
-            )
+        api.resources()
         status = {
             "Connection": "Disconnected",
             "Resource": (
@@ -143,12 +125,6 @@ class LR700Backend:
             "Sequence": "Idle",
             "Excitation Safety": (
                 "Not connected; instrument state unknown"
-            ),
-            "Available GPIB Resources": list(
-                self.available_resources
-            ),
-            "Resource Discovery": (
-                discovery_message or "Completed"
             ),
             "Last Slot / Sensor": "-",
             "Last Resistance (Ohm)": "-",
@@ -187,7 +163,7 @@ class LR700Backend:
                 try:
                     self._set_safe_state(api)
                 except Exception as failure:
-                    cleanup_error = self._best_effort_safe_state()
+                    cleanup_error = self._best_effort_safe_state(api)
                     if cleanup_error is not None:
                         raise ModuleError(
                             "Cannot replace the existing LR-700 session because "
@@ -204,12 +180,13 @@ class LR700Backend:
             self._connect(
                 desired["resource"],
                 float(desired["io_timeout_seconds"]),
+                api,
             )
             connected = True
             self._set_safe_state(api)
         except Exception as failure:
             cleanup_error = (
-                self._best_effort_safe_state()
+                self._best_effort_safe_state(api)
                 if connected
                 else None
             )
@@ -252,7 +229,7 @@ class LR700Backend:
             self._set_safe_state(api)
         except Exception as failure:
             cleanup_error = (
-                self._best_effort_safe_state()
+                self._best_effort_safe_state(api)
             )
             if cleanup_error is not None:
                 raise ModuleError(
@@ -347,12 +324,12 @@ class LR700Backend:
                     settings["switch_settle_seconds"]
                 ),
             )
-            first = api.devices()
+            first = api.instruments()
             self._waiter(
                 api,
                 float(settings["dwell_seconds"]),
             )
-            second = api.devices()
+            second = api.instruments()
             temperature, field = (
                 self._averaged_system_values(
                     first,
@@ -504,7 +481,7 @@ class LR700Backend:
             # Stop 会让普通 api checkpoint 立即取消，因此清理路径直接使用带
             # VISA timeout 的底层 transport，不依赖协作上下文。
             cleanup_error = (
-                self._best_effort_safe_state()
+                self._best_effort_safe_state(api)
             )
             api.status({
                 "Excitation Safety": (
@@ -530,7 +507,7 @@ class LR700Backend:
     ) -> Mapping[str, Any]:
         """completed/stopped/error 都直接确认最低激励，模块仍保持 Enabled。"""
 
-        error = self._best_effort_safe_state()
+        error = self._best_effort_safe_state(api)
         self.sequence_active = False
         if error is not None:
             api.status({
@@ -561,7 +538,7 @@ class LR700Backend:
             self.applied_settings
         )
         error = (
-            self._best_effort_safe_state()
+            self._best_effort_safe_state(api)
             if had_applied_connection
             else None
         )
@@ -655,27 +632,7 @@ class LR700Backend:
         payload: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """处理资源刷新和只读连接测试；两者都不会保存或 Apply 设置。"""
-
-        if action == "refresh_resources":
-            try:
-                resources = self._resource_lister()
-            except Exception as exc:
-                raise ModuleWarning(
-                    "GPIB resource discovery failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    "LR700_RESOURCE_DISCOVERY_FAILED",
-                ) from exc
-            self.available_resources = resources
-            status = {
-                "Available GPIB Resources": list(
-                    resources
-                ),
-                "Resource Discovery": "Completed",
-                "Last Action": "GPIB resources refreshed",
-            }
-            api.status(status)
-            return status
+        """处理只读连接测试；不会保存或 Apply 设置。"""
 
         if action == "test_connection":
             candidate = payload.get(
@@ -697,9 +654,11 @@ class LR700Backend:
                 ),
             )
             transport: instrument.Transport | None = None
+            resource_id = str(desired["resource"])
+            resource = api.resource_address(resource_id)
             try:
                 transport = self._transport_factory(
-                    desired["resource"],
+                    resource,
                     float(
                         desired[
                             "io_timeout_seconds"
@@ -719,10 +678,10 @@ class LR700Backend:
             except Exception as exc:
                 raise ModuleError(
                     "LR-700 protocol test failed for "
-                    f"{desired['resource']}: "
+                    f"resource {resource_id!r}: "
                     f"{type(exc).__name__}: {exc}",
                     "LR700_CONNECTION_FAILED",
-                    desired["resource"],
+                    resource_id,
                 ) from exc
             finally:
                 if transport is not None:
@@ -770,8 +729,9 @@ class LR700Backend:
 
     def _connect(
         self,
-        resource: str,
+        resource_id: str,
         timeout_seconds: float,
+        api: ModuleAPI,
     ) -> None:
         """打开 VISA 并用只读 GET 6 验证 LR-700 协议结构。
 
@@ -780,6 +740,7 @@ class LR700Backend:
         """
 
         self._close_transport()
+        resource = api.resource_address(resource_id)
         transport: instrument.Transport | None = None
         try:
             transport = self._transport_factory(
@@ -797,10 +758,10 @@ class LR700Backend:
                 except Exception:
                     pass
             raise ModuleError(
-                f"Could not verify LR-700 protocol at "
-                f"{resource}: {type(exc).__name__}: {exc}",
+                f"Could not verify LR-700 resource {resource_id!r}: "
+                f"{type(exc).__name__}: {exc}",
                 "LR700_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         self.transport = transport
         self.protocol_signature = (
@@ -859,7 +820,7 @@ class LR700Backend:
             transport = self.transport
             if transport is None:
                 try:
-                    self._reopen_transport(settings)
+                    self._reopen_transport(settings, api)
                     transport = self.transport
                 except Exception as exc:
                     last_error = exc
@@ -897,7 +858,7 @@ class LR700Backend:
                 )
                 self._waiter(api, 0.2)
                 try:
-                    self._reopen_transport(settings)
+                    self._reopen_transport(settings, api)
                 except Exception as exc:
                     last_error = exc
         api.warn("LR700_IO_RETRY", None, command)
@@ -913,10 +874,13 @@ class LR700Backend:
     def _reopen_transport(
         self,
         settings: Mapping[str, Any],
+        api: ModuleAPI,
     ) -> None:
         """重建同一 GPIB session，并只读验证 GET 6 协议结构。"""
 
-        resource = str(settings["resource"])
+        resource = api.resource_address(
+            str(settings["resource"])
+        )
         timeout = float(
             settings["io_timeout_seconds"]
         )
@@ -976,7 +940,10 @@ class LR700Backend:
             "Excitation Safety": self._safe_state_text(),
         })
 
-    def _best_effort_safe_state(self) -> str | None:
+    def _best_effort_safe_state(
+        self,
+        api: ModuleAPI,
+    ) -> str | None:
         """在取消/异常路径直接设置最低激励，返回未确认原因而不吞掉原异常。
 
         先使用当前 session；失败后关闭并有界地重开一次，再重发绝对安全命令。成功
@@ -989,14 +956,23 @@ class LR700Backend:
             or self.desired_settings
         )
         if not settings.get("resource"):
-            return "no GPIB resource is configured"
+            return "no instrument resource is configured"
+        try:
+            resource = api.resource_address(
+                str(settings["resource"])
+            )
+        except Exception as exc:
+            return (
+                "instrument resource could not be resolved: "
+                f"{type(exc).__name__}: {exc}"
+            )
         last_error: Exception | None = None
         for attempt in range(2):
             transport = self.transport
             if transport is None:
                 try:
                     transport = self._transport_factory(
-                        str(settings["resource"]),
+                        resource,
                         float(
                             settings[
                                 "io_timeout_seconds"
@@ -1304,8 +1280,8 @@ class LR700Backend:
         kind: str,
     ) -> tuple[str, float, str, float]:
         candidates = [
-            (str(device_id), values)
-            for device_id, values in system.items()
+            (str(instrument_id), values)
+            for instrument_id, values in system.items()
             if str(
                 values.get("kind", "")
             ).casefold() == kind
@@ -1331,14 +1307,14 @@ class LR700Backend:
         )
         if not candidates:
             raise ModuleError(
-                f"No {kind} device is present in the "
+                f"No {kind} instrument is present in the "
                 "OpenLab system snapshot",
                 "LR700_SYSTEM_SNAPSHOT_UNAVAILABLE",
                 kind,
             )
-        device_id, values = candidates[0]
+        instrument_id, values = candidates[0]
         return LR700Backend._snapshot_values(
-            device_id,
+            instrument_id,
             values,
             kind,
         )
@@ -1346,58 +1322,58 @@ class LR700Backend:
     @staticmethod
     def _same_snapshot(
         system: Mapping[str, Mapping[str, Any]],
-        device_id: str,
+        instrument_id: str,
         kind: str,
     ) -> tuple[str, float, str, float]:
-        values = system.get(device_id)
+        values = system.get(instrument_id)
         if values is None:
             raise ModuleError(
-                f"{kind.title()} device {device_id} is "
+                f"{kind.title()} instrument {instrument_id} is "
                 "missing from the second system snapshot",
                 "LR700_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             )
         return LR700Backend._snapshot_values(
-            device_id,
+            instrument_id,
             values,
             kind,
         )
 
     @staticmethod
     def _snapshot_values(
-        device_id: str,
+        instrument_id: str,
         values: Mapping[str, Any],
         kind: str,
     ) -> tuple[str, float, str, float]:
         if not bool(values.get("connected", True)):
             raise ModuleError(
-                f"{kind.title()} device {device_id} is "
+                f"{kind.title()} instrument {instrument_id} is "
                 "disconnected",
                 "LR700_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             )
         try:
             current = float(values["current"])
             timestamp = float(values["timestamp"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{kind.title()} device {device_id} has no "
+                f"{kind.title()} instrument {instrument_id} has no "
                 "valid current value or timestamp",
                 "LR700_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             ) from exc
         if (
             not math.isfinite(current)
             or not math.isfinite(timestamp)
         ):
             raise ModuleError(
-                f"{kind.title()} device {device_id} returned "
+                f"{kind.title()} instrument {instrument_id} returned "
                 "a non-finite value or timestamp",
                 "LR700_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             )
         return (
-            device_id,
+            instrument_id,
             current,
             str(values.get("unit", "")),
             timestamp,
@@ -1525,27 +1501,17 @@ class LR700Backend:
             or "\n" in resource
         ):
             raise ModuleError(
-                "GPIB resource must be one line with at "
+                "Measurement resource ID must be one line with at "
                 "most 255 characters",
                 "LR700_INVALID_SETTINGS",
                 "resource",
             )
         if require_resource and not resource:
             raise ModuleError(
-                "Select a GPIB resource before Apply "
+                "Select a configured measurement instrument resource before Apply "
                 "Settings",
                 "LR700_INVALID_SETTINGS",
                 "resource",
-            )
-        if (
-            resource
-            and not resource.upper().startswith("GPIB")
-        ):
-            raise ModuleError(
-                "LR-700 resource must be a GPIB VISA "
-                "resource",
-                "LR700_INVALID_SETTINGS",
-                resource,
             )
         result["resource"] = resource
         result["switch_settle_seconds"] = cls._number(

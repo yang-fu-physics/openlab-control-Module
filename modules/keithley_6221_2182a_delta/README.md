@@ -1,6 +1,6 @@
 # Keithley 6221 + 2182A Delta
 
-版本 `0.2.0b2`。本模块用 Keithley 6221 电流源和通过其 RS-232/Trigger Link
+版本 `0.2.0b4`。本模块用 Keithley 6221 电流源和通过其 RS-232/Trigger Link
 连接的 2182A 纳伏表执行 Delta 测量，并可明确选择以下通道路由方式：
 
 - `None`：不连接切换器，只允许 CH1；
@@ -9,6 +9,8 @@
 
 模块不会自动探测或在连接失败时静默降级。选择 7001 或 3706A 后，Apply 必须识别
 对应型号，否则立即报告 Error。选择 None 时完全不打开切换器 VISA 会话。
+两个下拉框保存的是仪表扫描器确认过的 Measurement 资源 ID，而不是原始 GPIB
+地址；模块从核心解析地址，因此不会看到或占用 System Instrument 的通讯口。
 
 2182A 不使用独立 VISA 地址。使用前应在仪表面板上把 2182A RS-232 设置为
 19.2 kbaud、XON/XOFF 和 CR 终止，并让 6221 串口设置一致，同时连接 RS-232 与

@@ -15,7 +15,7 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from labcontrol.extensions.loading import load_source_object  # noqa: E402
+from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from labcontrol.module_api import (  # noqa: E402
     ModuleError,
 )
@@ -24,6 +24,7 @@ from labcontrol.measurement.frontend_api import (  # noqa: E402
 )
 from module_contract import (  # noqa: E402
     TestModuleAPI,
+    measurement_resources,
     measure_module,
     module_slots,
     open_module,
@@ -262,10 +263,6 @@ class LR700BackendTests(unittest.TestCase):
     ) -> LR700Backend:
         return LR700Backend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::18::INSTR",
-                "GPIB0::7::INSTR",
-            ),
             waiter=(
                 lambda context, seconds: (
                     waits.append(seconds)
@@ -279,6 +276,7 @@ class LR700BackendTests(unittest.TestCase):
     def _context(
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
+        resources: dict[str, dict] | None = None,
     ) -> TestModuleAPI:
         iterator = iter(samples or [])
         return TestModuleAPI(
@@ -293,6 +291,7 @@ class LR700BackendTests(unittest.TestCase):
             ),
             lambda _timeout: "running",
             120.0,
+            resources=resources,
         )
 
 
@@ -304,7 +303,7 @@ class LR700BackendTests(unittest.TestCase):
         for logical_slot in module_slots(backend):
             measure_module(backend, context, logical_slot)
 
-    def test_open_discovers_without_connecting_or_writing(
+    def test_open_reads_registry_without_connecting_or_writing(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -319,13 +318,7 @@ class LR700BackendTests(unittest.TestCase):
             status["Applied Settings"],
             "Not applied",
         )
-        self.assertEqual(
-            status["Available GPIB Resources"],
-            [
-                "GPIB0::18::INSTR",
-                "GPIB0::7::INSTR",
-            ],
-        )
+        self.assertNotIn("Available GPIB Resources", status)
 
     def test_four_slot_mapping_emits_two_sparse_rows_and_restores_minimum_excitation(
         self,
@@ -438,11 +431,14 @@ class LR700BackendTests(unittest.TestCase):
         waits: list[float] = []
         messages: list[tuple[str, dict]] = []
         settings = default_settings()
-        settings["resource"] = "GPIB0::18::INSTR"
+        settings["resource"] = "bridge-lr700"
         backend = self._backend(state, waits)
         context = self._context(
             messages,
             _samples(1),
+            measurement_resources({
+                "bridge-lr700": "GPIB0::18::INSTR",
+            }),
         )
         open_module(backend, context)
         backend.configure(settings, context)
@@ -451,6 +447,12 @@ class LR700BackendTests(unittest.TestCase):
         measure_module(backend, context)
 
         self.assertGreaterEqual(len(state.opened), 2)
+        self.assertTrue(
+            all(
+                resource == "GPIB0::18::INSTR"
+                for resource, _timeout in state.opened
+            )
+        )
         self.assertEqual(
             sum(
                 action == "query"
@@ -533,7 +535,7 @@ class LR700BackendTests(unittest.TestCase):
         backend.configure(settings, context)
         run_start(backend, context)
         backend._best_effort_safe_state = (
-            lambda: "simulated cleanup failure"
+            lambda _api: "simulated cleanup failure"
         )
 
         with self.assertRaises(ModuleError) as captured:
@@ -907,10 +909,13 @@ class LR700FrontendTests(unittest.TestCase):
             or QApplication([])
         )
 
-    def test_settings_round_trip_resources_and_manual_payload(
+    def test_settings_round_trip_uses_registry_resource_payload(
         self,
     ) -> None:
-        context = ModuleUIAPI()
+        context = ModuleUIAPI(resources=measurement_resources({
+            "bridge-lr700": "GPIB0::18::INSTR",
+            "alternate-bridge": "GPIB0::5::INSTR",
+        }))
         frontend = LR700Frontend(context)
         owner = QWidget()
         settings_page = frontend
@@ -924,6 +929,7 @@ class LR700FrontendTests(unittest.TestCase):
             700,
         )
         settings = _two_slot_settings()
+        settings["resource"] = "bridge-lr700"
         settings["channels"]["r4"].update({
             "input_channel": 16,
             "enabled": True,
@@ -933,13 +939,7 @@ class LR700FrontendTests(unittest.TestCase):
             "filter_index": 1,
         })
         frontend.load(settings)
-        frontend.show_status({
-            "Available GPIB Resources": [
-                "GPIB0::7::INSTR",
-                "GPIB0::18::INSTR",
-            ],
-            "Connection": "Disconnected",
-        })
+        frontend.show_status({"Connection": "Disconnected"})
 
         self.assertEqual(frontend.dump(), settings)
         self.assertGreaterEqual(
@@ -958,8 +958,8 @@ class LR700FrontendTests(unittest.TestCase):
                 (action, payload)
             )
         )
-        frontend.resource.setCurrentText(
-            "GPIB0::5::INSTR"
+        frontend.resource.setCurrentIndex(
+            frontend.resource.findData("alternate-bridge")
         )
         frontend.test_connection_button.click()
         self.application.processEvents()
@@ -969,7 +969,7 @@ class LR700FrontendTests(unittest.TestCase):
         )
         self.assertEqual(
             actions[-1][1]["settings"]["resource"],
-            "GPIB0::5::INSTR",
+            "alternate-bridge",
         )
         settings_page.deleteLater()
         status_page.deleteLater()
@@ -1001,9 +1001,8 @@ class LR700ManifestTests(unittest.TestCase):
         self.assertEqual(descriptor.id, "lr700")
         self.assertEqual(
             descriptor.version,
-            "0.1.0b6",
+            "0.1.0b7",
         )
-        self.assertEqual(descriptor.dependencies, ())
         names = list(LR700Backend.columns)
         self.assertEqual(
             names[:4],
@@ -1020,10 +1019,6 @@ class LR700ManifestTests(unittest.TestCase):
         )
         self.assertEqual(len(names), 11)
         self.assertEqual(descriptor.columns, ())
-        self.assertFalse(
-            (MODULE / "requirements.lock").exists()
-        )
-        self.assertFalse((MODULE / "wheels").exists())
 
 
 if __name__ == "__main__":

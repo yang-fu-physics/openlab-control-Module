@@ -22,7 +22,8 @@ Model 2400 的绝对命令能力约为 ±210 V、±1.05 A，连续工作边界�
 
 ## 生命周期
 
-- **Enable**：只加载 desired settings 并发现 GPIB 地址，不连接、不 Apply、不打开输出。
+- **Enable**：只读取核心已确认的 Measurement 资源表，不扫描 VISA、不连接、不 Apply、
+  不打开输出。
 - **Apply Settings**：连接并核对 `*IDN?`，先关闭输出，再写入并读回源模式、源值、
   compliance、NPLC 和 sense mode；固定启用 concurrent V/I measurement，并移除可能
   遗留的其他测量函数；结束时再次确认 `OUTP? = 0`。

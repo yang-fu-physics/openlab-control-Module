@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import QSize, QSignalBlocker
+from PySide6.QtCore import QSize, QSignalBlocker, Qt
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
@@ -143,14 +143,7 @@ class Keithley6221DeltaFrontend(QWidget):
         for value, label in SWITCHER_TYPES:
             self.switcher_type.addItem(label, value)
         self.resource_switcher = self._resource_combo()
-        self.refresh_resources_button = QPushButton(
-            "Refresh GPIB"
-        )
-        self.refresh_resources_button.clicked.connect(
-            lambda: self.api.action(
-                "refresh_resources"
-            )
-        )
+        self._load_resources()
         self.test_connection_button = QPushButton(
             "Test Connections"
         )
@@ -166,7 +159,7 @@ class Keithley6221DeltaFrontend(QWidget):
         self.io_timeout.setSingleStep(0.5)
         self.io_timeout.setSuffix(" s")
         communication_layout.addWidget(
-            QLabel("Keithley 6221 VISA resource"),
+            QLabel("Keithley 6221 resource"),
             0,
             0,
         )
@@ -190,7 +183,7 @@ class Keithley6221DeltaFrontend(QWidget):
             3,
         )
         communication_layout.addWidget(
-            QLabel("Switcher VISA resource"),
+            QLabel("Switcher resource"),
             2,
             0,
         )
@@ -200,11 +193,6 @@ class Keithley6221DeltaFrontend(QWidget):
             1,
             1,
             3,
-        )
-        communication_layout.addWidget(
-            self.refresh_resources_button,
-            0,
-            4,
         )
         communication_layout.addWidget(
             self.test_connection_button,
@@ -489,14 +477,6 @@ class Keithley6221DeltaFrontend(QWidget):
             form.addRow(key, label)
         layout.addWidget(summary)
         buttons = QHBoxLayout()
-        self.status_refresh_resources_button = QPushButton(
-            "Refresh GPIB"
-        )
-        self.status_refresh_resources_button.clicked.connect(
-            lambda: self.api.action(
-                "refresh_resources"
-            )
-        )
         self.refresh_status_button = QPushButton(
             "Refresh Status"
         )
@@ -511,9 +491,6 @@ class Keithley6221DeltaFrontend(QWidget):
                 "safe_off"
             )
         )
-        buttons.addWidget(
-            self.status_refresh_resources_button
-        )
         buttons.addWidget(self.refresh_status_button)
         buttons.addWidget(self.safe_off_button)
         buttons.addStretch(1)
@@ -526,10 +503,12 @@ class Keithley6221DeltaFrontend(QWidget):
 
         return {
             "resource_6221": (
-                self.resource_6221.currentText().strip()
+                str(self.resource_6221.currentData() or "")
             ),
             "switcher_type": str(self.switcher_type.currentData()),
-            "resource_switcher": self.resource_switcher.currentText().strip(),
+            "resource_switcher": str(
+                self.resource_switcher.currentData() or ""
+            ),
             "mode": str(self.mode.currentData()),
             "io_timeout_seconds": self.io_timeout.value(),
             "switch_settle_seconds": (
@@ -728,13 +707,6 @@ class Keithley6221DeltaFrontend(QWidget):
         self,
         status: Mapping[str, Any],
     ) -> None:
-        resources = status.get(
-            "Available GPIB Resources"
-        )
-        if isinstance(resources, (list, tuple)):
-            self._update_resources(
-                tuple(str(item) for item in resources)
-            )
         for key, value in status.items():
             label = self.status_labels.get(str(key))
             if label is None:
@@ -779,28 +751,30 @@ class Keithley6221DeltaFrontend(QWidget):
                 available,
             )
 
-    def _update_resources(
-        self,
-        resources: tuple[str, ...],
-    ) -> None:
+    def _load_resources(self) -> None:
+        """用核心提供的 Measurement 资源填充两个不可编辑下拉框。"""
+
+        resources = self.api.resources()
         for combo in (
             self.resource_6221,
             self.resource_switcher,
         ):
-            current = combo.currentText().strip()
             blocker = QSignalBlocker(combo)
             combo.clear()
-            for resource in sorted(
-                set(resources),
-                key=str.casefold,
-            ):
-                combo.addItem(resource)
-            if (
-                current
-                and combo.findText(current) < 0
-            ):
-                combo.addItem(current)
-            combo.setCurrentText(current)
+            combo.addItem("Select instrument…", "")
+            for resource_id, info in sorted(resources.items()):
+                identity = str(info.get("identity") or "").strip()
+                label = (
+                    resource_id
+                    if not identity
+                    else f"{resource_id} — {identity}"
+                )
+                combo.addItem(label, resource_id)
+                combo.setItemData(
+                    combo.count() - 1,
+                    str(info.get("address", "")),
+                    Qt.ItemDataRole.ToolTipRole,
+                )
             del blocker
 
     @staticmethod
@@ -809,9 +783,11 @@ class Keithley6221DeltaFrontend(QWidget):
         resource: str,
     ) -> None:
         value = resource.strip()
-        if value and combo.findText(value) < 0:
-            combo.addItem(value)
-        combo.setCurrentText(value)
+        index = combo.findData(value)
+        if index < 0 and value:
+            combo.addItem(f"Unavailable — {value}", value)
+            index = combo.count() - 1
+        combo.setCurrentIndex(max(0, index))
 
     @staticmethod
     def _select_data(
@@ -825,7 +801,6 @@ class Keithley6221DeltaFrontend(QWidget):
     @staticmethod
     def _resource_combo() -> QComboBox:
         combo = QComboBox()
-        combo.setEditable(True)
         combo.setMinimumContentsLength(24)
         return combo
 

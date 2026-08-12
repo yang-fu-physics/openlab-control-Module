@@ -39,23 +39,6 @@ class PyVisaTransport:
             self._manager.close()
             raise
 
-    @staticmethod
-    def list_resources() -> tuple[str, ...]:
-        """枚举并排序 GPIB 资源，避免把其他总线地址混入设置下拉框。"""
-
-        pyvisa = importlib.import_module("pyvisa")
-        manager = pyvisa.ResourceManager()
-        try:
-            resources = tuple(str(item) for item in manager.list_resources())
-        finally:
-            manager.close()
-        return tuple(
-            sorted(
-                {item for item in resources if item.upper().startswith("GPIB")},
-                key=str.casefold,
-            )
-        )
-
     def write(self, command: str) -> None:
         self._instrument.write(command)
 

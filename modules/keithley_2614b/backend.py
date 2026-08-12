@@ -1,4 +1,4 @@
-﻿"""Keithley 2614B 双通道恒流/恒压电阻测量后端。
+"""Keithley 2614B 双通道恒流/恒压电阻测量后端。
 
 2614B 使用 TSP 而不是传统 SCPI 子系统。模块不调用 ``reset()``，避免清除操作员在
 仪表上建立的其他现场设置；只配置 SMU A/B 完成本次测量所需的 source、limit、sense、
@@ -15,17 +15,16 @@ from typing import Any
 from labcontrol.module_api import (
     ModuleError,
     ModuleAPI,
-    ModuleWarning,
 )
 
 from .constants import (
     CHANNELS,
-    DEVICE_HIGH_CURRENT_MAX_VOLTAGE_LIMIT_V,
-    DEVICE_HIGH_CURRENT_THRESHOLD_A,
-    DEVICE_HIGH_VOLTAGE_MAX_CURRENT_LIMIT_A,
-    DEVICE_HIGH_VOLTAGE_THRESHOLD_V,
-    DEVICE_MAX_CURRENT_A,
-    DEVICE_MAX_VOLTAGE_V,
+    INSTRUMENT_HIGH_CURRENT_MAX_VOLTAGE_LIMIT_V,
+    INSTRUMENT_HIGH_CURRENT_THRESHOLD_A,
+    INSTRUMENT_HIGH_VOLTAGE_MAX_CURRENT_LIMIT_A,
+    INSTRUMENT_HIGH_VOLTAGE_THRESHOLD_V,
+    INSTRUMENT_MAX_CURRENT_A,
+    INSTRUMENT_MAX_VOLTAGE_V,
     SENSE_2WIRE,
     SENSE_4WIRE,
     SOURCE_CURRENT,
@@ -44,7 +43,6 @@ from . import keithley_2614b as instrument
 _READING_SENTINEL = 9.0e36
 _CLEANUP_RESERVE_SECONDS = 4.0
 TransportFactory = Callable[[str, float], instrument.Transport]
-ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
 
 
@@ -66,20 +64,15 @@ class Keithley2614BBackend:
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
-        resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
     ) -> None:
         self._transport_factory = transport_factory or instrument.PyVisaTransport
-        self._resource_lister = (
-            resource_lister or instrument.PyVisaTransport.list_resources
-        )
         self._waiter = waiter or (
             lambda api, seconds: api.sleep(seconds)
         )
         self.transport: instrument.Transport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
         self.applied_settings: dict[str, Any] | None = None
-        self.available_resources: tuple[str, ...] = ()
         self.identity = ""
         self.sequence_active = False
         self.output_states = {"ch1": "Unknown", "ch2": "Unknown"}
@@ -90,25 +83,14 @@ class Keithley2614BBackend:
         self.last_current: float | None = None
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
-        """Enable 只加载 desired settings 并发现 GPIB 地址。"""
+        """Enable 只加载设置并读取核心资源表，不连接 2614B。"""
 
         self.desired_settings = self._normalized_settings(
             default_settings(),
             require_resource=False,
             operation_timeout_seconds=api.timeout,
         )
-        try:
-            self.available_resources = tuple(
-                sorted(set(self._resource_lister()), key=str.casefold)
-            )
-            api.warn("K2614B_RESOURCE_DISCOVERY_FAILED", None)
-        except Exception as exc:
-            self.available_resources = ()
-            api.warn(
-                "K2614B_RESOURCE_DISCOVERY_FAILED",
-                "GPIB resource discovery failed: "
-                f"{type(exc).__name__}: {exc}",
-            )
+        api.resources()
         self.applied_settings = None
         self.identity = ""
         self.sequence_active = False
@@ -452,19 +434,7 @@ class Keithley2614BBackend:
         payload: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        if action == "refresh_resources":
-            try:
-                self.available_resources = tuple(
-                    sorted(set(self._resource_lister()), key=str.casefold)
-                )
-            except Exception as exc:
-                raise ModuleWarning(
-                    "GPIB resource discovery failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    "K2614B_RESOURCE_DISCOVERY_FAILED",
-                ) from exc
-            api.warn("K2614B_RESOURCE_DISCOVERY_FAILED", None)
-        elif action == "test_connection":
+        if action == "test_connection":
             candidate = payload.get("settings", self.desired_settings)
             if not isinstance(candidate, Mapping):
                 raise ModuleError(
@@ -520,16 +490,17 @@ class Keithley2614BBackend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        resource = str(settings["resource"])
+        resource_id = str(settings["resource"])
+        resource = api.resource_address(resource_id)
         timeout = float(settings["io_timeout_seconds"])
         try:
             self.transport = self._transport_factory(resource, timeout)
         except Exception as exc:
             raise ModuleError(
-                f"Could not open 2614B at {resource}: "
+                f"Could not open 2614B resource {resource_id!r}: "
                 f"{type(exc).__name__}: {exc}",
                 "K2614B_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         try:
             identity = self._query(instrument.IDENTIFY, api)
@@ -544,10 +515,11 @@ class Keithley2614BBackend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        resource = str(settings["resource"])
+        resource_id = str(settings["resource"])
+        resource = api.resource_address(resource_id)
         timeout = float(settings["io_timeout_seconds"])
         if self.transport is not None and self.applied_settings is not None:
-            if str(self.applied_settings["resource"]) == resource:
+            if str(self.applied_settings["resource"]) == resource_id:
                 self._validate_identity(
                     self._query(instrument.IDENTIFY, api)
                 )
@@ -556,10 +528,10 @@ class Keithley2614BBackend:
             temporary = self._transport_factory(resource, timeout)
         except Exception as exc:
             raise ModuleError(
-                f"Could not open 2614B at {resource}: "
+                f"Could not open 2614B resource {resource_id!r}: "
                 f"{type(exc).__name__}: {exc}",
                 "K2614B_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         try:
             api.sleep(0)
@@ -979,7 +951,6 @@ class Keithley2614BBackend:
             "Last Current (A)": (
                 self.last_current if self.last_current is not None else "-"
             ),
-            "Available GPIB Resources": list(self.available_resources),
         }
 
     def _normalized_settings(
@@ -999,13 +970,13 @@ class Keithley2614BBackend:
         resource = str(supplied.get("resource", defaults["resource"])).strip()
         if require_resource and not resource:
             raise ModuleError(
-                "Select or enter a GPIB VISA resource",
+                "Select a configured measurement instrument resource",
                 "K2614B_INVALID_SETTINGS",
                 "resource",
             )
         if "\n" in resource or "\r" in resource:
             raise ModuleError(
-                "VISA resource must be a single line",
+                "Measurement resource ID must be a single line",
                 "K2614B_INVALID_SETTINGS",
                 "resource",
             )
@@ -1098,26 +1069,26 @@ class Keithley2614BBackend:
                 base["current_limit"], "A", f"{key}.current_limit"
             )
             nplc = self._finite_number(base["nplc"], f"{key}.nplc")
-            if abs(source_current) > DEVICE_MAX_CURRENT_A:
+            if abs(source_current) > INSTRUMENT_MAX_CURRENT_A:
                 self._invalid_range(
                     f"{key}.source_current",
-                    -DEVICE_MAX_CURRENT_A,
-                    DEVICE_MAX_CURRENT_A,
+                    -INSTRUMENT_MAX_CURRENT_A,
+                    INSTRUMENT_MAX_CURRENT_A,
                 )
-            if abs(source_voltage) > DEVICE_MAX_VOLTAGE_V:
+            if abs(source_voltage) > INSTRUMENT_MAX_VOLTAGE_V:
                 self._invalid_range(
                     f"{key}.source_voltage",
-                    -DEVICE_MAX_VOLTAGE_V,
-                    DEVICE_MAX_VOLTAGE_V,
+                    -INSTRUMENT_MAX_VOLTAGE_V,
+                    INSTRUMENT_MAX_VOLTAGE_V,
                 )
             if not 0 < voltage_limit <= 200.0:
                 self._invalid_range(f"{key}.voltage_limit", 0.0, 200.0)
             if not 0 < current_limit <= 1.5:
                 self._invalid_range(f"{key}.current_limit", 0.0, 1.5)
             if (
-                abs(source_current) > DEVICE_HIGH_CURRENT_THRESHOLD_A
+                abs(source_current) > INSTRUMENT_HIGH_CURRENT_THRESHOLD_A
                 and voltage_limit
-                > DEVICE_HIGH_CURRENT_MAX_VOLTAGE_LIMIT_V
+                > INSTRUMENT_HIGH_CURRENT_MAX_VOLTAGE_LIMIT_V
             ):
                 raise ModuleError(
                     f"{key}.voltage_limit must be <= 20 V when source current "
@@ -1126,8 +1097,8 @@ class Keithley2614BBackend:
                     f"{key}.voltage_limit",
                 )
             if (
-                abs(source_voltage) > DEVICE_HIGH_VOLTAGE_THRESHOLD_V
-                and current_limit > DEVICE_HIGH_VOLTAGE_MAX_CURRENT_LIMIT_A
+                abs(source_voltage) > INSTRUMENT_HIGH_VOLTAGE_THRESHOLD_V
+                and current_limit > INSTRUMENT_HIGH_VOLTAGE_MAX_CURRENT_LIMIT_A
             ):
                 raise ModuleError(
                     f"{key}.current_limit must be <= 100 mA when source voltage "

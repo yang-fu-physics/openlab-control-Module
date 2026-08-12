@@ -41,7 +41,7 @@
 
 ## 生命周期和安全状态
 
-- **Enable**：只加载设置和发现 GPIB，不连接。
+- **Enable**：只读取核心已确认的 Measurement 资源表，不扫描 VISA、不连接。
 - **Apply Settings**：连接、核对 6517B 型号，进入 standby，打开 zero check，配置并
   读回 V-source limit、METER-CONNECT、current measurement 和数据格式。
 - **Measure**：本模块没有声明 `slots`，所以核心在每个逻辑槽位都调用一次

@@ -21,7 +21,6 @@ from typing import Any
 from labcontrol.module_api import (
     ModuleError,
     ModuleAPI,
-    ModuleWarning,
 )
 
 from .constants import (
@@ -39,7 +38,6 @@ from . import keithley_6517b as instrument
 _READING_SENTINEL = 9.0e36
 _CLEANUP_RESERVE_SECONDS = 4.0
 TransportFactory = Callable[[str, float], instrument.Transport]
-ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
 
 
@@ -57,20 +55,15 @@ class Keithley6517BBackend:
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
-        resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
     ) -> None:
         self._transport_factory = transport_factory or instrument.PyVisaTransport
-        self._resource_lister = (
-            resource_lister or instrument.PyVisaTransport.list_resources
-        )
         self._waiter = waiter or (
             lambda api, seconds: api.sleep(seconds)
         )
         self.transport: instrument.Transport | None = None
         self.desired_settings: dict[str, Any] = default_settings()
         self.applied_settings: dict[str, Any] | None = None
-        self.available_resources: tuple[str, ...] = ()
         self.identity = ""
         self.sequence_active = False
         self.last_status = "Idle"
@@ -83,25 +76,14 @@ class Keithley6517BBackend:
         self.last_current: float | None = None
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
-        """Enable 只发现 GPIB；不连接、不改变 METER-CONNECT 或 V-source。"""
+        """Enable 只读取核心资源表；不连接、不改变 METER-CONNECT 或 V-source。"""
 
         self.desired_settings = self._normalized_settings(
             default_settings(),
             require_resource=False,
             operation_timeout_seconds=api.timeout,
         )
-        try:
-            self.available_resources = tuple(
-                sorted(set(self._resource_lister()), key=str.casefold)
-            )
-            api.warn("K6517B_RESOURCE_DISCOVERY_FAILED", None)
-        except Exception as exc:
-            self.available_resources = ()
-            api.warn(
-                "K6517B_RESOURCE_DISCOVERY_FAILED",
-                "GPIB resource discovery failed: "
-                f"{type(exc).__name__}: {exc}",
-            )
+        api.resources()
         self.applied_settings = None
         self.identity = ""
         self.sequence_active = False
@@ -415,19 +397,7 @@ class Keithley6517BBackend:
         payload: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        if action == "refresh_resources":
-            try:
-                self.available_resources = tuple(
-                    sorted(set(self._resource_lister()), key=str.casefold)
-                )
-            except Exception as exc:
-                raise ModuleWarning(
-                    "GPIB resource discovery failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    "K6517B_RESOURCE_DISCOVERY_FAILED",
-                ) from exc
-            api.warn("K6517B_RESOURCE_DISCOVERY_FAILED", None)
-        elif action == "test_connection":
+        if action == "test_connection":
             candidate = payload.get("settings", self.desired_settings)
             if not isinstance(candidate, Mapping):
                 raise ModuleError(
@@ -483,16 +453,17 @@ class Keithley6517BBackend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        resource = str(settings["resource"])
+        resource_id = str(settings["resource"])
+        resource = api.resource_address(resource_id)
         timeout = float(settings["io_timeout_seconds"])
         try:
             self.transport = self._transport_factory(resource, timeout)
         except Exception as exc:
             raise ModuleError(
-                f"Could not open 6517B at {resource}: "
+                f"Could not open 6517B resource {resource_id!r}: "
                 f"{type(exc).__name__}: {exc}",
                 "K6517B_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         try:
             identity = self._query(instrument.IDENTIFY, api)
@@ -507,10 +478,11 @@ class Keithley6517BBackend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> None:
-        resource = str(settings["resource"])
+        resource_id = str(settings["resource"])
+        resource = api.resource_address(resource_id)
         timeout = float(settings["io_timeout_seconds"])
         if self.transport is not None and self.applied_settings is not None:
-            if str(self.applied_settings["resource"]) == resource:
+            if str(self.applied_settings["resource"]) == resource_id:
                 self._validate_identity(
                     self._query(instrument.IDENTIFY, api)
                 )
@@ -519,10 +491,10 @@ class Keithley6517BBackend:
             temporary = self._transport_factory(resource, timeout)
         except Exception as exc:
             raise ModuleError(
-                f"Could not open 6517B at {resource}: "
+                f"Could not open 6517B resource {resource_id!r}: "
                 f"{type(exc).__name__}: {exc}",
                 "K6517B_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         try:
             api.sleep(0)
@@ -957,7 +929,6 @@ class Keithley6517BBackend:
             "Last Current (A)": (
                 self.last_current if self.last_current is not None else "-"
             ),
-            "Available GPIB Resources": list(self.available_resources),
         }
 
     def _normalized_settings(
@@ -980,13 +951,13 @@ class Keithley6517BBackend:
         resource = str(merged["resource"]).strip()
         if require_resource and not resource:
             raise ModuleError(
-                "Select or enter a GPIB VISA resource",
+                "Select a configured measurement instrument resource",
                 "K6517B_INVALID_SETTINGS",
                 "resource",
             )
         if "\n" in resource or "\r" in resource:
             raise ModuleError(
-                "VISA resource must be a single line",
+                "Measurement resource ID must be a single line",
                 "K6517B_INVALID_SETTINGS",
                 "resource",
             )

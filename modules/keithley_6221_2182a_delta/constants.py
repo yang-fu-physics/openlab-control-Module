@@ -1,7 +1,7 @@
 """Keithley Delta 模块的协议常量和无输出默认设置。
 
 默认设置不会产生非零电流。Enable 只发现资源；Apply 按明确选择连接切换器。模块不维护
-用户可配置的软件电流或 compliance 上限，但仍会按仪表手册拒绝设备本身无法接受的
+用户可配置的软件电流或 compliance 上限，但仍会按仪表手册拒绝仪表本身无法接受的
 命令范围。样品、接线和允许功耗的实验安全边界应在真实仪表上人工配置并核对。
 """
 
@@ -27,9 +27,9 @@ ARM_SETTLE_SECONDS: Final = 3.0
 MAX_DELTA_COUNT: Final = 32_768
 
 # 6221 用户手册给出的 Delta 和 compliance 绝对仪表边界。
-DEVICE_CURRENT_LIMIT_A: Final = 105.0e-3
-DEVICE_COMPLIANCE_MIN_V: Final = 0.1
-DEVICE_COMPLIANCE_MAX_V: Final = 105.0
+INSTRUMENT_CURRENT_LIMIT_A: Final = 105.0e-3
+INSTRUMENT_COMPLIANCE_MIN_V: Final = 0.1
+INSTRUMENT_COMPLIANCE_MAX_V: Final = 105.0
 
 # 2182A DCV1 的五个固定量程；None 表示自动量程。
 VOLTAGE_RANGES: Final[
@@ -104,9 +104,9 @@ def default_settings() -> dict[str, Any]:
 
 __all__ = [
     "ARM_SETTLE_SECONDS",
-    "DEVICE_COMPLIANCE_MAX_V",
-    "DEVICE_COMPLIANCE_MIN_V",
-    "DEVICE_CURRENT_LIMIT_A",
+    "INSTRUMENT_COMPLIANCE_MAX_V",
+    "INSTRUMENT_COMPLIANCE_MIN_V",
+    "INSTRUMENT_CURRENT_LIMIT_A",
     "FILTER_TYPES",
     "MAX_DELTA_COUNT",
     "MODE_INDEPENDENT",

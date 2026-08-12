@@ -1,4 +1,4 @@
-﻿"""Lake Shore Model 372 AC Resistance Bridge 的 Measurement Module 后端。
+"""Lake Shore Model 372 AC Resistance Bridge 的 Measurement Module 后端。
 
 用户界面沿用实验室常用的“372A”名称，协议实现依据 Model 372 手册中的
 ``FREQ/FILTER/INSET/INTYPE/SCAN`` 设置命令和
@@ -40,7 +40,6 @@ TransportFactory = Callable[
     [str, float],
     instrument.Transport,
 ]
-ResourceLister = Callable[[], tuple[str, ...]]
 Waiter = Callable[[ModuleAPI, float], None]
 
 
@@ -83,15 +82,10 @@ class LakeShore372ABackend:
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
-        resource_lister: ResourceLister | None = None,
         waiter: Waiter | None = None,
     ) -> None:
         self._transport_factory = (
             transport_factory or instrument.PyVisaTransport
-        )
-        self._resource_lister = (
-            resource_lister
-            or instrument.PyVisaTransport.list_resources
         )
         self._waiter = (
             waiter
@@ -106,10 +100,9 @@ class LakeShore372ABackend:
         self.identity = ""
         self.sequence_active = False
         self.last_values: dict[str, Any] = {}
-        self.available_resources: tuple[str, ...] = ()
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
-        """Enable 阶段只发现 GPIB，不连接仪表、不发送设置。"""
+        """Enable 阶段只读取核心资源表，不连接仪表、不发送设置。"""
 
         self._require_live_context(api)
         self.desired_settings = self._normalized_settings(
@@ -120,18 +113,7 @@ class LakeShore372ABackend:
                 api.timeout
             ),
         )
-        discovery_message = ""
-        try:
-            self.available_resources = (
-                self._resource_lister()
-            )
-        except Exception as exc:
-            # 资源发现失败不阻止模块窗口打开；用户仍可手动输入 VISA resource。错误
-            # 只显示在 Status，真正 Apply 时会再次严格验证并连接。
-            self.available_resources = ()
-            discovery_message = (
-                f"{type(exc).__name__}: {exc}"
-            )
+        api.resources()
         status = {
             "Connection": "Disconnected",
             "Resource": (
@@ -142,12 +124,6 @@ class LakeShore372ABackend:
             "Applied Settings": "Not applied",
             "Sequence": "Idle",
             "Excitation": "Shunted",
-            "Available GPIB Resources": list(
-                self.available_resources
-            ),
-            "Resource Discovery": (
-                discovery_message or "Completed"
-            ),
             "Last Channel": "-",
             "Last Resistance (Ohm)": "-",
             "Last Phase (deg)": "-",
@@ -192,6 +168,7 @@ class LakeShore372ABackend:
             self._connect(
                 desired["resource"],
                 float(desired["io_timeout_seconds"]),
+                api,
             )
             connected = True
             # FREQ 的第一个参数 0 表示全局/测量输入组；写后立即 FREQ? 核对索引。
@@ -371,12 +348,12 @@ class LakeShore372ABackend:
                 float(settings["pause_seconds"]),
             )
             # 第一份温场快照位于 Change Pause 之后、Dwell 之前。
-            first = api.devices()
+            first = api.instruments()
             self._waiter(
                 api,
                 float(settings["dwell_seconds"]),
             )
-            second = api.devices()
+            second = api.instruments()
             # 平均函数还会要求第二份 temperature/field 时间戳严格更新，避免把同一份
             # 缓存读数重复两次伪装成时间平均。
             temperature, field = (
@@ -665,30 +642,9 @@ class LakeShore372ABackend:
         payload: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """处理 Idle 时的资源刷新和连接测试；两者都不会 Apply 仪表设置。"""
+        """处理 Idle 时的只读连接测试；不会 Apply 仪表设置。"""
 
-        if action == "refresh_resources":
-            try:
-                self.available_resources = (
-                    self._resource_lister()
-                )
-            except Exception as exc:
-                raise ModuleWarning(
-                    f"GPIB resource discovery failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    "LS372_RESOURCE_DISCOVERY_FAILED",
-                ) from exc
-            status = {
-                "Available GPIB Resources": list(
-                    self.available_resources
-                ),
-                "Resource Discovery": "Completed",
-                "Last Action": (
-                    f"Found {len(self.available_resources)} "
-                    "GPIB resource(s)"
-                ),
-            }
-        elif action == "test_connection":
+        if action == "test_connection":
             # 使用 Settings 页“当前尚未保存/Apply”的值，使用户可以先验证新地址。
             supplied = payload.get("settings")
             source = (
@@ -707,6 +663,7 @@ class LakeShore372ABackend:
             self._connect(
                 settings["resource"],
                 float(settings["io_timeout_seconds"]),
+                api,
             )
             status = {
                 "Connection": "Connected",
@@ -763,12 +720,14 @@ class LakeShore372ABackend:
 
     def _connect(
         self,
-        resource: str,
+        resource_id: str,
         timeout_seconds: float,
+        api: ModuleAPI,
     ) -> None:
         """关闭旧 session，打开新资源并在接管前严格验证 ``*IDN?``。"""
 
         self._close_transport()
+        resource = api.resource_address(resource_id)
         transport: instrument.Transport | None = None
         try:
             transport = self._transport_factory(
@@ -786,10 +745,10 @@ class LakeShore372ABackend:
             except Exception:
                 pass
             raise ModuleError(
-                f"Could not connect to {resource}: "
+                f"Could not connect to resource {resource_id!r}: "
                 f"{type(exc).__name__}: {exc}",
                 "LS372_CONNECTION_FAILED",
-                resource,
+                resource_id,
             ) from exc
         self.transport = transport
         self.identity = identity
@@ -890,7 +849,7 @@ class LakeShore372ABackend:
                 if attempt >= attempts:
                     break
                 try:
-                    self._reopen_transport(settings)
+                    self._reopen_transport(settings, api)
                 except Exception as reopen_error:
                     last_error = reopen_error
                 continue
@@ -909,7 +868,7 @@ class LakeShore372ABackend:
                 )
                 self._waiter(api, 0.2)
                 try:
-                    self._reopen_transport(settings)
+                    self._reopen_transport(settings, api)
                 except Exception as reopen_error:
                     last_error = reopen_error
                 continue
@@ -928,10 +887,13 @@ class LakeShore372ABackend:
     def _reopen_transport(
         self,
         settings: Mapping[str, Any],
+        api: ModuleAPI,
     ) -> None:
         """重建同一资源并只验证身份；不静默修改 ``applied_settings``。"""
 
-        resource = str(settings["resource"])
+        resource = api.resource_address(
+            str(settings["resource"])
+        )
         timeout = float(settings["io_timeout_seconds"])
         self._close_transport()
         transport = self._transport_factory(
@@ -1284,8 +1246,8 @@ class LakeShore372ABackend:
     ) -> tuple[float, float]:
         """从 Dwell 前后两份核心快照计算主温度(K)和主磁场(Oe)算术平均。
 
-        第二份快照必须使用与第一份相同的设备 ID，且时间戳严格增加；不能在两次读取间
-        偷换主设备，也不能把同一缓存值重复平均。单位转换完成后才做平均。
+        第二份快照必须使用与第一份相同的仪表 ID，且时间戳严格增加；不能在两次读取间
+        偷换主仪表，也不能把同一缓存值重复平均。单位转换完成后才做平均。
         """
 
         first_temperature = cls._primary_snapshot(
@@ -1341,15 +1303,15 @@ class LakeShore372ABackend:
         system: Mapping[str, Mapping[str, Any]],
         kind: str,
     ) -> tuple[str, float, str, float]:
-        """确定温度或磁场的主快照，返回设备 ID、值、单位和时间戳。
+        """确定温度或磁场的主快照，返回仪表 ID、值、单位和时间戳。
 
-        选择优先级固定为显式 ``role=primary``、启用控制的设备、其余设备；同级按设备
-        ID 排序，避免字典插入顺序让同一数据集在不同进程中选择不同设备。
+        选择优先级固定为显式 ``role=primary``、启用控制的仪表、其余仪表；同级按仪表
+        ID 排序，避免字典插入顺序让同一数据集在不同进程中选择不同仪表。
         """
 
         candidates = [
-            (str(device_id), values)
-            for device_id, values in system.items()
+            (str(instrument_id), values)
+            for instrument_id, values in system.items()
             if str(values.get("kind", "")).casefold()
             == kind
         ]
@@ -1375,14 +1337,14 @@ class LakeShore372ABackend:
         )
         if not candidates:
             raise ModuleError(
-                f"No {kind} device is present in the "
+                f"No {kind} instrument is present in the "
                 "OpenLab system snapshot",
                 "LS372_SYSTEM_SNAPSHOT_UNAVAILABLE",
                 kind,
             )
-        device_id, values = candidates[0]
+        instrument_id, values = candidates[0]
         return LakeShore372ABackend._snapshot_values(
-            device_id,
+            instrument_id,
             values,
             kind,
         )
@@ -1390,62 +1352,62 @@ class LakeShore372ABackend:
     @staticmethod
     def _same_snapshot(
         system: Mapping[str, Mapping[str, Any]],
-        device_id: str,
+        instrument_id: str,
         kind: str,
     ) -> tuple[str, float, str, float]:
-        """从第二份系统快照提取同一设备，禁止在 Dwell 中途切换数据来源。"""
+        """从第二份系统快照提取同一仪表，禁止在 Dwell 中途切换数据来源。"""
 
-        values = system.get(device_id)
+        values = system.get(instrument_id)
         if values is None:
             raise ModuleError(
-                f"{kind.title()} device {device_id} is missing "
+                f"{kind.title()} instrument {instrument_id} is missing "
                 "from the second system snapshot",
                 "LS372_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             )
         return LakeShore372ABackend._snapshot_values(
-            device_id,
+            instrument_id,
             values,
             kind,
         )
 
     @staticmethod
     def _snapshot_values(
-        device_id: str,
+        instrument_id: str,
         values: Mapping[str, Any],
         kind: str,
     ) -> tuple[str, float, str, float]:
-        """验证核心设备快照处于连接状态，并含有限的 current/timestamp。"""
+        """验证核心仪表快照处于连接状态，并含有限的 current/timestamp。"""
 
         if not bool(values.get("connected", True)):
             raise ModuleError(
-                f"{kind.title()} device {device_id} is "
+                f"{kind.title()} instrument {instrument_id} is "
                 "disconnected",
                 "LS372_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             )
         try:
             current = float(values["current"])
             timestamp = float(values["timestamp"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{kind.title()} device {device_id} has no "
+                f"{kind.title()} instrument {instrument_id} has no "
                 "valid current value or timestamp",
                 "LS372_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             ) from exc
         if (
             not math.isfinite(current)
             or not math.isfinite(timestamp)
         ):
             raise ModuleError(
-                f"{kind.title()} device {device_id} returned "
+                f"{kind.title()} instrument {instrument_id} returned "
                 "a non-finite value or timestamp",
                 "LS372_SYSTEM_SNAPSHOT_UNAVAILABLE",
-                device_id,
+                instrument_id,
             )
         return (
-            device_id,
+            instrument_id,
             current,
             str(values.get("unit", "")),
             timestamp,
@@ -1667,7 +1629,7 @@ class LakeShore372ABackend:
     ) -> dict[str, Any]:
         """把保存文件或 UI 提供的不可信设置规范化为严格、可发送的副本。
 
-        资源名限制为单行 GPIB 地址以阻止命令/日志注入；所有数值按手册和 UI 边界再次
+        资源 ID 限制为单行文本；真实 GPIB 地址只从核心资源表取得。所有数值按手册和 UI 边界再次
         校验；R1-R4 的物理输入必须互不重复且至少启用一个。只有 Apply 会把
         ``validate_enabled_compatibility`` 设为 True，并对 Enabled 槽位执行
         Figure 1-16 的交叉量程校验；Enable 和 Test Connection 必须允许旧设置
@@ -1689,26 +1651,16 @@ class LakeShore372ABackend:
             or "\n" in resource
         ):
             raise ModuleError(
-                "GPIB resource must be one line with at most "
+                "Measurement resource ID must be one line with at most "
                 "255 characters",
                 "LS372_INVALID_SETTINGS",
                 "resource",
             )
         if require_resource and not resource:
             raise ModuleError(
-                "Select a GPIB resource before Apply Settings",
+                "Select a configured measurement instrument resource before Apply Settings",
                 "LS372_INVALID_SETTINGS",
                 "resource",
-            )
-        if (
-            resource
-            and not resource.upper().startswith("GPIB")
-        ):
-            raise ModuleError(
-                "Lake Shore 372A resource must be a GPIB "
-                "VISA resource",
-                "LS372_INVALID_SETTINGS",
-                resource,
             )
         result["resource"] = resource
         result["frequency_index"] = cls._integer(

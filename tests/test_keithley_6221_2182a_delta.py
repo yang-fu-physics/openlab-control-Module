@@ -20,7 +20,7 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from labcontrol.extensions.loading import (  # noqa: E402
+from labcontrol.package_support.loading import (  # noqa: E402
     load_source_object,
 )
 from labcontrol.module_api import (  # noqa: E402
@@ -32,6 +32,7 @@ from labcontrol.measurement.frontend_api import (  # noqa: E402
 )
 from module_contract import (  # noqa: E402
     TestModuleAPI,
+    measurement_resources,
     measure_module,
     module_slots,
     open_module,
@@ -609,14 +610,43 @@ class BackendTests(unittest.TestCase):
 
         return Keithley6221DeltaBackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::12::INSTR",
-                "GPIB0::7::INSTR",
-            ),
             waiter=wait,
         )
 
-    def test_open_only_discovers_and_apply_connects_selected_7001(
+    def test_serial_query_waits_for_2182a_reply_before_reading_buffer(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state)
+        context = _context([])
+        open_module(backend, context)
+        backend.configure(_settings(), context)
+
+        send_index = state.commands.index(
+            (
+                "GPIB0::12::INSTR",
+                "write",
+                'SYST:COMM:SER:SEND "*IDN?"',
+            )
+        )
+        self.assertEqual(
+            state.commands[send_index : send_index + 3],
+            [
+                (
+                    "GPIB0::12::INSTR",
+                    "write",
+                    'SYST:COMM:SER:SEND "*IDN?"',
+                ),
+                ("<module>", "wait", "0.1"),
+                (
+                    "GPIB0::12::INSTR",
+                    "query",
+                    "SYST:COMM:SER:ENT?",
+                ),
+            ],
+        )
+
+    def test_open_reads_registry_and_apply_connects_selected_7001(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -637,7 +667,10 @@ class BackendTests(unittest.TestCase):
             if resource == "GPIB0::7::INSTR" and action == "query"
         ]
         self.assertEqual(switcher_queries[0], "*IDN?")
-        self.assertIn("ROUT:OPEN? (@1!1,1!11,1!5,1!15,1!2,1!12,1!3,1!13,1!4,1!14)", switcher_queries)
+        self.assertIn(
+            "ROUT:OPEN? (@1!1,1!11,1!5,1!15,1!2,1!12,1!3,1!13,1!4,1!14)",
+            switcher_queries,
+        )
 
     def test_connection_test_uses_current_ui_settings_payload(
         self,
@@ -919,7 +952,10 @@ class BackendTests(unittest.TestCase):
             and command == "SOUR:DELT:ARM"
         ]
         self.assertEqual(arm_commands, ["SOUR:DELT:ARM"])
-        self.assertEqual(waits, [3.0, 0.0, 0.0])
+        self.assertEqual(
+            [seconds for seconds in waits if seconds != 0.1],
+            [3.0, 0.0, 0.0],
+        )
         arm_index = state.commands.index(
             (
                 "GPIB0::12::INSTR",
@@ -985,7 +1021,7 @@ class BackendTests(unittest.TestCase):
         )
         self.assertEqual(arm_count, 2)
         self.assertEqual(
-            waits,
+            [seconds for seconds in waits if seconds != 0.1],
             [0.0, 3.0, 0.0, 3.0],
         )
         arm_indices = [
@@ -1188,9 +1224,12 @@ class BackendTests(unittest.TestCase):
         state = _FakeVisaState()
 
         def cancel_during_arm(
-            _context: TestModuleAPI,
+            context: TestModuleAPI,
             seconds: float,
         ) -> None:
+            if seconds == 0.1:
+                context.sleep(0)
+                return
             self.assertEqual(seconds, 3.0)
             # waiter 只会在 SOUR:DELT:ARM 写入之后调用。
             self.assertTrue(state.armed)
@@ -1200,10 +1239,6 @@ class BackendTests(unittest.TestCase):
 
         backend = Keithley6221DeltaBackend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::12::INSTR",
-                "GPIB0::7::INSTR",
-            ),
             waiter=cancel_during_arm,
         )
         settings = _settings(channels=1)
@@ -1220,7 +1255,7 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
 
-    def test_zero_default_and_device_command_ranges_block_apply(
+    def test_zero_default_and_instrument_command_ranges_block_apply(
         self,
     ) -> None:
         state = _FakeVisaState()
@@ -1259,7 +1294,11 @@ class FrontendTests(unittest.TestCase):
     def test_si_text_mode_pages_and_ch1_only_status(
         self,
     ) -> None:
-        context = ModuleUIAPI()
+        context = ModuleUIAPI(resources=measurement_resources({
+            "delta-source": "GPIB0::12::INSTR",
+            "switch-matrix": "GPIB0::7::INSTR",
+            "alternate-source": "GPIB0::22::INSTR",
+        }))
         frontend = Keithley6221DeltaFrontend(context)
         page = frontend
         # 实际主框架会持有两个页面；测试也必须保留状态页，避免 Qt 在状态刷新
@@ -1269,6 +1308,8 @@ class FrontendTests(unittest.TestCase):
             channels=4,
             independent=True,
         )
+        settings["resource_6221"] = "delta-source"
+        settings["resource_switcher"] = "switch-matrix"
         settings["shared"]["high_current"] = "1mA"
         settings["independent"]["ch2"][
             "low_current"
@@ -1320,8 +1361,8 @@ class FrontendTests(unittest.TestCase):
                 (action, payload)
             )
         )
-        frontend.resource_6221.setCurrentText(
-            "GPIB0::22::INSTR"
+        frontend.resource_6221.setCurrentIndex(
+            frontend.resource_6221.findData("alternate-source")
         )
         frontend.test_connection_button.click()
         self.application.processEvents()
@@ -1333,7 +1374,7 @@ class FrontendTests(unittest.TestCase):
             actions[-1][1]["settings"][
                 "resource_6221"
             ],
-            "GPIB0::22::INSTR",
+            "alternate-source",
         )
 
         frontend.switcher_type.setCurrentIndex(
@@ -1376,7 +1417,7 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.2.0b2",
+            "0.2.0b4",
         )
         self.assertEqual(
             list(Keithley6221DeltaBackend.columns),

@@ -10,7 +10,7 @@ CORE = ROOT.parent / "OpenLabControl"
 MODULE = ROOT / "modules" / "simulated_transport"
 sys.path.insert(0, str(CORE / "src"))
 
-from labcontrol.extensions.loading import load_source_object  # noqa: E402
+from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from module_contract import (  # noqa: E402
     TestModuleAPI,
     measure_module,

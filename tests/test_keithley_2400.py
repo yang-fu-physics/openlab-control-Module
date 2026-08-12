@@ -15,7 +15,7 @@ sys.path.insert(0, str(CORE / "src"))
 
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from labcontrol.extensions.loading import load_source_object  # noqa: E402
+from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from labcontrol.module_api import (  # noqa: E402
     ModuleError,
     _ModuleOperationCancelled as ModuleOperationCancelled,
@@ -25,6 +25,7 @@ from labcontrol.measurement.frontend_api import (  # noqa: E402
 )
 from module_contract import (  # noqa: E402
     TestModuleAPI,
+    measurement_resources,
     measure_module,
     module_slots,
     open_module,
@@ -236,10 +237,6 @@ class Keithley2400BackendTests(unittest.TestCase):
     ):
         return Keithley2400Backend(
             transport_factory=state.factory,
-            resource_lister=lambda: (
-                "GPIB0::24::INSTR",
-                "GPIB0::7::INSTR",
-            ),
             waiter=(
                 (lambda _context, seconds: waits.append(seconds))
                 if waits is not None
@@ -247,7 +244,7 @@ class Keithley2400BackendTests(unittest.TestCase):
             ),
         )
 
-    def test_open_only_discovers_resources(self) -> None:
+    def test_open_reads_registry_without_opening_transport(self) -> None:
         state = _FakeState()
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state)
@@ -257,10 +254,7 @@ class Keithley2400BackendTests(unittest.TestCase):
         self.assertEqual(state.opened, [])
         self.assertEqual(state.commands, [])
         self.assertEqual(status["Applied Settings"], "Not applied")
-        self.assertEqual(
-            status["Available GPIB Resources"],
-            ["GPIB0::24::INSTR", "GPIB0::7::INSTR"],
-        )
+        self.assertNotIn("Available GPIB Resources", status)
 
     def test_apply_constant_current_four_wire_reads_back_and_stays_off(self) -> None:
         state = _FakeState()
@@ -479,7 +473,6 @@ class Keithley2400BackendTests(unittest.TestCase):
 
         backend = Keithley2400Backend(
             transport_factory=state.factory,
-            resource_lister=lambda: (),
             waiter=cancel,
         )
         context = self._context(messages)
@@ -578,7 +571,7 @@ class Keithley2400BackendTests(unittest.TestCase):
         self.assertEqual(state.closed, 1)
         self.assertIsNone(backend.transport)
 
-    def test_device_limits_and_operation_budget_are_validated(self) -> None:
+    def test_instrument_limits_and_operation_budget_are_validated(self) -> None:
         state = _FakeState()
         backend = self._backend(state)
         context = self._context([])
@@ -642,18 +635,26 @@ class Keithley2400FrontendTests(unittest.TestCase):
         self.assertFalse(frontend.source_current.isEnabled())
         self.assertTrue(frontend.source_voltage.isEnabled())
 
-    def test_status_resource_refresh_preserves_manual_resource(self) -> None:
-        frontend = Keithley2400Frontend(ModuleUIAPI())
+    def test_resource_dropdown_uses_central_registry_ids(self) -> None:
+        frontend = Keithley2400Frontend(ModuleUIAPI(resources=measurement_resources({
+            "source-meter": "GPIB0::24::INSTR",
+        })))
         settings_page = frontend
         status_page = frontend.status_widget
-        frontend.resource.setCurrentText("GPIB9::24::INSTR")
+        supplied = _settings()
+        supplied["resource"] = "source-meter"
+        frontend.load(supplied)
 
-        frontend.show_status(
-            {"Available GPIB Resources": ["GPIB0::24::INSTR"]}
+        self.assertFalse(frontend.resource.isEditable())
+        self.assertEqual(frontend.resource.currentData(), "source-meter")
+        self.assertEqual(frontend.dump()["resource"], "source-meter")
+        self.assertEqual(
+            frontend.resource.itemData(
+                frontend.resource.currentIndex(),
+                3,
+            ),
+            "GPIB0::24::INSTR",
         )
-
-        self.assertEqual(frontend.resource.currentText(), "GPIB9::24::INSTR")
-        self.assertGreaterEqual(frontend.resource.findText("GPIB0::24::INSTR"), 0)
         self.assertIsInstance(settings_page, QWidget)
         self.assertIsInstance(status_page, QWidget)
 

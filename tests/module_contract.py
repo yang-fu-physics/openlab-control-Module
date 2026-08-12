@@ -12,6 +12,25 @@ from typing import Any
 from labcontrol.module_api import ModuleAPI
 
 
+def measurement_resources(
+    resources: Mapping[str, str],
+) -> dict[str, dict[str, Any]]:
+    """为前后端测试构造“稳定 ID → 实际地址”的核心资源快照。"""
+
+    return {
+        resource_id: {
+            "id": resource_id,
+            "address": address,
+            "identity": f"Test {resource_id}",
+            "purpose": "measurement",
+            "system_instrument": "",
+            "primary_reading": "",
+            "monitor_readings": [],
+        }
+        for resource_id, address in resources.items()
+    }
+
+
 class TestModuleAPI(ModuleAPI):
     """官方模块单元测试使用的可直接构造 ModuleAPI。"""
 
@@ -19,18 +38,55 @@ class TestModuleAPI(ModuleAPI):
 
     def __init__(
         self,
-        devices: Mapping[str, Mapping[str, Any]],
+        instruments: Mapping[str, Mapping[str, Any]],
         emit,
-        sample_devices=None,
+        sample_instruments=None,
         operation_state=None,
         timeout: float = 120.0,
+        resources: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
+        # 后端测试中的既有假地址同时作为稳定测试资源 ID。生产环境的 ID 由扫描工具
+        # 验证为简短名称；这里保留协议断言使用的地址文本，避免测试夹具掩盖实际打开值。
+        test_addresses = (
+            "GPIB0::7::INSTR",
+            "GPIB0::5::INSTR",
+            "GPIB0::8::INSTR",
+            "GPIB0::12::INSTR",
+            "GPIB0::18::INSTR",
+            "GPIB0::24::INSTR",
+            "GPIB0::26::INSTR",
+            "GPIB0::27::INSTR",
+            "GPIB0::22::INSTR",
+            "GPIB0::99::INSTR",
+            "GPIB9::12::INSTR",
+            "GPIB9::18::INSTR",
+            "GPIB9::24::INSTR",
+            "GPIB9::26::INSTR",
+            "GPIB9::27::INSTR",
+        )
+        resource_table = (
+            resources
+            if resources is not None
+            else {
+                address: {
+                    "id": address,
+                    "address": address,
+                    "identity": "Test instrument",
+                    "purpose": "measurement",
+                    "system_instrument": "",
+                    "primary_reading": "",
+                    "monitor_readings": [],
+                }
+                for address in test_addresses
+            }
+        )
         super().__init__(
-            devices,
+            instruments,
             emit,
-            sample_devices,
+            sample_instruments,
             operation_state,
             timeout,
+            _instrument_resources=resource_table,
         )
 
 
