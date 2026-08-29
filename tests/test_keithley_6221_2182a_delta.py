@@ -684,7 +684,12 @@ class BackendTests(unittest.TestCase):
         open_module(backend, context)
         current = _settings()
 
-        run_action(backend, "test_connection", {"settings": current}, context)
+        status = run_action(
+            backend,
+            "test_connection",
+            {"settings": current},
+            context,
+        )
 
         self.assertIn(
             ("GPIB0::12::INSTR", 3.0),
@@ -696,6 +701,9 @@ class BackendTests(unittest.TestCase):
                 for resource, _timeout in state.opened
             )
         )
+        self.assertEqual(status["Switcher Type"], "7001")
+        self.assertIn("MODEL 7001", status["Switcher"])
+        self.assertEqual(backend.switcher_type, "none")
 
     def test_reapply_none_safes_old_7001_before_changing_protocol(self) -> None:
         state = _FakeVisaState()

@@ -519,6 +519,13 @@ class Keithley6221DeltaBackend:
             )
             self._test_connections(settings, api)
             status = self._status()
+            tested_switcher_type = str(settings["switcher_type"])
+            status["Switcher Type"] = tested_switcher_type
+            status["Switcher"] = (
+                "None - CH1 only"
+                if tested_switcher_type == SWITCHER_NONE
+                else (self.identity_switcher or "Not connected")
+            )
             api.status(status)
             return status
         if action == "safe_off":
