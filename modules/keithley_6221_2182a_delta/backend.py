@@ -1339,9 +1339,9 @@ class Keithley6221DeltaBackend:
         api: ModuleAPI,
     ) -> str:
         self._serial_write(command, api)
-        # 2182A 以 19.2 kbaud 把响应发回 6221。立即读取 6221 的串口缓冲会得到空串，
-        # 因此给已发送的查询一次固定传输时间；这里不重发命令。
-        self._waiter(api, 0.1)
+        # 2182A 以 19.2 kbaud 把响应发回 6221。实测查询后至少等待 0.12 s；
+        # 使用 0.15 s 留出余量，然后只读取一次串口缓冲，不重发命令。
+        self._waiter(api, 0.15)
         return self._query_6221(
             keithley_6221.SERIAL_ENTER_QUERY,
             api,

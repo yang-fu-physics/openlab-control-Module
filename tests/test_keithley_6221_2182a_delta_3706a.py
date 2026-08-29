@@ -935,7 +935,7 @@ class BackendTests(unittest.TestCase):
         ]
         self.assertEqual(arm_commands, ["SOUR:DELT:ARM"])
         self.assertEqual(
-            [seconds for seconds in waits if seconds != 0.1],
+            [seconds for seconds in waits if seconds != 0.15],
             [3.0, 0.0, 0.0],
         )
         arm_index = state.commands.index(
@@ -1003,7 +1003,7 @@ class BackendTests(unittest.TestCase):
         )
         self.assertEqual(arm_count, 2)
         self.assertEqual(
-            [seconds for seconds in waits if seconds != 0.1],
+            [seconds for seconds in waits if seconds != 0.15],
             [0.0, 3.0, 0.0, 3.0],
         )
         arm_indices = [
@@ -1248,7 +1248,7 @@ class BackendTests(unittest.TestCase):
             context: TestModuleAPI,
             seconds: float,
         ) -> None:
-            if seconds == 0.1:
+            if seconds == 0.15:
                 context.sleep(0)
                 return
             self.assertEqual(seconds, 3.0)

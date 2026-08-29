@@ -30,8 +30,9 @@ class PyVisaTransport:
         try:
             self._instrument = self._manager.open_resource(resource)
             self._instrument.timeout = max(1, int(float(timeout_seconds) * 1000))
-            self._instrument.write_termination = "\n"
-            self._instrument.read_termination = "\n"
+            self._instrument.write_termination = ""
+            self._instrument.read_termination = None
+            self._instrument.send_end = True
         except Exception:
             self._manager.close()
             raise

@@ -6,6 +6,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -75,6 +76,11 @@ format_quantity = load_source_object(
     MODULE,
     "quantities:format_quantity",
     "test_keithley_delta_format_quantity",
+)
+PyVisaTransport = load_source_object(
+    MODULE,
+    "keithley_6221:PyVisaTransport",
+    "test_keithley_delta_pyvisa_transport",
 )
 load_routing = load_source_object(
     MODULE,
@@ -571,6 +577,39 @@ class QuantityTests(unittest.TestCase):
             parse_quantity("1mV", expected_unit="A")
 
 
+class ProtocolTests(unittest.TestCase):
+    def test_pyvisa_transport_uses_gpib_eoi_without_text_terminators(
+        self,
+    ) -> None:
+        class Instrument:
+            timeout = 0
+            write_termination = "\r\n"
+            read_termination = "\n"
+            send_end = False
+
+        instrument = Instrument()
+
+        class Manager:
+            def open_resource(self, resource: str) -> Instrument:
+                self.resource = resource
+                return instrument
+
+        manager = Manager()
+
+        class PyVisa:
+            @staticmethod
+            def ResourceManager() -> Manager:
+                return manager
+
+        with patch("importlib.import_module", return_value=PyVisa):
+            PyVisaTransport("GPIB0::12::INSTR", 3.0)
+
+        self.assertEqual(manager.resource, "GPIB0::12::INSTR")
+        self.assertEqual(instrument.write_termination, "")
+        self.assertIsNone(instrument.read_termination)
+        self.assertTrue(instrument.send_end)
+
+
 class RoutingTests(unittest.TestCase):
     def test_default_hidden_routes_match_requested_four_channels(
         self,
@@ -637,7 +676,7 @@ class BackendTests(unittest.TestCase):
                     "write",
                     'SYST:COMM:SER:SEND "*IDN?"',
                 ),
-                ("<module>", "wait", "0.1"),
+                ("<module>", "wait", "0.15"),
                 (
                     "GPIB0::12::INSTR",
                     "query",
@@ -961,7 +1000,7 @@ class BackendTests(unittest.TestCase):
         ]
         self.assertEqual(arm_commands, ["SOUR:DELT:ARM"])
         self.assertEqual(
-            [seconds for seconds in waits if seconds != 0.1],
+            [seconds for seconds in waits if seconds != 0.15],
             [3.0, 0.0, 0.0],
         )
         arm_index = state.commands.index(
@@ -1029,7 +1068,7 @@ class BackendTests(unittest.TestCase):
         )
         self.assertEqual(arm_count, 2)
         self.assertEqual(
-            [seconds for seconds in waits if seconds != 0.1],
+            [seconds for seconds in waits if seconds != 0.15],
             [0.0, 3.0, 0.0, 3.0],
         )
         arm_indices = [
@@ -1235,7 +1274,7 @@ class BackendTests(unittest.TestCase):
             context: TestModuleAPI,
             seconds: float,
         ) -> None:
-            if seconds == 0.1:
+            if seconds == 0.15:
                 context.sleep(0)
                 return
             self.assertEqual(seconds, 3.0)
