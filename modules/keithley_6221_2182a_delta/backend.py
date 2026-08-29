@@ -189,7 +189,11 @@ class Keithley6221DeltaBackend:
                 self._connect_switcher(normalized, api)
             else:
                 self._close_transport_switcher()
+            # Apply 只判断本次命令产生的错误；6221 的错误队列会跨会话保留，
+            # 因此先按手册用 *CLS 建立干净基线，再执行并验证安全状态。
+            self._write_6221(keithley_6221.CLEAR_STATUS, api)
             self._enter_safe_state(api)
+            self._raise_if_instrument_error(api)
             self._verify_2182a(api)
             first_channel = self._enabled_channels(
                 normalized

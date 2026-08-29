@@ -119,6 +119,7 @@ class _FakeVisaState:
         self.digital_filter_type = "MOV"
         self.digital_filter_count = 10
         self.digital_filter_window = 0.01
+        self.error_queue: list[str] = []
         self.closed_routes: set[str] = set()
         self.trace_by_channel: dict[str, str] = {
             "ch1": "1e-6,3e-6",
@@ -199,6 +200,8 @@ class _Fake6221:
             self.state.armed = False
             self.state.current = 0.0
             self.state.output = False
+        elif upper == "*CLS":
+            self.state.error_queue.clear()
         elif upper == "SOUR:CLE":
             self.state.current = 0.0
             self.state.output = False
@@ -303,7 +306,6 @@ class _Fake6221:
             ),
             "OUTP?": "1" if self.state.output else "0",
             "SOUR:CURR?": f"{self.state.current:.12g}",
-            "SYST:ERR?": '0,"No error"',
             "*OPC?": "1",
             "TRAC:DATA?": self.state.trace_by_channel[
                 self.state.active_channel()
@@ -311,6 +313,12 @@ class _Fake6221:
         }
         if upper == "SYST:COMM:SER:ENT?":
             return self._serial_reply()
+        if upper == "SYST:ERR?":
+            return (
+                self.state.error_queue.pop(0)
+                if self.state.error_queue
+                else '0,"No error"'
+            )
         if upper in replies:
             return replies[upper]
         raise AssertionError(
@@ -684,6 +692,25 @@ class BackendTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_apply_clears_preexisting_6221_error_queue(self) -> None:
+        state = _FakeVisaState()
+        state.error_queue.append('-410,"Query INTERRUPTED"')
+        backend = self._backend(state)
+        context = _context([])
+        open_module(backend, context)
+
+        status = backend.configure(_settings(), context)
+
+        self.assertEqual(status["State"], "Settings applied - output off")
+        clear_index = state.commands.index(
+            ("GPIB0::12::INSTR", "write", "*CLS")
+        )
+        abort_index = state.commands.index(
+            ("GPIB0::12::INSTR", "write", "SOUR:SWE:ABOR")
+        )
+        self.assertLess(clear_index, abort_index)
+        self.assertEqual(state.error_queue, [])
 
     def test_open_reads_registry_and_apply_connects_selected_7001(
         self,

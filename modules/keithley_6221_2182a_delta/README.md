@@ -57,9 +57,11 @@ CH1-CH4 各占一行，并与其他四槽位扫描模块按槽位对齐。DAT �
 状态非零时 `Resistance` 和 `StdDev` 留空。数据质量问题调用去重 Warning 并继续
 SEQ；通信、身份、配置读回、路由、触发状态或安全输出无法确认时报告 Error 并终止。
 
-Apply 前后、Stop、Error、Disable 和正常 SEQ 结束均执行 Abort/Clear、确认输出关闭
-及零电流，并在存在切换器时打开全部触点。模块没有单通道 timeout，也没有 DUT 软件
-电流/compliance 上限；长 `*OPC?` 使用核心 Measure 总预算并预留安全清理时间。仍会
+Apply 在身份确认后先用 `*CLS` 清除 6221 跨会话保留的历史错误，再执行
+Abort/Clear、确认输出关闭及零电流，并在存在切换器时打开全部触点。Apply 结束、
+Stop、Error、Disable 和正常 SEQ 结束也执行相同的安全关闭。模块没有单通道
+timeout，也没有 DUT 软件电流/compliance 上限；长 `*OPC?` 使用核心 Measure 总预算
+并预留安全清理时间。仍会
 按 6221 手册拒绝仪表自身不支持的命令范围，但这不等于样品安全认证。
 
 本版本尚未用真实仪表、开关卡、DUT、线缆和 GPIB 控制器验证，仍按 Beta 使用。

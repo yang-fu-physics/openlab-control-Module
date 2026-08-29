@@ -196,6 +196,8 @@ class _Fake6221:
             self.state.armed = False
             self.state.current = 0.0
             self.state.output = False
+        elif upper == "*CLS":
+            pass
         elif upper == "SOUR:CLE":
             self.state.current = 0.0
             self.state.output = False

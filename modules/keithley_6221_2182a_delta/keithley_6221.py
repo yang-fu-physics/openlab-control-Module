@@ -62,6 +62,7 @@ class PyVisaTransport:
 
 
 IDENTIFY = "*IDN?"
+CLEAR_STATUS = "*CLS"
 NANOVOLTMETER_PRESENT_QUERY = "SOUR:DELT:NVPRESENT?"
 ARM = "SOUR:DELT:ARM"
 ARM_QUERY = "SOUR:DELT:ARM?"
@@ -146,6 +147,7 @@ __all__ = [
     "Transport",
     "PyVisaTransport",
     "IDENTIFY",
+    "CLEAR_STATUS",
     "NANOVOLTMETER_PRESENT_QUERY",
     "ARM",
     "ARM_QUERY",
