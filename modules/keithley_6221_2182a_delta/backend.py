@@ -893,8 +893,8 @@ class Keithley6221DeltaBackend:
         self.last_status = "Arming"
         api.status(self._status())
         self._waiter(api, ARM_SETTLE_SECONDS)
-        self._verify_armed(api)
         self._raise_if_instrument_error(api)
+        self._verify_armed(api)
         self.last_status = "Armed - waiting for software trigger"
         api.status(self._status())
 

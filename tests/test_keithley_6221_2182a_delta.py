@@ -120,6 +120,7 @@ class _FakeVisaState:
         self.digital_filter_count = 10
         self.digital_filter_window = 0.01
         self.error_queue: list[str] = []
+        self.arm_error_reply = ""
         self.closed_routes: set[str] = set()
         self.trace_by_channel: dict[str, str] = {
             "ch1": "1e-6,3e-6",
@@ -231,7 +232,13 @@ class _Fake6221:
         elif upper == "SOUR:DELT:CAB ON":
             self.state.compliance_abort = True
         elif upper == "SOUR:DELT:ARM":
-            self.state.armed = True
+            if self.state.arm_error_reply:
+                self.state.error_queue.append(
+                    self.state.arm_error_reply
+                )
+                self.state.armed = False
+            else:
+                self.state.armed = True
             self.state.current = 0.0
         elif upper == "INIT:IMM":
             if not self.state.armed:
@@ -1053,6 +1060,29 @@ class BackendTests(unittest.TestCase):
         self.assertLess(wait_index, verify_index)
 
         run_end(backend, "completed", context)
+        self.assertFalse(state.armed)
+        self.assertFalse(state.output)
+        self.assertEqual(state.closed_routes, set())
+
+    def test_arm_reports_instrument_error_before_not_armed(self) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state, [])
+        context = _context([])
+        open_module(backend, context)
+        backend.configure(_settings(channels=1), context)
+        state.arm_error_reply = '419,"Trigger link cable not connected"'
+
+        with self.assertRaises(ModuleError) as captured:
+            run_start(backend, context)
+
+        self.assertEqual(
+            captured.exception.code,
+            "K6221_INSTRUMENT_ERROR",
+        )
+        self.assertIn(
+            "Trigger link cable not connected",
+            str(captured.exception),
+        )
         self.assertFalse(state.armed)
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
