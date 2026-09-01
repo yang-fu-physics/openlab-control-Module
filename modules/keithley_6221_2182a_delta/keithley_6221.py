@@ -75,6 +75,7 @@ OUTPUT_QUERY = "OUTP?"
 CURRENT_QUERY = "SOUR:CURR?"
 ERROR_QUERY = "SYST:ERR?"
 SERIAL_ENTER_QUERY = "SYST:COMM:SER:ENT?"
+SERIAL_ABORT_CONTROL_FRAME = "DCL\x11"
 COMPLIANCE_QUERY = "SOUR:CURR:COMP?"
 HIGH_CURRENT_QUERY = "SOUR:DELT:HIGH?"
 LOW_CURRENT_QUERY = "SOUR:DELT:LOW?"
@@ -119,6 +120,17 @@ def serial_send(command: str) -> str:
     return f'SYST:COMM:SER:SEND "{escaped}"'
 
 
+def parse_serial_bridge_reply(reply: str) -> str:
+    """移除 Delta Abort 的已知控制帧，并返回唯一的 2182A 响应。"""
+
+    frames = reply.splitlines()
+    while frames and frames[0] == SERIAL_ABORT_CONTROL_FRAME:
+        frames.pop(0)
+    if len(frames) != 1 or not frames[0].strip():
+        raise ValueError(f"invalid 6221 serial-bridge response {reply!r}")
+    return frames[0].strip()
+
+
 def parse_switch(reply: str) -> bool:
     normalized = reply.strip().upper()
     if normalized in {"1", "+1", "ON"}:
@@ -160,6 +172,7 @@ __all__ = [
     "CURRENT_QUERY",
     "ERROR_QUERY",
     "SERIAL_ENTER_QUERY",
+    "SERIAL_ABORT_CONTROL_FRAME",
     "COMPLIANCE_QUERY",
     "HIGH_CURRENT_QUERY",
     "LOW_CURRENT_QUERY",
@@ -169,6 +182,7 @@ __all__ = [
     "COMPLIANCE_ABORT_QUERY",
     "configuration_commands",
     "serial_send",
+    "parse_serial_bridge_reply",
     "parse_switch",
     "parse_number",
     "parse_error_code",

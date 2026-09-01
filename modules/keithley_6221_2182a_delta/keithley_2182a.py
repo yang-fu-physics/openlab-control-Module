@@ -62,6 +62,7 @@ def parse_trace(reply: str, expected_count: int) -> tuple[tuple[float, ...], tup
     tokens = re.split(r"[,;\r\n]+", stripped) if stripped else []
     values: list[float] = []
     issues: list[str] = []
+    over_range_count = 0
     invalid = False
     over_range = False
     for index, token in enumerate(tokens, start=1):
@@ -83,7 +84,12 @@ def parse_trace(reply: str, expected_count: int) -> tuple[tuple[float, ...], tup
         values.append(value)
         if abs(value) > 120.0:
             over_range = True
-            issues.append(f"sample {index} exceeds the 2182A range")
+            over_range_count += 1
+    if over_range_count:
+        issues.append(
+            "2182A overrange on "
+            f"{over_range_count}/{len(tokens)} trace values"
+        )
     if len(tokens) != expected_count:
         invalid = True
         issues.append(f"expected {expected_count} samples, received {len(tokens)}")

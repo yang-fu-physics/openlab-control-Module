@@ -82,6 +82,11 @@ PyVisaTransport = load_source_object(
     "keithley_6221:PyVisaTransport",
     "test_keithley_delta_pyvisa_transport",
 )
+parse_serial_bridge_reply = load_source_object(
+    MODULE,
+    "keithley_6221:parse_serial_bridge_reply",
+    "test_keithley_delta_parse_serial_bridge_reply",
+)
 load_routing = load_source_object(
     MODULE,
     "routing:load_routing",
@@ -111,6 +116,7 @@ class _FakeVisaState:
         self.cold_switch = True
         self.compliance_abort = True
         self.serial_pending = ""
+        self.serial_control_frames: list[str] = []
         self.nplc = 1.0
         self.range_auto = True
         self.voltage_range = 0.01
@@ -198,6 +204,10 @@ class _Fake6221:
         )
         upper = command.upper()
         if upper == "SOUR:SWE:ABOR":
+            if self.state.armed:
+                self.state.serial_control_frames.extend(
+                    ["DCL\x11", "DCL\x11"]
+                )
             self.state.armed = False
             self.state.current = 0.0
             self.state.output = False
@@ -402,7 +412,9 @@ class _Fake6221:
             raise AssertionError(
                 f"Unexpected 2182A serial query: {query}"
             )
-        return replies[query]
+        frames = [*self.state.serial_control_frames, replies[query]]
+        self.state.serial_control_frames.clear()
+        return "\n".join(frames)
 
     def close(self) -> None:
         self.state.closed.append(self.resource)
@@ -593,6 +605,19 @@ class QuantityTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_serial_bridge_extracts_only_known_abort_control_frames(
+        self,
+    ) -> None:
+        self.assertEqual(
+            parse_serial_bridge_reply("DCL\x11\nDCL\x11\n0"),
+            "0",
+        )
+        self.assertEqual(parse_serial_bridge_reply("1"), "1")
+        for reply in ("DCL\x11", "UNKNOWN\n0", "DCL\x11\n0\n1"):
+            with self.subTest(reply=reply):
+                with self.assertRaises(ValueError):
+                    parse_serial_bridge_reply(reply)
+
     def test_pyvisa_transport_uses_gpib_eoi_without_text_terminators(
         self,
     ) -> None:
@@ -1000,28 +1025,28 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         ]
         self.assertEqual(len(rows), 2)
-        self.assertEqual(
-            [payload["values"]["Channel"] for payload in rows],
-            [1, 2],
-        )
+        self.assertIn("Delta_R1", rows[0]["values"])
+        self.assertNotIn("Delta_R2", rows[0]["values"])
+        self.assertIn("Delta_R2", rows[1]["values"])
+        self.assertNotIn("Delta_R1", rows[1]["values"])
         self.assertEqual(
             rows[0]["raw_values"],
             [1.0e-6, 3.0e-6],
         )
         self.assertAlmostEqual(
-            rows[0]["values"]["Resistance"],
+            rows[0]["values"]["Delta_R1"],
             0.2,
         )
         self.assertAlmostEqual(
-            rows[0]["values"]["Current"],
+            rows[0]["values"]["Delta_Current"],
             10.0e-6,
         )
         self.assertAlmostEqual(
-            rows[0]["values"]["StdDev"],
+            rows[0]["values"]["Delta_R1_StdDev"],
             math.sqrt(0.02),
         )
         self.assertEqual(
-            rows[0]["values"]["StatusCode"],
+            rows[0]["values"]["Delta_StatusCode"],
             0,
         )
         arm_commands = [
@@ -1063,6 +1088,31 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.armed)
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
+
+    def test_completed_run_abort_frames_do_not_pollute_next_run(
+        self,
+    ) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state, [])
+        context = _context([])
+
+        open_module(backend, context)
+        backend.configure(_settings(channels=1), context)
+        run_start(backend, context)
+        _measure_enabled_slots(backend, context)
+        run_end(backend, "completed", context)
+        run_start(backend, context)
+
+        range_queries = [
+            command
+            for resource, action, command in state.commands
+            if resource == "GPIB0::12::INSTR"
+            and action == "write"
+            and command
+            == 'SYST:COMM:SER:SEND "VOLT:RANG:AUTO?"'
+        ]
+        self.assertEqual(len(range_queries), 3)
+        self.assertEqual(state.serial_control_frames, [])
 
     def test_arm_reports_instrument_error_before_not_armed(self) -> None:
         state = _FakeVisaState()
@@ -1111,7 +1161,7 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         ]
         for actual, expected in zip(
-            [row["Current"] for row in rows],
+            [row["Delta_Current"] for row in rows],
             [10.0e-6, 20.0e-6],
             strict=True,
         ):
@@ -1197,15 +1247,18 @@ class BackendTests(unittest.TestCase):
             for kind, payload in messages
             if kind == "row"
         )
-        self.assertEqual(
-            row["values"]["StatusCode"],
-            3,
-        )
         self.assertNotIn(
-            "Resistance",
+            "Delta_R1",
             row["values"],
         )
-        self.assertNotIn("StdDev", row["values"])
+        self.assertNotIn(
+            "Delta_R1_StdDev",
+            row["values"],
+        )
+        self.assertEqual(
+            row["values"]["Delta_StatusCode"],
+            3,
+        )
         self.assertEqual(
             row["raw_values"],
             [1.0e-6, 1.0e200],
@@ -1215,6 +1268,13 @@ class BackendTests(unittest.TestCase):
                 kind == "warning"
                 and payload["code"]
                 == "K6221_READING_WARNING"
+                and payload["message"]
+                == (
+                    "CH1 has no Delta result: "
+                    "sample 3 is not numeric ('BAD'); "
+                    "2182A overrange on 1/3 trace values; "
+                    "only 2 samples were numeric"
+                )
                 for kind, payload in messages
             )
         )
@@ -1242,11 +1302,13 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         )
         self.assertEqual(
-            row["values"]["StatusCode"],
+            set(row["values"]),
+            {"Delta_Current", "Delta_StatusCode"},
+        )
+        self.assertEqual(
+            row["values"]["Delta_StatusCode"],
             1,
         )
-        self.assertEqual(row["values"]["Channel"], 1)
-        self.assertNotIn("Resistance", row["values"])
 
     def test_7001_runtime_failure_has_no_retry_and_is_fatal(
         self,
@@ -1521,17 +1583,21 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.2.0b4",
+            "0.2.0b5",
         )
         self.assertEqual(
             list(Keithley6221DeltaBackend.columns),
             [
-                "Channel",
-                "Resistance",
-                "Current",
-                "StdDev",
-                "SampleCount",
-                "StatusCode",
+                "Delta_R1",
+                "Delta_R1_StdDev",
+                "Delta_R2",
+                "Delta_R2_StdDev",
+                "Delta_R3",
+                "Delta_R3_StdDev",
+                "Delta_R4",
+                "Delta_R4_StdDev",
+                "Delta_Current",
+                "Delta_StatusCode",
             ],
         )
         self.assertEqual(descriptor.columns, ())

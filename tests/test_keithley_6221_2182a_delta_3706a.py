@@ -884,28 +884,28 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         ]
         self.assertEqual(len(rows), 2)
-        self.assertEqual(
-            [payload["values"]["Channel"] for payload in rows],
-            [1, 2],
-        )
+        self.assertIn("Delta_R1", rows[0]["values"])
+        self.assertNotIn("Delta_R2", rows[0]["values"])
+        self.assertIn("Delta_R2", rows[1]["values"])
+        self.assertNotIn("Delta_R1", rows[1]["values"])
         self.assertEqual(
             rows[0]["raw_values"],
             [1.0e-6, 3.0e-6],
         )
         self.assertAlmostEqual(
-            rows[0]["values"]["Resistance"],
+            rows[0]["values"]["Delta_R1"],
             0.2,
         )
         self.assertAlmostEqual(
-            rows[0]["values"]["Current"],
+            rows[0]["values"]["Delta_Current"],
             10.0e-6,
         )
         self.assertAlmostEqual(
-            rows[0]["values"]["StdDev"],
+            rows[0]["values"]["Delta_R1_StdDev"],
             math.sqrt(0.02),
         )
         self.assertEqual(
-            rows[0]["values"]["StatusCode"],
+            rows[0]["values"]["Delta_StatusCode"],
             0,
         )
         switch_writes = [
@@ -991,7 +991,7 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         ]
         for actual, expected in zip(
-            [row["Current"] for row in rows],
+            [row["Delta_Current"] for row in rows],
             [10.0e-6, 20.0e-6],
             strict=True,
         ):
@@ -1078,14 +1078,17 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         )
         self.assertEqual(
-            row["values"]["StatusCode"],
+            row["values"]["Delta_StatusCode"],
             3,
         )
         self.assertNotIn(
-            "Resistance",
+            "Delta_R1",
             row["values"],
         )
-        self.assertNotIn("StdDev", row["values"])
+        self.assertNotIn(
+            "Delta_R1_StdDev",
+            row["values"],
+        )
         self.assertEqual(
             row["raw_values"],
             [1.0e-6, 1.0e200],
@@ -1122,11 +1125,10 @@ class BackendTests(unittest.TestCase):
             if kind == "row"
         )
         self.assertEqual(
-            row["values"]["StatusCode"],
+            row["values"]["Delta_StatusCode"],
             1,
         )
-        self.assertEqual(row["values"]["Channel"], 1)
-        self.assertNotIn("Resistance", row["values"])
+        self.assertNotIn("Delta_R1", row["values"])
 
     def test_3706a_runtime_failure_has_no_retry_and_is_fatal(
         self,
@@ -1448,17 +1450,21 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.2.0b4",
+            "0.2.0b5",
         )
         self.assertEqual(
             list(Keithley6221Delta3706ABackend.columns),
             [
-                "Channel",
-                "Resistance",
-                "Current",
-                "StdDev",
-                "SampleCount",
-                "StatusCode",
+                "Delta_R1",
+                "Delta_R1_StdDev",
+                "Delta_R2",
+                "Delta_R2_StdDev",
+                "Delta_R3",
+                "Delta_R3_StdDev",
+                "Delta_R4",
+                "Delta_R4_StdDev",
+                "Delta_Current",
+                "Delta_StatusCode",
             ],
         )
         self.assertEqual(descriptor.columns, ())

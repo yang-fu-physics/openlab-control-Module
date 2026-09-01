@@ -75,14 +75,23 @@ class Keithley6221DeltaBackend:
     """6221/2182A Delta 测量及可选 7001/3706A 四路路由状态机。"""
 
     columns = {
-        "Channel": "",
-        "Resistance": "Ohm",
-        "Current": "A",
-        "StdDev": "Ohm",
-        "SampleCount": "",
-        "StatusCode": "",
+        "Delta_R1": "ohm",
+        "Delta_R1_StdDev": "ohm",
+        "Delta_R2": "ohm",
+        "Delta_R2_StdDev": "ohm",
+        "Delta_R3": "ohm",
+        "Delta_R3_StdDev": "ohm",
+        "Delta_R4": "ohm",
+        "Delta_R4_StdDev": "ohm",
+        "Delta_Current": "",
+        "Delta_StatusCode": "",
     }
-    display_columns = ("Resistance",)
+    display_columns = (
+        "Delta_R1",
+        "Delta_R2",
+        "Delta_R3",
+        "Delta_R4",
+    )
 
     def __init__(
         self,
@@ -343,18 +352,17 @@ class Keithley6221DeltaBackend:
                 )
             )
             current = self._effective_current(selected)
+            channel_number = int(channel[2:])
             row: dict[str, Any] = {
-                "Channel": int(channel[2:]),
-                "Current": current,
-                "SampleCount": len(raw_values),
-                "StatusCode": status_code,
+                "Delta_Current": current,
+                "Delta_StatusCode": status_code,
             }
             if issues:
                 # “通道 Error”是数据状态，不是框架 Error 事件。以 Warning 报告后
                 # SEQ 继续，且不把部分有效样本伪装成正式电阻。
                 api.warn(
                     "K6221_READING_WARNING",
-                    f"{channel.upper()} Delta readings are invalid: "
+                    f"{channel.upper()} has no Delta result: "
                     + "; ".join(issues),
                     channel,
                 )
@@ -379,8 +387,8 @@ class Keithley6221DeltaBackend:
                 )
                 row.update(
                     {
-                        "Resistance": mean,
-                        "StdDev": stddev,
+                        f"Delta_R{channel_number}": mean,
+                        f"Delta_R{channel_number}_StdDev": stddev,
                     }
                 )
                 api.warn("K6221_READING_WARNING", None, channel)
@@ -1346,10 +1354,19 @@ class Keithley6221DeltaBackend:
         # 2182A 以 19.2 kbaud 把响应发回 6221。实测查询后至少等待 0.12 s；
         # 使用 0.15 s 留出余量，然后只读取一次串口缓冲，不重发命令。
         self._waiter(api, 0.15)
-        return self._query_6221(
+        reply = self._query_6221(
             keithley_6221.SERIAL_ENTER_QUERY,
             api,
         )
+        try:
+            return keithley_6221.parse_serial_bridge_reply(reply)
+        except ValueError as exc:
+            raise ModuleError(
+                f"{command} returned invalid 6221 serial-bridge "
+                f"response {reply!r}",
+                "K6221_INVALID_REPLY",
+                command,
+            ) from exc
 
     def _raise_if_instrument_error(
         self,
