@@ -3,6 +3,10 @@
 这是 Measurement Module 的共享仓库。框架负责加载、进程隔离、Pause/Stop、操作总
 timeout、跨模块并行和 DAT 写入；模块负责仪表协议、通道、状态码和安全动作。
 
+`examples/labview_dll` 是直接加载 LabVIEW Shared Library 的开发模板。它用固定的
+UTF-8 JSON ABI 传递设置、资源、测量结果和 LabVIEW error cluster；复制到
+`modules/<id>/` 并完成 DLL 后才会出现在 Modules Manager。详细步骤见该目录 README。
+
 ## 最小硬件模块
 
 ```text
