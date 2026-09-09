@@ -90,6 +90,30 @@ class _BackendDriver:
             "columns": {"Resistance": "Ohm", "StatusCode": ""},
             "display_columns": ["Resistance"],
             "slots": 2,
+            "manual_functions": [
+                {
+                    "id": "diagnostic_read",
+                    "label": "Diagnostic Read",
+                    "inputs": [
+                        {
+                            "name": "mode",
+                            "label": "Mode",
+                            "type": "choice",
+                            "default": "Current",
+                            "choices": ["Current", "Voltage"],
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "name": "value",
+                            "label": "Value",
+                            "type": "float",
+                            "unit": "V",
+                            "decimals": 9,
+                        }
+                    ],
+                }
+            ],
         }
         self.calls = []
         self.warning = False
@@ -113,6 +137,8 @@ class _BackendDriver:
                 "rawdata": [0.00124, 0.00126],
                 "status": {"Last Slot": payload["slot"]},
             }
+        if operation == "manual_function":
+            return {"value": 1.25e-6}
         return {"State": operation}
 
     def close(self):
@@ -171,6 +197,10 @@ class LabVIEWDLLTemplateTests(unittest.TestCase):
         self.assertEqual(backend.columns, {"Resistance": "Ohm", "StatusCode": ""})
         self.assertEqual(backend.display_columns, ("Resistance",))
         self.assertEqual(backend.slots, 2)
+        self.assertEqual(
+            backend.dll_functions[0]["id"],
+            "diagnostic_read",
+        )
         commands = normalize_module_commands(
             "labview_dll_example",
             backend.sequence_commands,
@@ -192,11 +222,17 @@ class LabVIEWDLLTemplateTests(unittest.TestCase):
             },
             api,
         )
+        result = backend.execute_dll_function(
+            "diagnostic_read",
+            {"mode": "Current"},
+            api,
+        )
         backend.on_event("run_end", {"reason": "completed"}, api)
         backend.close(api)
 
         self.assertEqual(row, {"Resistance": 12.5, "StatusCode": 0})
         self.assertEqual(rawdata, [0.00124, 0.00126])
+        self.assertEqual(result, {"value": 1.25e-6})
         self.assertEqual(driver.calls[0][1]["resources"]["meter_1"]["address"], "GPIB0::24::INSTR")
         self.assertEqual(driver.calls[1][1]["settings"], {"resource": "meter_1"})
         self.assertEqual(
@@ -208,6 +244,10 @@ class LabVIEWDLLTemplateTests(unittest.TestCase):
             },
         )
         self.assertEqual(driver.calls[4][1]["parameters"]["value"], 1.0)
+        self.assertEqual(
+            driver.calls[5][1]["function_id"],
+            "diagnostic_read",
+        )
         self.assertIn(("status", {"values": {"Last Slot": 2}}), messages)
         self.assertEqual(driver.calls[-1][0], "close")
 

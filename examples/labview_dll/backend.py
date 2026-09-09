@@ -103,6 +103,7 @@ class Module:
         self.columns = dict(columns)
         self.display_columns = tuple(display_columns)
         self.slots = slots
+        self.dll_functions = description.get("manual_functions", [])
         self._close_required = False
 
     @staticmethod
@@ -216,6 +217,27 @@ class Module:
         api.checkpoint()
         api.status(status)
         return status
+
+    def execute_dll_function(
+        self,
+        function_id: str,
+        parameters: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> Mapping[str, Any]:
+        api.checkpoint()
+        try:
+            result = self._driver.invoke(
+                "manual_function",
+                {
+                    "function_id": function_id,
+                    "parameters": dict(parameters),
+                    "operation_timeout_seconds": api.timeout,
+                },
+            )
+        except LabVIEWDLLFailure as error:
+            self._raise_failure(error)
+        api.checkpoint()
+        return result
 
     def close(self, api: ModuleAPI) -> Mapping[str, Any]:
         if not self._close_required:

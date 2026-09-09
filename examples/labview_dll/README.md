@@ -1,5 +1,7 @@
 # LabVIEW DLL Measurement Module 模板
 
+要求 OpenLab Control `0.20.1` 或更新版本。
+
 仪表已有经过实际使用的 LabVIEW 驱动或测量 VI 时，优先使用本模板复用原实现，而不是重新
 用 Python 翻译整套底层指令。复用不会替代安全边界：量程与输出限制、有限超时、写后回读
 和真机低风险验证仍然必须完成。
@@ -90,12 +92,32 @@ Error 中止 SEQ。把 LabVIEW error cluster 映射到稳定的 `code`、可读�
     "columns": {"Resistance": "Ohm", "StatusCode": ""},
     "display_columns": ["Resistance"],
     "slots": 1,
-    "operations": ["configure", "measure", "event", "sequence_command"]
+    "operations": ["configure", "measure", "event", "sequence_command", "manual_function"],
+    "manual_functions": [
+      {
+        "id": "diagnostic_read",
+        "label": "Diagnostic Read",
+        "description": "Run one existing LabVIEW diagnostic VI.",
+        "inputs": [
+          {"name": "mode", "label": "Mode", "type": "choice", "default": "Current", "choices": ["Current", "Voltage"]},
+          {"name": "range", "label": "Range", "type": "choice", "default": "Auto", "choices": ["Auto", "Low", "High"]},
+          {"name": "level", "label": "Level", "type": "float", "default": 0.001, "minimum": 0.0, "maximum": 1.0, "unit": "A", "decimals": 9},
+          {"name": "samples", "label": "Samples", "type": "int", "default": 10, "minimum": 1, "maximum": 1000}
+        ],
+        "outputs": [
+          {"name": "value", "label": "Value", "type": "float", "unit": "V", "decimals": 9},
+          {"name": "status", "label": "Status", "type": "int"}
+        ]
+      }
+    ]
   }
 }
 ```
 
 `columns`、`display_columns` 和正整数 `slots` 在模块 Enable 时读取，运行中不能改变。
+`manual_functions` 是可选项，直接保存在 DLL 静态说明中，不需要另写 TOML。模块 Enable
+成功后，OpenLab 在主菜单 `Modules` 下自动生成窗口；同一函数可以同时打开多个窗口。
+函数只在 SEQ 空闲时运行，结果显示并写入事件日志，不写 DAT。
 
 `OLC_Open` 收到核心确认过的 Measurement 资源表和本次操作总超时。它适合初始化 DLL
 内部状态；如果用户还没有 Apply Settings，不要猜测应连接哪台仪表：
@@ -127,6 +149,8 @@ Error 中止 SEQ。把 LabVIEW error cluster 映射到稳定的 `code`、可读�
 - `event`：参数中有 `name`、`data` 和总超时；结果是状态字典。`run_end` 的安全关闭输出
   也在这里完成。
 - `sequence_command`：普通指令和扫描的每个点都使用这个操作；结果是状态字典，不写 DAT。
+- `manual_function`：参数包含 `function_id`、对应的 `parameters` 和总超时；结果字段必须与
+  `manual_functions.outputs` 完全一致。
 - `OLC_Open`、`OLC_Close`：结果是状态字典，可以为空。
 
 模板后端附带两个可直接出现在 Sequence Command Bar 中的示例：
