@@ -1,6 +1,6 @@
 # Keithley 6221 + 2182A Delta
 
-版本 `0.2.0b5`。本模块用 Keithley 6221 电流源和通过其 RS-232/Trigger Link
+版本 `0.2.0b6`。本模块用 Keithley 6221 电流源和通过其 RS-232/Trigger Link
 连接的 2182A 纳伏表执行 Delta 测量，并可明确选择以下通道路由方式：
 
 - `None`：不连接切换器，只允许 CH1；
@@ -37,6 +37,11 @@ Trigger Link。模块会验证 6221 报告 2182A 存在，并通过串口转发�
 动态 `slots` 让核心为每个 Enabled 逻辑通道调用一次 `measure(slot, api)`，因此
 CH1-CH4 各占一行，并与其他四槽位扫描模块按槽位对齐。2182A 原始电压序列逐行写入
 `rawdata`，与正式 DAT 行一一对应。Delta count 最大 32,768，以保证 IPC 帧有界。
+
+Status 中 `Connected Channel` 表示当前连接的逻辑通道；`Last Measured Channel` 表示
+下面一组 Last Resistance、Last Current 和 Last StdDev 所属的最近完成测量通道。
+切换通道时保留上一组结果及其通道标记，直到新测量完成；数据无效时电阻和标准差显示 `-`。
+输出关闭、路由断开后连接通道显示 `-`，最后测量结果仍保留。
 
 ## 路由配置
 

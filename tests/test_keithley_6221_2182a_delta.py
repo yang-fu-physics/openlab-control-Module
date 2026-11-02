@@ -1005,6 +1005,16 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(state.armed)
         _measure_enabled_slots(backend, context)
 
+        switching_status = next(
+            payload["values"]
+            for kind, payload in messages
+            if kind == "status"
+            and payload["values"].get("Connected Channel") == "CH2"
+            and payload["values"].get("Last Measured Channel") == "CH1"
+        )
+        self.assertAlmostEqual(switching_status["Last Resistance (Ohm)"], 0.2)
+        self.assertEqual(backend._status()["Last Measured Channel"], "CH2")
+
         completion_timeouts = [
             timeout
             for command, timeout in state.query_timeouts
@@ -1088,6 +1098,9 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.armed)
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
+
+        self.assertEqual(backend._status()["Connected Channel"], "-")
+        self.assertEqual(backend._status()["Last Measured Channel"], "CH2")
 
     def test_completed_run_abort_frames_do_not_pollute_next_run(
         self,
@@ -1240,7 +1253,13 @@ class BackendTests(unittest.TestCase):
         backend.configure(settings, context)
         run_start(backend, context)
 
+        backend.last_resistance = 123.0
+        backend.last_stddev = 1.0
         measure_module(backend, context)
+        result_status = backend._status()
+        self.assertEqual(result_status["Last Measured Channel"], "CH1")
+        self.assertEqual(result_status["Last Resistance (Ohm)"], "-")
+        self.assertEqual(result_status["Last StdDev (Ohm)"], "-")
 
         row = next(
             payload

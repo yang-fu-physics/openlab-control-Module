@@ -133,6 +133,7 @@ class Keithley6221DeltaBackend:
         self.sequence_active = False
         self.armed = False
         self.active_channel = ""
+        self.last_measured_channel = ""
         self.last_resistance: float | None = None
         self.last_current: float | None = None
         self.last_stddev: float | None = None
@@ -396,6 +397,7 @@ class Keithley6221DeltaBackend:
                 self.last_stddev = stddev
                 self.last_status = "Normal"
             self.last_current = current
+            self.last_measured_channel = channel.upper()
             self.active_channel = channel.upper()
             api.status(self._status())
             api.sleep(0)
@@ -1570,20 +1572,22 @@ class Keithley6221DeltaBackend:
             ),
             "Armed": self.armed,
             "Sequence Active": self.sequence_active,
-            "Active Channel": self.active_channel or "-",
+            "Connected Channel": self.active_channel or "-",
+            "Last Measured Channel": self.last_measured_channel or "-",
+            "Last Resistance (Ohm)": (
+                self.last_resistance if self.last_resistance is not None else "-"
+            ),
+            "Last Current (A)": (
+                self.last_current if self.last_current is not None else "-"
+            ),
+            "Last StdDev (Ohm)": (
+                self.last_stddev if self.last_stddev is not None else "-"
+            ),
             "Routing Config": str(
                 self.routing_table.source_path
             ),
             "ARM Wait": f"{ARM_SETTLE_SECONDS:g} s",
         }
-        if self.last_resistance is not None:
-            status["Last Resistance (Ohm)"] = (
-                self.last_resistance
-            )
-        if self.last_current is not None:
-            status["Last Current (A)"] = self.last_current
-        if self.last_stddev is not None:
-            status["Last StdDev (Ohm)"] = self.last_stddev
         return status
 
     def _close_transport_6221(self) -> None:
