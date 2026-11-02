@@ -1603,7 +1603,7 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor.version,
-            "0.2.0b5",
+            "0.2.0b6",
         )
         self.assertEqual(
             list(Keithley6221DeltaBackend.columns),
