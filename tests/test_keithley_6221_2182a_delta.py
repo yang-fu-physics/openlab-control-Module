@@ -1421,12 +1421,13 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
 
-    def test_zero_default_and_instrument_command_ranges_block_apply(
+    def test_zero_span_and_instrument_command_ranges_block_apply(
         self,
     ) -> None:
         state = _FakeVisaState()
         backend = self._backend(state)
         settings = default_settings()
+        settings["shared"].update(high_current="0", low_current="0")
         settings["resource_6221"] = (
             "GPIB0::12::INSTR"
         )

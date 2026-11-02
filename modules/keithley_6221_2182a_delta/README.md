@@ -12,6 +12,12 @@
 两个下拉框保存的是仪表扫描器确认过的 Measurement 资源 ID，而不是原始 GPIB
 地址；模块从核心解析地址，因此不会看到或占用 System Instrument 的通讯口。
 
+首次默认使用 Shared / stay Armed、切换器 None、仅启用 CH1，I/O timeout 为 3 秒，
+切换等待为 0 秒。测量参数为高/低电流 `1m`/`-1m` A、compliance 1 V、Delta delay
+`100m` 秒、count 10、2182A 量程 10 mV、积分 1 PLC；模拟及数字滤波均关闭，数字滤波
+保留 Moving、count 10、window 0.010%。独立通道使用同一套初始参数。已有保存设置仍按
+原值加载，Enable 不会自动应用或打开输出。
+
 2182A 不使用独立 VISA 地址。使用前应在仪表面板上把 2182A RS-232 设置为
 19.2 kbaud、XON/XOFF 和 CR 终止，并让 6221 串口设置一致，同时连接 RS-232 与
 Trigger Link。模块会验证 6221 报告 2182A 存在，并通过串口转发检查 2182A 身份；

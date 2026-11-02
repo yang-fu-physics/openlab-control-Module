@@ -1,6 +1,6 @@
-"""Keithley Delta 模块的协议常量和无输出默认设置。
+"""Keithley Delta 模块的协议常量和首次测量设置。
 
-默认设置不会产生非零电流。Enable 只发现资源；Apply 按明确选择连接切换器。模块不维护
+默认电流为 ±1 mA；Enable 只发现资源，Apply 按明确选择连接切换器。模块不维护
 用户可配置的软件电流或 compliance 上限，但仍会按仪表手册拒绝仪表本身无法接受的
 命令范围。样品、接线和允许功耗的实验安全边界应在真实仪表上人工配置并核对。
 """
@@ -58,15 +58,15 @@ STATUS_CODE_INVALID_TRACE: Final = 3
 
 
 def default_delta_settings() -> dict[str, Any]:
-    """返回一套不会输出非零电流的 Delta 设置。"""
+    """返回首次使用的 Delta 设置；仅加载设置不会打开输出。"""
 
     return {
-        "high_current": "0",
-        "low_current": "0",
+        "high_current": "1m",
+        "low_current": "-1m",
         "compliance": "1",
-        "delta_delay": "2m",
-        "count": 1,
-        "voltage_range": "auto",
+        "delta_delay": "100m",
+        "count": 10,
+        "voltage_range": "10mv",
         # 6221 在 ARM 时会把非整数 PLC 自动改成 1 PLC；界面因此只允许整数。
         "nplc": 1,
         "analog_filter_enabled": False,
@@ -87,7 +87,7 @@ def default_settings() -> dict[str, Any]:
         "resource_switcher": "",
         "mode": MODE_SHARED,
         "io_timeout_seconds": 3.0,
-        "switch_settle_seconds": 0.5,
+        "switch_settle_seconds": 0.0,
         "channels": {
             f"ch{index}": {
                 "enabled": index == 1,

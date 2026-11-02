@@ -567,7 +567,7 @@ class QuantityTests(unittest.TestCase):
 
 
 class DefaultSettingsTests(unittest.TestCase):
-    def test_defaults_are_fresh_and_output_safe(
+    def test_defaults_are_fresh_and_match_initial_measurement_settings(
         self,
     ) -> None:
         first = default_settings()
@@ -582,8 +582,16 @@ class DefaultSettingsTests(unittest.TestCase):
         self.assertFalse(
             second["channels"]["ch2"]["enabled"]
         )
-        self.assertEqual(first["shared"]["high_current"], "0")
-        self.assertEqual(first["shared"]["low_current"], "0")
+        self.assertEqual(first["shared"]["high_current"], "1m")
+        self.assertEqual(first["shared"]["low_current"], "-1m")
+        self.assertEqual(first["shared"]["delta_delay"], "100m")
+        self.assertEqual(first["shared"]["count"], 10)
+        self.assertEqual(first["shared"]["voltage_range"], "10mv")
+        self.assertEqual(first["switch_settle_seconds"], 0.0)
+        self.assertEqual(first["mode"], "shared_armed")
+        self.assertEqual(first["independent"]["ch1"], first["shared"])
+        first["independent"]["ch1"]["high_current"] = "2m"
+        self.assertEqual(first["shared"]["high_current"], "1m")
         self.assertTrue(first["channels"]["ch1"]["enabled"])
         self.assertFalse(first["resource_6221"])
         self.assertEqual(first["switcher_type"], "none")
@@ -1280,12 +1288,13 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(state.output)
         self.assertEqual(state.closed_routes, set())
 
-    def test_zero_default_and_instrument_command_ranges_block_apply(
+    def test_zero_span_and_instrument_command_ranges_block_apply(
         self,
     ) -> None:
         state = _FakeVisaState()
         backend = self._backend(state)
         settings = default_settings()
+        settings["shared"].update(high_current="0", low_current="0")
         settings["resource_6221"] = (
             "GPIB0::12::INSTR"
         )
