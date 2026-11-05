@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -30,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from labcontrol.measurement.frontend_api import ModuleUIAPI
+from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
     CURRENT_EXCITATIONS,

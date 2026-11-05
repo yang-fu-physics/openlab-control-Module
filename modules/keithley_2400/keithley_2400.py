@@ -77,7 +77,9 @@ ERROR_QUERY = "SYST:ERR?"
 def number(value: object) -> str:
     """生成不依赖区域设置的有限精度 SCPI 数值。"""
 
-    return f"{float(value):.12g}"
+    number = float(value)
+    text = f"{number:.12g}"
+    return text if float(text) == number else repr(number)
 
 
 def configuration_commands(settings: Mapping[str, object]) -> tuple[str, ...]:

@@ -56,7 +56,7 @@ class Module:
                     "default": 0.0,
                     "minimum": 0.0,
                     "unit": "s",
-                    "decimals": 3,
+                    "decimals": 1,
                 },
             ],
         },

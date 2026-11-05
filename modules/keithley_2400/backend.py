@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+from labcontrol.formatting import require_precision
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
@@ -931,8 +932,8 @@ class Keithley2400Backend:
         )
         if not 0.1 <= io_timeout <= 30.0:
             self._invalid_range("io_timeout_seconds", 0.1, 30.0)
-        if not 0.01 <= nplc <= 10.0:
-            self._invalid_range("nplc", 0.01, 10.0)
+        if not 0.1 <= nplc <= 10.0:
+            self._invalid_range("nplc", 0.1, 10.0)
         if not 0.0 <= settle <= 3600.0:
             self._invalid_range("settle_seconds", 0.0, 3600.0)
         output_off = merged["output_off_between_measurements"]
@@ -1004,9 +1005,11 @@ class Keithley2400Backend:
             )
         try:
             result = float(value)
+            if field.endswith("_seconds") or field == "nplc":
+                result = require_precision(result, 1, field)
         except (TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{field} must be numeric",
+                f"{field}: {exc}",
                 "K2400_INVALID_SETTINGS",
                 field,
             ) from exc

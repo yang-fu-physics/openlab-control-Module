@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import re
+from labcontrol.formatting import require_precision
 from typing import Final
 
 
@@ -131,6 +132,8 @@ def format_quantity(
     """
 
     number = parse_quantity(value, expected_unit=expected_unit)
+    if expected_unit == "s":
+        return f"{require_precision(number, 1, 'Time (s)'):.1f}"
     if number == 0:
         return "0"
     exponent = int(math.floor(math.log10(abs(number)) / 3.0) * 3)
@@ -140,7 +143,10 @@ def format_quantity(
     text = f"{scaled:.9g}"
     if text == "-0":
         text = "0"
-    return f"{text}{prefix}"
+    candidate = f"{text}{prefix}"
+    if parse_quantity(candidate, expected_unit=expected_unit) == number:
+        return candidate
+    return value.strip() if isinstance(value, str) else repr(number)
 
 
 __all__ = [

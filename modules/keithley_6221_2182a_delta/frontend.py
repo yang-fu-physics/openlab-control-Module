@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -33,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from labcontrol.measurement.frontend_api import ModuleUIAPI
+from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
     FILTER_TYPES,
@@ -70,7 +70,7 @@ class _QuantityEdit(QLineEdit):
             {
                 "A": "e.g. 1m, 100u, 1p",
                 "V": "e.g. 1, 100m",
-                "s": "e.g. 2m, 1",
+                "s": "e.g. 0.1, 1.0",
             }.get(expected_unit, "SI value")
         )
         self.editingFinished.connect(self._normalize_text)
@@ -81,9 +81,13 @@ class _QuantityEdit(QLineEdit):
                 value,
                 expected_unit=self.expected_unit,
             )
-        except (TypeError, ValueError):
-            text = str(value)
+        except (TypeError, ValueError) as exc:
+            self.setText(str(value))
+            self.setToolTip(str(exc))
+            self._mark_valid(False)
+            return
         self.setText(text)
+        self.setToolTip("")
         self._mark_valid(True)
 
     def _normalize_text(self) -> None:
@@ -92,10 +96,12 @@ class _QuantityEdit(QLineEdit):
                 self.text(),
                 expected_unit=self.expected_unit,
             )
-        except ValueError:
+        except ValueError as exc:
+            self.setToolTip(str(exc))
             self._mark_valid(False)
             return
         self.setText(normalized)
+        self.setToolTip("")
         self._mark_valid(True)
 
     def _mark_valid(self, valid: bool) -> None:
@@ -240,7 +246,7 @@ class Keithley6221DeltaFrontend(QWidget):
         )
         self.switch_settle = QDoubleSpinBox()
         self.switch_settle.setRange(0.0, 300.0)
-        self.switch_settle.setDecimals(3)
+        self.switch_settle.setDecimals(1)
         self.switch_settle.setSingleStep(0.1)
         self.switch_settle.setSuffix(" s")
         operation_layout.addWidget(
@@ -419,8 +425,8 @@ class Keithley6221DeltaFrontend(QWidget):
         layout.addLayout(left, 0, 0)
         layout.addLayout(right, 0, 1)
         note = QLabel(
-            "Current and delay accept SI prefixes: 1m, "
-            "100u, 1n, 1p. A zero current span is safe to "
+            "Current accepts SI prefixes: 1m, "
+            "100u, 1n, 1p. Delay uses seconds with one decimal place. A zero current span is safe to "
             "load but Apply will reject it before a SEQ. "
             "There is no module software current/compliance "
             "cap; 6221 Compliance Abort and Cold Switching "

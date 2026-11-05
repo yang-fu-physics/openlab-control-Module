@@ -19,6 +19,7 @@ Beta。自动化测试验证的是协议状态机和异常边界，不是硬件�
 from __future__ import annotations
 
 import math
+from labcontrol.formatting import require_precision
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
@@ -1769,9 +1770,11 @@ class LR700Backend:
             )
         try:
             result = float(value)
+            if name.endswith("_seconds"):
+                result = require_precision(result, 1, name)
         except (TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{name} must be from {minimum:g} to "
+                f"{name}: {exc}; must be from {minimum:g} to "
                 f"{maximum:g}",
                 "LR700_INVALID_SETTINGS",
                 name,

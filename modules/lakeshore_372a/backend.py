@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+from labcontrol.formatting import require_precision
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
@@ -1954,9 +1955,11 @@ class LakeShore372ABackend:
             )
         try:
             result = float(value)
+            if name == "io_timeout_seconds":
+                result = require_precision(result, 1, name)
         except (TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{name} must be from {minimum:g} to "
+                f"{name}: {exc}; must be from {minimum:g} to "
                 f"{maximum:g}",
                 "LS372_INVALID_SETTINGS",
                 name,

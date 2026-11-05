@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+from labcontrol.formatting import require_precision
 import statistics
 import time
 from collections.abc import Callable, Mapping
@@ -1871,6 +1872,7 @@ class Keithley6221DeltaBackend:
                 ),
                 expected_unit="s",
             )
+            delay = require_precision(delay, 1, f"{prefix}.delta_delay")
         except ValueError as exc:
             raise ModuleError(
                 f"{prefix} contains an invalid SI value: {exc}",
@@ -2156,9 +2158,11 @@ class Keithley6221DeltaBackend:
             )
         try:
             result = float(value)
+            if name.endswith("_seconds"):
+                result = require_precision(result, 1, name)
         except (TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{name} must be from {minimum:g} to "
+                f"{name}: {exc}; must be from {minimum:g} to "
                 f"{maximum:g}",
                 "K6221_INVALID_SETTINGS",
                 name,

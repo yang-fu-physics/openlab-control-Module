@@ -295,7 +295,7 @@ class Keithley2400BackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]] = []
         backend = self._backend(state, waits)
         context = self._context(messages)
-        settings = _settings(source_current="1m", settle_seconds=0.25)
+        settings = _settings(source_current="1m", settle_seconds=0.3)
         open_module(backend, context)
         backend.configure(settings, context)
         run_start(backend, context)
@@ -303,7 +303,7 @@ class Keithley2400BackendTests(unittest.TestCase):
 
         measure_module(backend, context)
 
-        self.assertEqual(waits, [0.25])
+        self.assertEqual(waits, [0.3])
         self.assertFalse(state.output)
         row = next(payload for kind, payload in messages if kind == "row")
         self.assertEqual(row["values"]["StatusCode"], 0)
@@ -612,7 +612,7 @@ class Keithley2400FrontendTests(unittest.TestCase):
             current_compliance="500uA",
             sense_mode="4wire",
             nplc=3.0,
-            settle_seconds=0.75,
+            settle_seconds=0.8,
             output_off_at_sequence_end=False,
         )
 

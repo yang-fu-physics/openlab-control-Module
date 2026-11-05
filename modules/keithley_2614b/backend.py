@@ -8,6 +8,7 @@ NPLC、autorange 和高阻输出关闭模式，并逐项通过 ``print(...)`` �
 from __future__ import annotations
 
 import math
+from labcontrol.formatting import require_precision
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
@@ -1106,8 +1107,8 @@ class Keithley2614BBackend:
                     "K2614B_INVALID_SETTINGS",
                     f"{key}.current_limit",
                 )
-            if not 0.001 <= nplc <= 25.0:
-                self._invalid_range(f"{key}.nplc", 0.001, 25.0)
+            if not 0.1 <= nplc <= 25.0:
+                self._invalid_range(f"{key}.nplc", 0.1, 25.0)
             channels[key] = {
                 "enabled": enabled,
                 "source_mode": mode,
@@ -1178,9 +1179,11 @@ class Keithley2614BBackend:
             )
         try:
             result = float(value)
+            if field.endswith("_seconds") or field.endswith(".nplc"):
+                result = require_precision(result, 1, field)
         except (TypeError, ValueError) as exc:
             raise ModuleError(
-                f"{field} must be numeric",
+                f"{field}: {exc}",
                 "K2614B_INVALID_SETTINGS",
                 field,
             ) from exc

@@ -73,7 +73,9 @@ _NUMBER_PREFIX = re.compile(
 
 
 def number(value: object) -> str:
-    return f"{float(value):.12g}"
+    number = float(value)
+    text = f"{number:.12g}"
+    return text if float(text) == number else repr(number)
 
 
 def configuration_commands(

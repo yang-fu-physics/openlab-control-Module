@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from labcontrol.module_api import ModuleAPI, ModuleError
+from labcontrol.formatting import require_precision
 
 
 STATUS_CODE_NORMAL = 0
@@ -37,7 +38,7 @@ class SimulatedTransportBackend:
     def _defaults() -> dict[str, Any]:
         return {
             "excitation_current_mA": 1.0,
-            "delay_seconds": 0.04,
+            "delay_seconds": 0.1,
             "noise_ohm": 0.0005,
             "warning_threshold_ohm": 10.0,
         }
@@ -62,6 +63,10 @@ class SimulatedTransportBackend:
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.desired_settings = {**self._defaults(), **dict(settings)}
+        try:
+            require_precision(self.desired_settings["delay_seconds"], 1, "delay_seconds")
+        except ValueError as exc:
+            raise ModuleError(str(exc), "INVALID_SETTINGS", "delay_seconds") from exc
         self.applied_settings = dict(self.desired_settings)
         status = {
             "Applied Settings": "Applied",

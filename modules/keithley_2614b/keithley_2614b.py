@@ -50,7 +50,9 @@ _MEASUREMENT_SPLIT = re.compile(r"[\s,]+")
 
 
 def number(value: object) -> str:
-    return f"{float(value):.12g}"
+    number = float(value)
+    text = f"{number:.12g}"
+    return text if float(text) == number else repr(number)
 
 
 def validate_identity(identity: str) -> bool:

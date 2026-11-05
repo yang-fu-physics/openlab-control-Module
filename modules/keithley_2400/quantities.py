@@ -103,7 +103,10 @@ def format_quantity(value: object, *, expected_unit: str = "") -> str:
     exponent = max(min(exponent, 12), -15)
     scaled = number / (10.0**exponent)
     text = f"{scaled:.9g}"
-    return f"{text}{_EXPONENT_PREFIX[exponent]}"
+    candidate = f"{text}{_EXPONENT_PREFIX[exponent]}"
+    if parse_quantity(candidate, expected_unit=expected_unit) == number:
+        return candidate
+    return value.strip() if isinstance(value, str) else repr(number)
 
 
 __all__ = ["PREFIX_FACTORS", "format_quantity", "parse_quantity"]

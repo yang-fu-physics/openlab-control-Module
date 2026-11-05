@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -25,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from labcontrol.measurement.frontend_api import ModuleUIAPI
+from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
     SENSE_2WIRE,
@@ -111,7 +111,7 @@ class Keithley2614BFrontend(QWidget):
         self.io_timeout.setSuffix(" s")
         self.settle_seconds = QDoubleSpinBox()
         self.settle_seconds.setRange(0.0, 3600.0)
-        self.settle_seconds.setDecimals(3)
+        self.settle_seconds.setDecimals(1)
         self.settle_seconds.setSingleStep(0.1)
         self.settle_seconds.setSuffix(" s")
         self.output_off_between_measurements = QCheckBox(
@@ -168,8 +168,8 @@ class Keithley2614BFrontend(QWidget):
             sense_mode.addItem("2-wire (local sense)", SENSE_2WIRE)
             sense_mode.addItem("4-wire (remote sense)", SENSE_4WIRE)
             nplc = QDoubleSpinBox()
-            nplc.setRange(0.001, 25.0)
-            nplc.setDecimals(3)
+            nplc.setRange(0.1, 25.0)
+            nplc.setDecimals(1)
             nplc.setSingleStep(0.1)
             mode_note = QLabel()
             mode_note.setWordWrap(True)

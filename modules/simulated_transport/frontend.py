@@ -7,7 +7,6 @@ from typing import Any
 
 from PySide6.QtCore import QSignalBlocker
 from PySide6.QtWidgets import (
-    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -18,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from labcontrol.measurement.frontend_api import ModuleUIAPI
+from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 
 class SimulatedTransportFrontend(QWidget):
@@ -33,7 +33,7 @@ class SimulatedTransportFrontend(QWidget):
         self.excitation.setSuffix(" mA")
         self.delay = QDoubleSpinBox()
         self.delay.setRange(0.0, 60.0)
-        self.delay.setDecimals(3)
+        self.delay.setDecimals(1)
         self.delay.setSuffix(" s/channel")
         self.noise = QDoubleSpinBox()
         self.noise.setRange(0.0, 10.0)
@@ -100,7 +100,7 @@ class SimulatedTransportFrontend(QWidget):
     def load(self, settings: Mapping[str, Any]) -> None:
         values = {
             "excitation_current_mA": 1.0,
-            "delay_seconds": 0.04,
+            "delay_seconds": 0.1,
             "noise_ohm": 0.0005,
             "warning_threshold_ohm": 10.0,
             **dict(settings),

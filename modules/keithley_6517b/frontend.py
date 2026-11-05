@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -25,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from labcontrol.measurement.frontend_api import ModuleUIAPI
+from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
     SOURCE_RANGE_1000_V,
@@ -137,12 +137,12 @@ class Keithley6517BFrontend(QWidget):
         self.source_voltage = _QuantityEdit("V")
         self.voltage_limit = _QuantityEdit("V")
         self.nplc = QDoubleSpinBox()
-        self.nplc.setRange(0.01, 10.0)
-        self.nplc.setDecimals(2)
+        self.nplc.setRange(0.1, 10.0)
+        self.nplc.setDecimals(1)
         self.nplc.setSingleStep(0.1)
         self.settle_seconds = QDoubleSpinBox()
         self.settle_seconds.setRange(0.0, 3600.0)
-        self.settle_seconds.setDecimals(3)
+        self.settle_seconds.setDecimals(1)
         self.settle_seconds.setSingleStep(0.5)
         self.settle_seconds.setSuffix(" s")
         self.output_off_between_measurements = QCheckBox(
