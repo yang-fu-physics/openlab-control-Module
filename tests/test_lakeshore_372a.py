@@ -970,6 +970,8 @@ class LakeShore372ABackendTests(unittest.TestCase):
             result["Last Action"],
             "Connection test passed",
         )
+        self.assertIsNone(backend.transport)
+        self.assertEqual(state.closed, 1)
         self.assertEqual(
             state.opened[-1][0],
             "GPIB0::12::INSTR",
@@ -981,6 +983,26 @@ class LakeShore372ABackendTests(unittest.TestCase):
                 if action == "write"
             )
         )
+
+    def test_test_connection_preserves_the_applied_instrument(self) -> None:
+        state = _FakeVisaState()
+        backend = self._backend(state)
+        context = self._context([])
+        config = default_settings() | {"resource": "GPIB0::12::INSTR"}
+        open_module(backend, context)
+        backend.configure(config, context)
+        transport = backend.transport
+        applied = deepcopy(backend.applied_settings)
+
+        for address in ("GPIB0::12::INSTR", "GPIB0::7::INSTR"):
+            status = run_action(
+                backend, "test_connection", {"settings": config | {"resource": address}}, context
+            )
+            self.assertEqual(status["Tested Resource"], address)
+            self.assertIs(backend.transport, transport)
+            self.assertEqual(backend.applied_settings, applied)
+        self.assertEqual([address for address, _ in state.opened], ["GPIB0::12::INSTR", "GPIB0::7::INSTR"])
+        self.assertEqual(state.closed, 1)
 
     def test_close_shunts_and_releases_transport(self) -> None:
         state = _FakeVisaState()

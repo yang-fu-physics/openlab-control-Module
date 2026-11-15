@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
-import importlib
 import math
 import re
 from collections.abc import Mapping
 from typing import Protocol
+
+from labcontrol.measurement.visa import VisaSession as PyVisaTransport
 
 from .constants import SENSE_4WIRE, SOURCE_CURRENT
 
@@ -22,34 +23,6 @@ class Transport(Protocol):
     def query(self, command: str) -> str: ...
 
     def close(self) -> None: ...
-
-
-class PyVisaTransport:
-    """仅在模块 worker 内创建的有限超时 GPIB 会话。"""
-
-    def __init__(self, resource_name: str, timeout_seconds: float) -> None:
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        try:
-            self._instrument = self._manager.open_resource(resource_name)
-            self._instrument.timeout = max(1, int(timeout_seconds * 1000))
-            self._instrument.read_termination = "\n"
-            self._instrument.write_termination = "\n"
-        except Exception:
-            self._manager.close()
-            raise
-
-    def write(self, command: str) -> None:
-        self._instrument.write(command)
-
-    def query(self, command: str) -> str:
-        return str(self._instrument.query(command))
-
-    def close(self) -> None:
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
 
 
 IDENTIFY = "*IDN?"

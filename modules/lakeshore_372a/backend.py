@@ -661,17 +661,23 @@ class LakeShore372ABackend:
                     api.timeout
                 ),
             )
-            self._connect(
-                settings["resource"],
-                float(settings["io_timeout_seconds"]),
-                api,
-            )
+            resource_id = settings["resource"]
+            if self.transport is not None and self.applied_settings.get("resource") == resource_id:
+                identity = self.transport.query(instrument.IDENTIFY).strip()
+                self._validate_identity(identity)
+            else:
+                probe = self._transport_factory(
+                    api.resource_address(resource_id), float(settings["io_timeout_seconds"])
+                )
+                try:
+                    identity = probe.query(instrument.IDENTIFY).strip()
+                    self._validate_identity(identity)
+                finally:
+                    probe.close()
             status = {
-                "Connection": "Connected",
-                "Resource": settings["resource"],
-                "Identity": self.identity,
-                "Applied Settings": "Not applied",
                 "Last Action": "Connection test passed",
+                "Tested Resource": resource_id,
+                "Tested Identity": identity,
             }
         else:
             raise ModuleWarning(

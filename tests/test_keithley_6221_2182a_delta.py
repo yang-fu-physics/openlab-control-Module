@@ -630,7 +630,7 @@ class ProtocolTests(unittest.TestCase):
         instrument = Instrument()
 
         class Manager:
-            def open_resource(self, resource: str) -> Instrument:
+            def open_resource(self, resource: str, *, open_timeout: int) -> Instrument:
                 self.resource = resource
                 return instrument
 
@@ -641,7 +641,7 @@ class ProtocolTests(unittest.TestCase):
             def ResourceManager() -> Manager:
                 return manager
 
-        with patch("importlib.import_module", return_value=PyVisa):
+        with patch("labcontrol.measurement.visa.import_module", return_value=PyVisa):
             PyVisaTransport("GPIB0::12::INSTR", 3.0)
 
         self.assertEqual(manager.resource, "GPIB0::12::INSTR")

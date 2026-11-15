@@ -24,7 +24,7 @@ def close_command(routes: tuple[str, ...]) -> str:
 
 def parse_closed_routes(reply: str) -> frozenset[str]:
     stripped = reply.strip()
-    if not stripped:
+    if stripped == "nil":
         return frozenset()
     actual: list[str] = []
     for raw_token in stripped.split(","):

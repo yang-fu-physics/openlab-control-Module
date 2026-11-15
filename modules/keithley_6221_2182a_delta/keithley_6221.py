@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import importlib
 import math
 import re
 from collections.abc import Mapping
 from typing import Protocol
+
+from labcontrol.measurement.visa import VisaSession
 
 
 class Transport(Protocol):
@@ -21,44 +22,11 @@ class Transport(Protocol):
     def close(self) -> None: ...
 
 
-class PyVisaTransport:
-    """支持为单次长查询临时扩大 timeout 的 PyVISA 会话。"""
+class PyVisaTransport(VisaSession):
+    """6221/切换器 GPIB 会话使用 EOI，不添加文本终止符。"""
 
     def __init__(self, resource: str, timeout_seconds: float) -> None:
-        pyvisa = importlib.import_module("pyvisa")
-        self._manager = pyvisa.ResourceManager()
-        try:
-            self._instrument = self._manager.open_resource(resource)
-            self._instrument.timeout = max(1, int(float(timeout_seconds) * 1000))
-            self._instrument.write_termination = ""
-            self._instrument.read_termination = None
-            self._instrument.send_end = True
-        except Exception:
-            self._manager.close()
-            raise
-
-    def write(self, command: str) -> None:
-        self._instrument.write(command)
-
-    def query(
-        self,
-        command: str,
-        timeout_seconds: float | None = None,
-    ) -> str:
-        if timeout_seconds is None:
-            return str(self._instrument.query(command))
-        original = self._instrument.timeout
-        self._instrument.timeout = max(1, int(float(timeout_seconds) * 1000))
-        try:
-            return str(self._instrument.query(command))
-        finally:
-            self._instrument.timeout = original
-
-    def close(self) -> None:
-        try:
-            self._instrument.close()
-        finally:
-            self._manager.close()
+        super().__init__(resource, timeout_seconds, read_termination=None, write_termination="", send_end=True)
 
 
 IDENTIFY = "*IDN?"

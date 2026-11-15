@@ -1,0 +1,275 @@
+"""One DAT row per Measure, containing both OE1022D channels and both harmonics."""
+
+import math
+import re
+
+from labcontrol.formatting import require_precision
+from labcontrol.module_api import ModuleError
+
+from .oe1022d import CHANNEL_SETTINGS, LockIn
+
+
+EXTERNAL = "external"
+SINE_OUT = "sine_out"
+CHANNELS = ("channel_1", "channel_2")
+_QUANTITY = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([pnuµμmk]?)\s*V?")
+_SCALE = {"": 1, "p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "μ": 1e-6, "m": 1e-3, "k": 1e3}
+
+
+def voltage(value):
+    match = _QUANTITY.fullmatch(str(value).strip())
+    if match is None:
+        raise ValueError(f"Expected voltage, for example 10mV; got {value!r}")
+    result = float(match[1]) * _SCALE[match[2]]
+    if not math.isfinite(result):
+        raise ValueError("Expected a finite voltage")
+    return result
+
+
+def default_settings():
+    return {
+        "mode": EXTERNAL, "lockin_resource": "", "baud": 921600,
+        "io_timeout": 0.5, "frequency": 137.77, "sine_channel": 1,
+        "amplitude": "0", "max_voltage": "",
+        "settle_seconds": 3.0,
+        **{
+            name: {**{key: default for key, _, _, _, default in CHANNEL_SETTINGS}, "phase": 0.0, "primary": 1, "secondary": 2}
+            for name in CHANNELS
+        },
+    }
+
+
+class Module:
+    columns = {
+        "X1p": "V", "Y1p": "V", "R1p": "V", "Theta1p": "degree",
+        "Harmonic1p": "", "Frequency1p": "Hz",
+        "X1s": "V", "Y1s": "V", "R1s": "V", "Theta1s": "degree",
+        "Harmonic1s": "", "Frequency1s": "Hz",
+        "Status1": "", "Y1s/X1p": "", "Y1s/X1p^2": "1/V",
+        "X2p": "V", "Y2p": "V", "R2p": "V", "Theta2p": "degree",
+        "Harmonic2p": "", "Frequency2p": "Hz",
+        "X2s": "V", "Y2s": "V", "R2s": "V", "Theta2s": "degree",
+        "Harmonic2s": "", "Frequency2s": "Hz",
+        "Status2": "", "Y2s/X1p": "", "Y2s/X1p^2": "1/V",
+        "Source Voltage": "V", "X1p Squared": "V^2", "X2p Squared": "V^2",
+    }
+    display_columns = ("X1p", "Y2s", "Source Voltage")
+    sequence_commands = [{
+        "id": "scan_voltage", "label": "Scan Voltage", "kind": "scan", "points_field": "points", "point_parameter": "voltage",
+        "fields": [
+            {"name": "points", "label": "RMS points (V)", "type": "list", "default": ["10m", "20m", "50m"]},
+            {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},
+        ],
+    }]
+
+    def __init__(self, lockin_factory=LockIn):
+        self.lockin_factory = lockin_factory
+        self.lockin = None
+        self.voltage_channel = None
+        self.settings = None
+        self.point = None
+        self.active = False
+        self.identity = ""
+        self.latest = {}
+
+    def open(self, api):
+        api.resources()
+        return self._status()
+
+    def configure(self, settings, api):
+        settings = default_settings() | dict(settings)
+        try:
+            mode = settings["mode"]
+            if mode not in (EXTERNAL, SINE_OUT):
+                raise ValueError("Select external reference or OE1022D Sine Out")
+            timeout = require_precision(settings["io_timeout"], 1, "I/O timeout")
+            if not 0.1 <= timeout <= 1 or timeout * 4 >= api.timeout:
+                raise ValueError("I/O timeout must be 0.1–1.0 s and leave time for cleanup")
+            settings["io_timeout"] = timeout
+            frequency = require_precision(settings["frequency"], 3, "Frequency")
+            if not 0.001 <= frequency <= 102000:
+                raise ValueError("Reference frequency is out of range")
+            settings["frequency"] = frequency
+            if mode == SINE_OUT and (type(settings["sine_channel"]) is not int or settings["sine_channel"] not in (1, 2)):
+                raise ValueError("Select Sine Out A or B")
+            if settings["baud"] not in (921600, 460800, 230400, 115200, 57600, 38400, 19200, 9600):
+                raise ValueError("Select a supported baud rate")
+            if mode == SINE_OUT:
+                cap = voltage(settings["max_voltage"])
+                if not 0 < cap <= 5:
+                    raise ValueError("Enter a positive sample voltage limit up to 5 V RMS")
+                settings["cap"] = cap
+                settings["amplitude"] = self._validate_point(settings, settings["amplitude"])
+                settings["settle_seconds"] = self._settle(settings["settle_seconds"], timeout, api)
+            for name in CHANNELS:
+                channel = settings[name] = dict(settings[name])
+                for key, _, label, options, _ in CHANNEL_SETTINGS:
+                    if type(channel[key]) is not int or not 0 <= channel[key] < len(options):
+                        raise ValueError(f"Invalid {label}")
+                phase = require_precision(channel["phase"], 2, "Reference phase")
+                if not -180 <= phase <= 180:
+                    raise ValueError("Reference phase must be between −180° and 180°")
+                channel["phase"] = phase
+                if channel["sync"] and (frequency >= 200 or channel["slope"] < 2):
+                    raise ValueError("Synchronous filtering requires <200 Hz and an 18 or 24 dB/oct slope")
+                for key in ("primary", "secondary"):
+                    order = channel[key]
+                    if type(order) is not int or not 1 <= order <= 32767 or order * frequency > 102000:
+                        raise ValueError("Harmonic order must be 1–32767 and harmonic frequency ≤102 kHz")
+            lockin_address = api.resource_address(settings["lockin_resource"])
+            if not lockin_address.upper().startswith("ASRL"):
+                raise ValueError("Select the OE1022D USB virtual COM or RS-232 VISA resource (ASRL)")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModuleError(str(exc), "LOCKIN_INVALID_SETTINGS") from exc
+
+        self._release()
+        try:
+            self.lockin = self.lockin_factory(lockin_address, timeout, settings["baud"])
+            self.identity = self.lockin.identify()
+            if mode == SINE_OUT:
+                self.voltage_channel = settings["sine_channel"]
+                self.lockin.zero(self.voltage_channel)
+            for i, name in enumerate(CHANNELS, 1):
+                self.lockin.configure_channel(i, settings[name], i != self.voltage_channel, frequency, api.checkpoint)
+        except BaseException:
+            # Cancellation must also leave any identified source in a confirmed safe state.
+            self._release()
+            raise
+        self.settings = settings
+        return self._status()
+
+    @staticmethod
+    def _validate_point(settings, value):
+        point = voltage(value)
+        if not 0 <= point <= settings["cap"]:
+            raise ValueError("Voltage exceeds the configured sample limit or is negative")
+        return require_precision(point, 3, "OE1022D RMS voltage")
+
+    @staticmethod
+    def _settle(value, io_timeout, api):
+        seconds = require_precision(value, 1, "Settle time")
+        if not 0 <= seconds < api.timeout - 4 * io_timeout:
+            raise ValueError("Settle time leaves insufficient time for source cleanup")
+        return seconds
+
+    def on_event(self, event, data, api):
+        if event == "run_start":
+            if self.settings is None:
+                raise ModuleError("Apply instrument settings before starting SEQ", "LOCKIN_NOT_CONFIGURED")
+            self.active = True
+        elif event == "run_end":
+            self.active = False
+            self._zero()
+        return self._status()
+
+    def _zero(self):
+        self.point = None
+        try:
+            if self.voltage_channel is not None:
+                self.lockin.zero(self.voltage_channel)
+        except Exception as exc:
+            raise ModuleError(f"Source zero/off could not be confirmed: {exc}", "LOCKIN_SAFE_STATE_UNCONFIRMED") from exc
+
+    def _release(self):
+        self.settings = None
+        self.active = False
+        try:
+            self._zero()
+        finally:
+            lockin = self.lockin
+            self.lockin = self.voltage_channel = None
+            self.identity = ""
+            self.latest.clear()
+            if lockin is not None:
+                lockin.close()
+
+    def close(self, api):
+        self._release()
+
+    def _set_point(self, point, settle, api):
+        try:
+            api.checkpoint()
+            if point == 0:
+                self._zero()
+            else:
+                self.lockin.source_voltage(self.voltage_channel, point)
+            self.point = point
+            api.sleep(settle)
+        except BaseException:
+            self._zero()
+            raise
+
+    def execute_sequence_command(self, command_id, parameters, api):
+        self._require_active()
+        if command_id != "scan_voltage" or self.voltage_channel is None:
+            raise ModuleError("Scan Voltage requires OE1022D Sine Out mode", "LOCKIN_WRONG_SOURCE", command_id)
+        try:
+            point = self._validate_point(self.settings, parameters["voltage"])
+            settle = self._settle(parameters["settle_seconds"], self.settings["io_timeout"], api)
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(str(exc), "LOCKIN_INVALID_SCAN_POINT", command_id) from exc
+        self._set_point(point, settle, api)
+        return self._status()
+
+    def _require_active(self):
+        if not self.active:
+            raise ModuleError("Start a sequence with applied settings first", "LOCKIN_NOT_READY")
+
+    def measure(self, slot, api):
+        self._require_active()
+        try:
+            return self._measure(api)
+        except BaseException:
+            if self.point is not None:
+                self._zero()
+            raise
+
+    def _measure(self, api):
+        if self.voltage_channel is not None and self.point is None:
+            self._set_point(self.settings["amplitude"], self.settings["settle_seconds"], api)
+        row = {"Source Voltage": self.point}
+        nominal = {}
+        for channel, name in enumerate(CHANNELS, 1):
+            settings = self.settings[name]
+            api.checkpoint()
+            status = self.lockin.status_code(channel, channel != self.voltage_channel)
+            row[f"Status{channel}"] = status
+            api.warn("LOCKIN_CHANNEL_STATUS", f"Channel {channel}: status {status}" if status else None, str(channel))
+            for harmonic, (role, key) in enumerate((("p", "primary"), ("s", "secondary")), 1):
+                api.checkpoint()
+                command = f"HARMD? {channel},{harmonic}"
+                actual = self.lockin.numbers(command)[0]
+                if not actual.is_integer() or not 1 <= actual <= 32767:
+                    raise ModuleError(f"{command}: invalid harmonic order {actual:g}", "LOCKIN_BAD_REPLY", command)
+                x, y, r, theta, base = self.lockin.read_harmonic(channel, harmonic)
+                suffix = f"{channel}{role}"
+                nominal[suffix] = actual == settings[key]
+                api.warn(
+                    "LOCKIN_HARMONIC_CHANGED",
+                    None if nominal[suffix] or status else (
+                        f"Channel {channel} {key}: requested harmonic {settings[key]}, instrument reports {int(actual)}"
+                    ),
+                    suffix,
+                )
+                row.update({
+                    f"X{suffix}": x, f"Y{suffix}": y, f"R{suffix}": r, f"Theta{suffix}": theta,
+                    f"Harmonic{suffix}": int(actual), f"Frequency{suffix}": base * actual if not status else None,
+                })
+            if not status and nominal[f"{channel}p"]:
+                row[f"X{channel}p Squared"] = row[f"X{channel}p"] ** 2
+        if row["X1p"] and not row["Status1"] and nominal["1p"]:
+            base = row["X1p"]
+            for channel in (1, 2):
+                if not row[f"Status{channel}"] and nominal[f"{channel}s"]:
+                    row[f"Y{channel}s/X1p"] = row[f"Y{channel}s"] / base
+                    if base * base:
+                        row[f"Y{channel}s/X1p^2"] = row[f"Y{channel}s"] / base ** 2
+        self.latest = {key: row[key] for key in ("X1p", "Y2s", "Status1", "Status2")}
+        api.status(self._status())
+        return row
+
+    def _status(self):
+        return {
+            "State": "Running" if self.active else "Ready" if self.settings else "Not applied",
+            "Set RMS Voltage": self.point, "OE1022D": self.identity, **self.latest,
+        }

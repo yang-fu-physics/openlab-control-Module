@@ -82,6 +82,9 @@ load_routing = load_source_object(
     "routing:load_routing",
     "test_keithley_delta_3706a_routing",
 )
+parse_closed_routes = load_source_object(
+    MODULE, "keithley_3706a:parse_closed_routes", "test_keithley_delta_3706a_closed_routes"
+)
 
 
 class _FakeVisaState:
@@ -467,9 +470,7 @@ class _Fake3706A:
                 return (
                     self.state.closed_routes_reply_override
                 )
-            return ",".join(
-                sorted(self.state.closed_routes)
-            )
+            return ",".join(sorted(self.state.closed_routes)) or "nil"
         raise AssertionError(
             f"Unexpected 3706A query: {command}"
         )
@@ -599,6 +600,12 @@ class DefaultSettingsTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def test_3706a_requires_a_documented_reply_to_confirm_all_relays_open(self) -> None:
+        self.assertEqual(parse_closed_routes("nil\r\n"), frozenset())
+        self.assertEqual(parse_closed_routes("1001,1002"), {"1001", "1002"})
+        with self.assertRaises(ValueError):
+            parse_closed_routes("\r\n")
+
     def test_default_hidden_routes_match_requested_four_channels(
         self,
     ) -> None:

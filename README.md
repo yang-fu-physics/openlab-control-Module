@@ -5,6 +5,27 @@ timeout、跨模块并行和 DAT 写入；模块负责仪表协议、通道、�
 
 ## 最小硬件模块
 
+新模块的底层通讯优先复用 [PyMeasure 驱动](https://pymeasure.readthedocs.io/en/latest/api/instruments/index.html)、
+[QCoDeS 官方驱动](https://microsoft.github.io/Qcodes/drivers_api/index.html)或
+[QCoDeS 社区驱动](https://github.com/QCoDeS/Qcodes_contrib_drivers)。先核对型号、接口和固件，
+复用匹配的命令、连接设置和回包解析；测量流程、超时和安全收尾仍由本模块负责。
+移植源码时保留许可证和出处，不因复用几条命令而引入整套框架。
+VISA 连接使用 `labcontrol.measurement.visa.VisaSession`，模块只提供自己的终止符和串口参数。
+关闭连接只释放该仪表的会话，不关闭当前模块进程共享的 VISA 管理器。
+使用这个连接接口的模块要与包含该接口的核心一起更新。
+选择物理仪表时，设置键使用 `resource`、`resource_*` 或 `*_resource`，值保存资源 ID。
+Apply 时框架按实际 VISA 地址检查是否被另一个模块占用。
+
+| 仪表 | 优先参考 |
+| --- | --- |
+| 2400 / 6517B / 6221 | [PyMeasure Keithley 驱动](https://pymeasure.readthedocs.io/en/stable/api/instruments/keithley/) |
+| 2614B | [QCoDeS 2600 系列源码](https://microsoft.github.io/Qcodes/_modules/qcodes/instrument_drivers/Keithley/_Keithley_2600.html)，包含 2614B 专用边界 |
+| 2182A / 7001 / 3706A | [Delta 模块的通讯参考](modules/keithley_6221_2182a_delta/README.md#底层通讯参考) |
+| Lake Shore 372 | [QCoDeS 372 源码](https://microsoft.github.io/Qcodes/_modules/qcodes/instrument_drivers/Lakeshore/Lakeshore_model_372.html) |
+| SR830（待开发） | [QCoDeS SR830 源码](https://microsoft.github.io/Qcodes/_modules/qcodes/instrument_drivers/stanford_research/SR830.html)和 [PyMeasure SR830 驱动](https://pymeasure.readthedocs.io/en/stable/api/instruments/srs/sr830.html) |
+
+LR700 和 OE1022D 没找到匹配的上游驱动，仪表命令继续按各自的手册维护。
+
 参数精度约定：可编辑的等待/超时时间以秒保留一位，滤波参数保持各自规定；2400、6517B、
 2614B 的 NPLC 保留一位，Delta 的 PLC 仍为整数，372A 的硬件整秒参数仍为整数。
 加载超精度设置会报错而非静默舍入；SI 电流/电压输入在短格式会丢失有效数字时保留原文本，
@@ -26,6 +47,7 @@ version = "0.1.0"
 ```
 
 ```python
+from labcontrol.measurement.visa import VisaSession
 from labcontrol.module_api import ModuleAPI
 from . import my_meter
 
@@ -41,7 +63,7 @@ class Module:
     def configure(self, settings, api: ModuleAPI):
         resource_id = str(settings["resource"])
         address = api.resource_address(resource_id)
-        self.instrument = my_meter.PyVisaTransport(address, 3.0)
+        self.instrument = VisaSession(address, 3.0)
         # 这里还必须查询身份、写入安全设置并读回确认。
 
     def measure(self, slot: int, api: ModuleAPI):

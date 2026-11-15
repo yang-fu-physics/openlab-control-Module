@@ -88,3 +88,10 @@ timeout，也没有 DUT 软件电流/compliance 上限；长 `*OPC?` 使用核�
 - `keithley_3706a.py`：3706A TSP 路由协议；
 - `frontend.py`：设置与状态界面；
 - `routing.py` / `routing.toml`：隐藏物理路由的读取和校验。
+
+## 底层通讯参考
+
+- [PyMeasure 6221 源码](https://github.com/pymeasure/pymeasure/blob/master/pymeasure/instruments/keithley/keithley6221.py)：Delta 的 ARM、触发、停止和读取 6221 缓冲区。
+- [QCoDeS 社区 2182A 源码](https://qcodes.github.io/Qcodes_contrib_drivers/_modules/qcodes_contrib_drivers/drivers/Tektronix/Keithley_2182A.html)：核对量程、NPLC 和滤波命令；其驱动直接连接 2182A，不包含经 6221 的串口转发。
+- [6221 厂商手册](https://download.tek.com/manual/622x-900-01%28B-Jun2005%29%28User%29.pdf)：串口转发是先 `SEND`，再用 `ENT?` 取回回复。Apply 时回空表示这一查询没有取到回包，不是 2182A 回报了错误的量程或 NPLC 值。
+- [QCoDeS 3706A 源码](https://github.com/microsoft/Qcodes/blob/main/src/qcodes/instrument_drivers/Keithley/Keithley_3706A.py)与 [3700A 厂商手册](https://download.tek.com/manual/3700AS-901-01D_Jul_2018_Ref_0.pdf)：`channel.getclose` 的 `nil` 表示无闭合通道；多通道回包按厂商手册用逗号解析。7001 是不同的 SCPI 协议，参考 [7001 厂商手册](https://download.tek.com/manual/7001_901_01H.pdf)。
