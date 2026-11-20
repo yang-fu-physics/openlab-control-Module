@@ -112,7 +112,7 @@ class LockInTests(unittest.TestCase):
         self.current_module.open(self.api)
         self.manager.open_resource.assert_not_called()
         commands = normalize_module_commands("oe1022d_lockin", self.module.sequence_commands)
-        self.assertEqual([item.command_id for item in commands], ["scan_voltage"])
+        self.assertEqual([item.command_id for item in commands], ["scan_voltage", "auto_range"])
         commands = normalize_module_commands("keithley_6221_ac", self.current_module.sequence_commands)
         self.assertEqual([item.command_id for item in commands], ["scan_current", "scan_frequency"])
 
