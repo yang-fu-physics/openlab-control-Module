@@ -508,6 +508,14 @@ class LR700Backend:
     ) -> Mapping[str, Any]:
         """completed/stopped/error 都直接确认最低激励，模块仍保持 Enabled。"""
 
+        if not self.applied_settings and self.transport is None:
+            self.sequence_active = False
+            status = {
+                "Sequence": reason.title(),
+                "Excitation Safety": "No instrument connection was opened or changed",
+            }
+            api.status(status)
+            return status
         error = self._best_effort_safe_state(api)
         self.sequence_active = False
         if error is not None:
