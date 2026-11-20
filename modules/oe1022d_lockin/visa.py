@@ -8,7 +8,8 @@ from labcontrol.module_api import ModuleError
 
 class Session(VisaSession):
     def query(self, command):
-        return super().query(command).strip()
+        # USB replies end in CR followed by NUL padding; the next read sees that padding.
+        return super().query(command).lstrip("\0").strip()
 
     def numbers(self, command, count=1):
         response = self.query(command)

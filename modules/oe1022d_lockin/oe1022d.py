@@ -1,5 +1,7 @@
 """OE1022D remote programming, chapters 5 and 9."""
 
+from time import sleep
+
 from labcontrol.module_api import ModuleError
 
 from .visa import Session
@@ -38,6 +40,8 @@ class LockIn(Session):
     def setting(self, command, channel, value, index=None):
         base = str(channel) if index is None else f"{channel},{index}"
         self.write(f"{command} {base},{value}")
+        # The USB firmware can drop a query sent immediately after a setting write.
+        sleep(0.1)
         self.verify(f"{command}? {base}", value)
 
     def configure_channel(self, channel, settings, external, frequency, checkpoint):
