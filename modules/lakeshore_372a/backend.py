@@ -416,13 +416,15 @@ class LakeShore372ABackend:
                     f"recorded as ERROR: {exc}",
                     warning_context,
                 )
-                row = {
-                    "TemperatureAverage": temperature,
-                    "FieldAverage": field,
+                row: dict[str, Any] = {
                     "StatusCode": (
                         STATUS_CODE_INVALID_READING
                     ),
                 }
+                if temperature is not None:
+                    row["TemperatureAverage"] = temperature
+                if field is not None:
+                    row["FieldAverage"] = field
                 self.last_values = {
                     "slot": slot,
                     "input_channel": input_channel,
@@ -462,10 +464,12 @@ class LakeShore372ABackend:
                 # manifest 为四个槽位预声明测量列。本行只填写当前槽位，其他
                 # R/Phase/Current 列由核心 DAT writer 留空。非零状态表示本次读数
                 # 不可信，当前槽位也保持为空，只保留温场快照与故障分类。
-                "TemperatureAverage": temperature,
-                "FieldAverage": field,
                 "StatusCode": status_code,
             }
+            if temperature is not None:
+                row["TemperatureAverage"] = temperature
+            if field is not None:
+                row["FieldAverage"] = field
             if status_code == STATUS_CODE_NORMAL:
                 row.update({
                     f"R{slot}": resistance,
@@ -1065,16 +1069,54 @@ class LakeShore372ABackend:
         shunted: bool,
         api: ModuleAPI,
     ) -> None:
-        """核对 INTYPE 的模式、量程、自动量程、分流和首选单位全部字段。"""
+        """核对 INTYPE 的模式、量程、自动量程、分流和首选单位字段。"""
 
-        self._expect_integers(
-            instrument.intype_query(channel["input_channel"]),
-            instrument.intype_values(
-                channel,
-                shunted=shunted,
-            ),
-            api,
+        command = instrument.intype_query(channel["input_channel"])
+        expected = instrument.intype_values(
+            channel,
+            shunted=shunted,
         )
+        reply = self._query_text(command, api)
+        try:
+            actual = instrument.parse_integer_tuple(reply)
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(
+                f"Model 372 returned an invalid settings "
+                f"reply to {command}: {reply!r}",
+                "LS372_INVALID_REPLY",
+                command,
+            ) from exc
+        if not self._intype_matches(actual, expected):
+            raise ModuleError(
+                f"Model 372 settings readback mismatch for "
+                f"{command}: expected {expected}, "
+                f"read back {actual}",
+                "LS372_SETTINGS_VERIFY_FAILED",
+                command,
+            )
+
+    @staticmethod
+    def _intype_matches(
+        actual: tuple[int, ...],
+        expected: tuple[int, ...],
+    ) -> bool:
+        """比较 INTYPE? 读回；硬件自动量程开启时允许仪表自主调整激励/电阻档位。"""
+
+        if len(actual) != 6 or len(expected) != 6:
+            return False
+        if expected[2] == 0:
+            return actual == expected
+        # autorange != 0：mode、autorange、cs_off（分流状态）和 units 必须严格一致，
+        # 激励量程和电阻量程只需处于硬件合法索引范围内。
+        if (actual[0], actual[2], actual[4], actual[5]) != (
+            expected[0],
+            expected[2],
+            expected[4],
+            expected[5],
+        ):
+            return False
+        max_excitation = 22 if actual[0] == 1 else 12
+        return 1 <= actual[1] <= max_excitation and 1 <= actual[3] <= 22
 
     def _expect_integers(
         self,
@@ -1250,60 +1292,78 @@ class LakeShore372ABackend:
         cls,
         first: Mapping[str, Mapping[str, Any]],
         second: Mapping[str, Mapping[str, Any]],
-    ) -> tuple[float, float]:
+    ) -> tuple[float | None, float | None]:
         """从 Dwell 前后两份核心快照计算主温度(K)和主磁场(Oe)算术平均。
 
-        第二份快照必须使用与第一份相同的仪表 ID，且时间戳严格增加；不能在两次读取间
-        偷换主仪表，也不能把同一缓存值重复平均。单位转换完成后才做平均。
+        若系统配置中未配备温度或磁场仪表，对应列返回 ``None``；已配置的仪表则要求
+        第二份快照使用与第一份相同的仪表 ID，且时间戳严格增加。
         """
 
-        first_temperature = cls._primary_snapshot(
+        temperature: float | None = None
+        first_temperature = cls._optional_primary_snapshot(
             first,
             "temperature",
         )
-        second_temperature = cls._same_snapshot(
-            second,
-            first_temperature[0],
-            "temperature",
-        )
-        first_field = cls._primary_snapshot(
+        if first_temperature is not None:
+            second_temperature = cls._same_snapshot(
+                second,
+                first_temperature[0],
+                "temperature",
+            )
+            cls._require_newer_snapshot(
+                first_temperature,
+                second_temperature,
+            )
+            temperature = (
+                cls._temperature_kelvin(
+                    first_temperature[1],
+                    first_temperature[2],
+                )
+                + cls._temperature_kelvin(
+                    second_temperature[1],
+                    second_temperature[2],
+                )
+            ) / 2.0
+
+        field: float | None = None
+        first_field = cls._optional_primary_snapshot(
             first,
             "field",
         )
-        second_field = cls._same_snapshot(
-            second,
-            first_field[0],
-            "field",
-        )
-        cls._require_newer_snapshot(
-            first_temperature,
-            second_temperature,
-        )
-        cls._require_newer_snapshot(
-            first_field,
-            second_field,
-        )
-        temperature = (
-            cls._temperature_kelvin(
-                first_temperature[1],
-                first_temperature[2],
+        if first_field is not None:
+            second_field = cls._same_snapshot(
+                second,
+                first_field[0],
+                "field",
             )
-            + cls._temperature_kelvin(
-                second_temperature[1],
-                second_temperature[2],
+            cls._require_newer_snapshot(
+                first_field,
+                second_field,
             )
-        ) / 2.0
-        field = (
-            cls._field_oersted(
-                first_field[1],
-                first_field[2],
-            )
-            + cls._field_oersted(
-                second_field[1],
-                second_field[2],
-            )
-        ) / 2.0
+            field = (
+                cls._field_oersted(
+                    first_field[1],
+                    first_field[2],
+                )
+                + cls._field_oersted(
+                    second_field[1],
+                    second_field[2],
+                )
+            ) / 2.0
         return temperature, field
+
+    @classmethod
+    def _optional_primary_snapshot(
+        cls,
+        system: Mapping[str, Mapping[str, Any]],
+        kind: str,
+    ) -> tuple[str, float, str, float] | None:
+        if not any(
+            str(values.get("kind", "")).casefold() == kind
+            for values in system.values()
+        ):
+            return None
+        return cls._primary_snapshot(system, kind)
 
     @staticmethod
     def _primary_snapshot(
@@ -1553,7 +1613,7 @@ class LakeShore372ABackend:
                 channel,
                 shunted=True,
             )
-            if actual != expected:
+            if not self._intype_matches(actual, expected):
                 return (
                     f"shunt readback mismatch: expected "
                     f"{expected}, read back {actual}"
