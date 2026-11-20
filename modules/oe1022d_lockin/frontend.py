@@ -31,6 +31,7 @@ class Frontend(QWidget):
             "io_timeout": self._number(0.1, 1, 1),
             "frequency": self._number(0.001, 102000, 3),
             "sine_channel": self._choice([("A", 1), ("B", 2)]),
+            "channel_2_reference": self._choice([("External (B Ref In)", "external"), ("Channel-A", "channel_1")]),
             "amplitude": QLineEdit(),
             "max_voltage": QLineEdit(),
             "settle_seconds": self._number(0, 3600, 1),
@@ -40,6 +41,7 @@ class Frontend(QWidget):
             ("baud", "OE1022D baud rate"),
             ("io_timeout", "I/O timeout (s)"), ("frequency", "Reference frequency (Hz)"),
             ("sine_channel", "Sine Out channel"), ("amplitude", "Initial RMS voltage"),
+            ("channel_2_reference", "Channel 2 reference"),
             ("max_voltage", "Sample voltage limit (V RMS)"),
             ("settle_seconds", "Settle before first reading (s)"),
         ):
@@ -93,8 +95,8 @@ class Frontend(QWidget):
             self.form.setRowVisible(self.source[key], standalone)
         self.source["amplitude"].setPlaceholderText("e.g. 10mV")
         self.note.setText(
-            "Route the selected channel’s TTL Out to the other channel’s external reference. At SEQ end the selected Sine Out goes to DC 0 V."
-            if standalone else "Connect both external references. This mode does not write to Sine Out."
+            "Channel-A reference follows channel 1 internally. External reference uses the corresponding Ref In. At SEQ end the selected Sine Out goes to DC 0 V."
+            if standalone else "Channel 1 uses external reference; channel 2 uses its selected reference. This mode does not write to Sine Out."
         )
 
     def load(self, settings):

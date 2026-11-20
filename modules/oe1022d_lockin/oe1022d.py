@@ -26,6 +26,10 @@ CHANNEL_SETTINGS = (
     ("sync", "SYNCD", "Synchronous filter", ("Off", "On"), 0),
 )
 
+SENSITIVITY_VOLTS = tuple(value * 10 ** exponent for exponent in range(-9, 0) for value in (1, 2, 5)) + (1.0,)
+TIME_CONSTANT_SECONDS = tuple(value * 10 ** exponent for exponent in range(-5, 4) for value in (1, 3))
+FILTER_WAIT_MULTIPLIERS = (5, 7, 9, 10)
+
 
 class LockIn(Session):
     def __init__(self, address, timeout, baud):
@@ -44,9 +48,12 @@ class LockIn(Session):
         sleep(0.1)
         self.verify(f"{command}? {base}", value)
 
-    def configure_channel(self, channel, settings, external, frequency, checkpoint):
-        modes = [("FMODD", 0 if external else 1)]
-        modes += [("RSLPD", 0)] if external else [("FREQD", frequency)]
+    def configure_channel(self, channel, settings, reference, frequency, checkpoint):
+        modes = [("FMODD", reference)]
+        if reference == 0:
+            modes.append(("RSLPD", 0))
+        elif reference == 1:
+            modes.append(("FREQD", frequency))
         modes += [(cmd, settings[key]) for key, cmd, *_ in CHANNEL_SETTINGS]
         modes.append(("PHASD", settings["phase"]))
         for command, value in modes:
@@ -64,6 +71,32 @@ class LockIn(Session):
     def source_voltage(self, channel, voltage):
         self.setting("SLVLD", channel, voltage)
         self.setting("SWVTD", channel, 0)
+
+    def auto_reserve(self, channel):
+        self.write(f"ARSVD {channel}")
+
+    def auto_gain(self, channel):
+        self.write(f"AGAND {channel}")
+
+    def set_reserve(self, channel, reserve):
+        self.setting("RMODD", channel, reserve)
+
+    def set_sensitivity(self, channel, sensitivity):
+        self.setting("SENSD", channel, sensitivity)
+
+    def read_filter(self, channel):
+        time_constant = self.numbers(f"OFLTD? {channel}")[0]
+        slope = self.numbers(f"OFSLD? {channel}")[0]
+        if not time_constant.is_integer() or not 0 <= time_constant < len(TIME_CONSTANT_SECONDS) or not slope.is_integer() or not 0 <= slope < len(FILTER_WAIT_MULTIPLIERS):
+            raise ModuleError(f"Channel {channel}: invalid time constant/filter slope {time_constant:g}/{slope:g}", "LOCKIN_BAD_REPLY")
+        return int(time_constant), int(slope)
+
+    def read_gain(self, channel):
+        reserve = self.numbers(f"RMODD? {channel}")[0]
+        sensitivity = self.numbers(f"SENSD? {channel}")[0]
+        if not reserve.is_integer() or not 0 <= reserve <= 2 or not sensitivity.is_integer() or not 0 <= sensitivity <= 27:
+            raise ModuleError(f"Channel {channel}: invalid reserve/sensitivity {reserve:g}/{sensitivity:g}", "LOCKIN_BAD_REPLY")
+        return int(reserve), int(sensitivity)
 
     def read_harmonic(self, channel, index):
         # SNAPD table (not OUTPD): X/Y/R/θ for harmonic 1 or 2 plus reference frequency.

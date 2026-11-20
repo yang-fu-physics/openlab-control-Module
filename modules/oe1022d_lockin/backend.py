@@ -2,11 +2,12 @@
 
 import math
 import re
+from time import monotonic
 
 from labcontrol.formatting import require_precision
 from labcontrol.module_api import ModuleError
 
-from .oe1022d import CHANNEL_SETTINGS, LockIn
+from .oe1022d import CHANNEL_SETTINGS, FILTER_WAIT_MULTIPLIERS, SENSITIVITY_VOLTS, TIME_CONSTANT_SECONDS, LockIn
 
 
 EXTERNAL = "external"
@@ -32,6 +33,7 @@ def default_settings():
         "io_timeout": 0.5, "frequency": 137.77, "sine_channel": 1,
         "amplitude": "0", "max_voltage": "",
         "settle_seconds": 3.0,
+        "channel_2_reference": "external",
         **{
             name: {**{key: default for key, _, _, _, default in CHANNEL_SETTINGS}, "phase": 0.0, "primary": 1, "secondary": 2}
             for name in CHANNELS
@@ -60,6 +62,12 @@ class Module:
             {"name": "points", "label": "RMS points (V)", "type": "list", "default": ["10m", "20m", "50m"]},
             {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},
         ],
+    }, {
+        "id": "auto_range", "label": "Auto Range", "kind": "command",
+        "description": "Search sensitivity in software at the unchanged time constant and slope, then optionally lower dynamic reserve. Keep selected settings for subsequent measurements.",
+        "fields": [
+            {"name": "auto_reserve", "label": "Optimize dynamic reserve after ranging", "type": "bool", "default": True},
+        ],
     }]
 
     def __init__(self, lockin_factory=LockIn):
@@ -71,6 +79,7 @@ class Module:
         self.active = False
         self.identity = ""
         self.latest = {}
+        self.auto_ranged = False
 
     def open(self, api):
         api.resources()
@@ -92,6 +101,10 @@ class Module:
             settings["frequency"] = frequency
             if mode == SINE_OUT and (type(settings["sine_channel"]) is not int or settings["sine_channel"] not in (1, 2)):
                 raise ValueError("Select Sine Out A or B")
+            if settings["channel_2_reference"] not in ("external", "channel_1"):
+                raise ValueError("Select external or Channel-A reference for channel 2")
+            if mode == SINE_OUT and settings["sine_channel"] == 2 and settings["channel_2_reference"] == "channel_1":
+                raise ValueError("Use Sine Out A when channel 2 follows Channel-A reference")
             if settings["baud"] not in (921600, 460800, 230400, 115200, 57600, 38400, 19200, 9600):
                 raise ValueError("Select a supported baud rate")
             if mode == SINE_OUT:
@@ -130,7 +143,8 @@ class Module:
                 self.voltage_channel = settings["sine_channel"]
                 self.lockin.zero(self.voltage_channel)
             for i, name in enumerate(CHANNELS, 1):
-                self.lockin.configure_channel(i, settings[name], i != self.voltage_channel, frequency, api.checkpoint)
+                reference = 3 if i == 2 and settings["channel_2_reference"] == "channel_1" else 1 if i == self.voltage_channel else 0
+                self.lockin.configure_channel(i, settings[name], reference, frequency, api.checkpoint)
         except BaseException:
             # Cancellation must also leave any identified source in a confirmed safe state.
             self._release()
@@ -173,6 +187,7 @@ class Module:
     def _release(self):
         self.settings = None
         self.active = False
+        self.auto_ranged = False
         try:
             self._zero()
         finally:
@@ -199,8 +214,163 @@ class Module:
             self._zero()
             raise
 
+    def _instrument_auto_range(self, parameters, api):
+        """Preserved native implementation; the SEQ dispatcher does not call it."""
+        self._require_active()
+        try:
+            reserve_first = parameters["auto_reserve"]
+            if type(reserve_first) is not bool:
+                raise ValueError("Auto Reserve first must be a boolean")
+            wait = require_precision(parameters["settle_seconds"], 1, "Auto Range wait")
+            operations = 2 * (1 + reserve_first)
+            timeout = self.settings["io_timeout"]
+            if wait < 5 or operations * (wait + 3 * timeout) + 14 * timeout >= api.timeout:
+                raise ValueError("Auto Range needs at least 5 s per operation and must leave time for readback and cleanup")
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(str(exc), "LOCKIN_INVALID_AUTO_RANGE") from exc
+        options = {key: values for key, _, _, values, _ in CHANNEL_SETTINGS}
+        self.auto_ranged = False
+        try:
+            reference_channels = (1,) if self.settings["channel_2_reference"] == "channel_1" else (1, 2)
+            for channel in reference_channels:
+                if self.lockin.status_code(channel, channel != self.voltage_channel) & 16:
+                    raise ModuleError(f"Channel {channel}: Auto Range requires a locked reference", "LOCKIN_AUTO_RANGE_UNLOCKED")
+            for channel, name in enumerate(CHANNELS, 1):
+                if reserve_first:
+                    api.checkpoint()
+                    self.lockin.auto_reserve(channel)
+                    api.sleep(wait)
+                    self.lockin.read_gain(channel)
+                api.checkpoint()
+                self.lockin.auto_gain(channel)
+                api.sleep(wait)
+                reserve, sensitivity = self.lockin.read_gain(channel)
+                self.settings[name].update(reserve=reserve, sensitivity=sensitivity)
+                self.latest.update({
+                    f"Dynamic Reserve {channel}": options["reserve"][reserve],
+                    f"Sensitivity {channel}": options["sensitivity"][sensitivity],
+                })
+            for channel, name in enumerate(CHANNELS, 1):
+                if self.lockin.read_gain(channel) != (self.settings[name]["reserve"], self.settings[name]["sensitivity"]):
+                    raise ModuleError("Automatic settings are still changing; extend the wait before scanning", "LOCKIN_AUTO_RANGE_UNSETTLED")
+            self.auto_ranged = True
+        except BaseException:
+            self._zero()
+            raise
+        return self._status()
+
+    def _check_range(self, channel, wait, deadline, api):
+        if monotonic() + wait + 8 * self.settings["io_timeout"] >= deadline:
+            raise ModuleError("Insufficient operation time for the unchanged filter settling time", "LOCKIN_AUTO_RANGE_TIMEOUT")
+        api.sleep(wait)
+        shared = channel == 2 and self.settings["channel_2_reference"] == "channel_1"
+        status = self.lockin.status_code(channel, channel != self.voltage_channel and not shared)
+        if shared:
+            status |= self.lockin.status_code(1, self.voltage_channel != 1) & 16
+        if status & 16:
+            raise ModuleError(f"Channel {channel}: Auto Range requires a locked reference", "LOCKIN_AUTO_RANGE_UNLOCKED")
+        if status & 2:
+            raise ModuleError(f"Channel {channel}: input overload; reduce the input signal", "LOCKIN_AUTO_RANGE_INPUT_OVERLOAD")
+        if status & 4:
+            return None
+        magnitudes = [self.lockin.read_harmonic(channel, index)[2] for index in (1, 2)]
+        if any(value < 0 for value in magnitudes):
+            raise ModuleError(f"Channel {channel}: negative harmonic magnitude", "LOCKIN_BAD_REPLY")
+        return max(magnitudes)
+
     def execute_sequence_command(self, command_id, parameters, api):
         self._require_active()
+        if command_id == "auto_range":
+            optimize_reserve = parameters["auto_reserve"]
+            if type(optimize_reserve) is not bool:
+                raise ModuleError("Optimize dynamic reserve must be a boolean", "LOCKIN_INVALID_AUTO_RANGE")
+            self.auto_ranged = False
+            deadline = monotonic() + api.timeout - 4 * self.settings["io_timeout"] - 0.4
+            options = {key: values for key, _, _, values, _ in CHANNEL_SETTINGS}
+            filters = {}
+            try:
+                reference_channels = (1,) if self.settings["channel_2_reference"] == "channel_1" else (1, 2)
+                for channel in reference_channels:
+                    api.checkpoint()
+                    if self.lockin.status_code(channel, channel != self.voltage_channel) & 16:
+                        raise ModuleError(f"Channel {channel}: Auto Range requires a locked reference", "LOCKIN_AUTO_RANGE_UNLOCKED")
+                for channel, name in enumerate(CHANNELS, 1):
+                    time_constant, slope = filters[channel] = self.lockin.read_filter(channel)
+                    wait = TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope]
+                    _, sensitivity = self.lockin.read_gain(channel)
+                    api.checkpoint()
+                    self.lockin.set_reserve(channel, 2)
+                    floor = 0
+                    last_safe = None
+                    confirmed = None
+                    for _ in range(10):
+                        magnitude = self._check_range(channel, wait, deadline, api)
+                        if magnitude is None:
+                            floor = max(floor, sensitivity + 1)
+                            if sensitivity == len(SENSITIVITY_VOLTS) - 1:
+                                raise ModuleError(f"Channel {channel}: gain overload at maximum range", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                            if last_safe is None:
+                                target = next((index for index in range(sensitivity + 1, len(SENSITIVITY_VOLTS)) if SENSITIVITY_VOLTS[index] >= 10 * SENSITIVITY_VOLTS[sensitivity]), len(SENSITIVITY_VOLTS) - 1)
+                            else:
+                                target = sensitivity + 1
+                        else:
+                            last_safe = sensitivity
+                            occupancy = magnitude / SENSITIVITY_VOLTS[sensitivity]
+                            if 0.2 <= occupancy <= 0.8:
+                                if confirmed == sensitivity:
+                                    break
+                                confirmed = sensitivity
+                                continue
+                            if occupancy > 0.8:
+                                if sensitivity == len(SENSITIVITY_VOLTS) - 1:
+                                    raise ModuleError(f"Channel {channel}: signal exceeds 80% of maximum range", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                                target = sensitivity + 1
+                            else:
+                                candidates = [index for index in range(floor, len(SENSITIVITY_VOLTS)) if 0.2 <= magnitude / SENSITIVITY_VOLTS[index] <= 0.8]
+                                if not candidates:
+                                    raise ModuleError(f"Channel {channel}: no safe range meets 20–80% occupancy", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                                target = min(candidates, key=lambda index: abs(magnitude / SENSITIVITY_VOLTS[index] - 0.55))
+                        confirmed = None
+                        api.checkpoint()
+                        self.lockin.set_sensitivity(channel, target)
+                        sensitivity = target
+                    else:
+                        raise ModuleError(f"Channel {channel}: range search exceeded 10 checks", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                    reserve = 2
+                    if optimize_reserve:
+                        for candidate in (1, 0):
+                            api.checkpoint()
+                            self.lockin.set_reserve(channel, candidate)
+                            magnitude = self._check_range(channel, wait, deadline, api)
+                            if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
+                                self.lockin.set_reserve(channel, reserve)
+                                magnitude = self._check_range(channel, wait, deadline, api)
+                                if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
+                                    raise ModuleError(f"Channel {channel}: previous safe reserve no longer passes", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                                break
+                            reserve = candidate
+                    self.settings[name].update(reserve=reserve, sensitivity=sensitivity)
+                    self.latest.update({
+                        f"Dynamic Reserve {channel}": options["reserve"][reserve],
+                        f"Sensitivity {channel}": options["sensitivity"][sensitivity],
+                    })
+                    api.status(self._status())
+                for channel, name in enumerate(CHANNELS, 1):
+                    time_constant, slope = filters[channel]
+                    if self.lockin.read_filter(channel) != filters[channel]:
+                        raise ModuleError(f"Channel {channel}: time constant or slope changed during range search", "LOCKIN_AUTO_RANGE_FILTER_CHANGED")
+                    sensitivity = self.settings[name]["sensitivity"]
+                    expected = (self.settings[name]["reserve"], sensitivity)
+                    if self.lockin.read_gain(channel) != expected:
+                        raise ModuleError(f"Channel {channel}: range settings changed during search", "LOCKIN_RANGE_CHANGED_AFTER_AUTO")
+                    magnitude = self._check_range(channel, TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope], deadline, api)
+                    if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
+                        raise ModuleError(f"Channel {channel}: final range verification failed", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                self.auto_ranged = True
+            except BaseException:
+                self._zero()
+                raise
+            return self._status()
         if command_id != "scan_voltage" or self.voltage_channel is None:
             raise ModuleError("Scan Voltage requires OE1022D Sine Out mode", "LOCKIN_WRONG_SOURCE", command_id)
         try:
@@ -232,7 +402,14 @@ class Module:
         for channel, name in enumerate(CHANNELS, 1):
             settings = self.settings[name]
             api.checkpoint()
-            status = self.lockin.status_code(channel, channel != self.voltage_channel)
+            if self.auto_ranged and self.lockin.read_gain(channel) != (settings["reserve"], settings["sensitivity"]):
+                raise ModuleError(f"Channel {channel}: settings changed after Auto Range", "LOCKIN_RANGE_CHANGED_AFTER_AUTO")
+            shared_reference = channel == 2 and self.settings["channel_2_reference"] == "channel_1"
+            status = self.lockin.status_code(channel, channel != self.voltage_channel and not shared_reference)
+            if shared_reference:
+                status |= row["Status1"] & 16
+            if self.auto_ranged and status:
+                raise ModuleError(f"Channel {channel}: overload or reference loss after Auto Range (status {status})", "LOCKIN_RANGE_STATUS_CHANGED")
             row[f"Status{channel}"] = status
             api.warn("LOCKIN_CHANNEL_STATUS", f"Channel {channel}: status {status}" if status else None, str(channel))
             for harmonic, (role, key) in enumerate((("p", "primary"), ("s", "secondary")), 1):
@@ -264,7 +441,7 @@ class Module:
                     row[f"Y{channel}s/X1p"] = row[f"Y{channel}s"] / base
                     if base * base:
                         row[f"Y{channel}s/X1p^2"] = row[f"Y{channel}s"] / base ** 2
-        self.latest = {key: row[key] for key in ("X1p", "Y2s", "Status1", "Status2")}
+        self.latest.update({key: row[key] for key in ("X1p", "Y2s", "Status1", "Status2")})
         api.status(self._status())
         return row
 
