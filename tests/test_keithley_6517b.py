@@ -563,6 +563,30 @@ class Keithley6517BBackendTests(unittest.TestCase):
             backend.configure(_settings(io_timeout_seconds=1.0), short)
         self.assertEqual(timeout_error.exception.context, "operation_timeout_seconds")
 
+    def test_parse_measurement_supports_figure_88_two_field_and_three_field_formats(self) -> None:
+        from keithley_6517b.keithley_6517b import parse_measurement
+
+        self.assertEqual(
+            parse_measurement("+1.000000E-09N,+100.000"),
+            (1.0e-9, "N", 100.0),
+        )
+        self.assertEqual(
+            parse_measurement("+2.500000E-10NADC,+50.000VSRC"),
+            (2.5e-10, "N", 50.0),
+        )
+        self.assertEqual(
+            parse_measurement("+9.900000E+37O,+100.000"),
+            (9.9e37, "O", 100.0),
+        )
+        self.assertEqual(
+            parse_measurement("+1.000000E-09,N,+100.000"),
+            (1.0e-9, "N", 100.0),
+        )
+        with self.assertRaises(ValueError):
+            parse_measurement("+1.000000E-09ADC,+100.000VSRC")
+        with self.assertRaises(ValueError):
+            parse_measurement("+1.000000E-09,+100.000")
+
     def test_close_is_idempotent_and_keeps_confirmed_safe_state(self) -> None:
         state = _FakeState()
         backend = self._backend(state)
