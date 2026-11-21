@@ -170,9 +170,11 @@ class Module:
         if event == "run_start":
             if self.settings is None:
                 raise ModuleError("Apply instrument settings before starting SEQ", "LOCKIN_NOT_CONFIGURED")
+            self.auto_ranged = False
             self.active = True
         elif event == "run_end":
             self.active = False
+            self.auto_ranged = False
             self._zero()
         return self._status()
 
@@ -259,9 +261,31 @@ class Module:
             raise
         return self._status()
 
+    @staticmethod
+    def _active_now(api):
+        """返回扣除核心已确认 Pause 时长后的活动单调时钟；绝不剔除正常 I/O 或调度开销。"""
+
+        paused = getattr(api, "paused_seconds", None)
+        if (
+            isinstance(paused, (int, float))
+            and not isinstance(paused, bool)
+            and math.isfinite(paused)
+            and paused >= 0.0
+        ):
+            return monotonic() - float(paused)
+        clock = getattr(api, "active_monotonic", None)
+        if callable(clock):
+            return float(clock())
+        return monotonic()
+
     def _check_range(self, channel, wait, deadline, api):
-        if monotonic() + wait + 8 * self.settings["io_timeout"] >= deadline:
-            raise ModuleError("Insufficient operation time for the unchanged filter settling time", "LOCKIN_AUTO_RANGE_TIMEOUT")
+        if self._active_now(api) + wait + 8 * self.settings["io_timeout"] >= deadline:
+            raise ModuleError(
+                f"Channel {channel}: insufficient operation time for the unchanged "
+                f"{wait:.1f} s filter settling wait; increase [modules] "
+                "operation_timeout_seconds in configs/general.toml",
+                "LOCKIN_AUTO_RANGE_TIMEOUT",
+            )
         api.sleep(wait)
         shared = channel == 2 and self.settings["channel_2_reference"] == "channel_1"
         status = self.lockin.status_code(channel, channel != self.voltage_channel and not shared)
@@ -285,18 +309,36 @@ class Module:
             if type(optimize_reserve) is not bool:
                 raise ModuleError("Optimize dynamic reserve must be a boolean", "LOCKIN_INVALID_AUTO_RANGE")
             self.auto_ranged = False
-            deadline = monotonic() + api.timeout - 4 * self.settings["io_timeout"] - 0.4
+            deadline = self._active_now(api) + api.timeout - 4 * self.settings["io_timeout"] - 0.4
             options = {key: values for key, _, _, values, _ in CHANNEL_SETTINGS}
             filters = {}
+            waits = {}
             try:
                 reference_channels = (1,) if self.settings["channel_2_reference"] == "channel_1" else (1, 2)
                 for channel in reference_channels:
                     api.checkpoint()
                     if self.lockin.status_code(channel, channel != self.voltage_channel) & 16:
                         raise ModuleError(f"Channel {channel}: Auto Range requires a locked reference", "LOCKIN_AUTO_RANGE_UNLOCKED")
-                for channel, name in enumerate(CHANNELS, 1):
+                for channel in (1, 2):
                     time_constant, slope = filters[channel] = self.lockin.read_filter(channel)
-                    wait = TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope]
+                    waits[channel] = TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope]
+                min_checks_per_channel = 3 + (2 if optimize_reserve else 0)
+                min_required_wait = sum(waits[channel] * min_checks_per_channel for channel in (1, 2))
+                available_wait = deadline - self._active_now(api) - 8 * self.settings["io_timeout"]
+                if min_required_wait >= available_wait:
+                    recommended_timeout = math.ceil(
+                        min_required_wait + 12 * self.settings["io_timeout"] + 5.0
+                    )
+                    raise ModuleError(
+                        f"Auto Range needs at least {min_required_wait:.1f} s of unchanged "
+                        f"filter settling (Ch1 {waits[1]:.1f} s/check, Ch2 {waits[2]:.1f} s/check), "
+                        f"exceeding operation_timeout_seconds ({api.timeout:.1f} s); increase "
+                        f"[modules] operation_timeout_seconds to at least {recommended_timeout} s "
+                        "in configs/general.toml",
+                        "LOCKIN_AUTO_RANGE_TIMEOUT",
+                    )
+                for channel, name in enumerate(CHANNELS, 1):
+                    wait = waits[channel]
                     _, sensitivity = self.lockin.read_gain(channel)
                     api.checkpoint()
                     self.lockin.set_reserve(channel, 2)
@@ -363,7 +405,7 @@ class Module:
                     expected = (self.settings[name]["reserve"], sensitivity)
                     if self.lockin.read_gain(channel) != expected:
                         raise ModuleError(f"Channel {channel}: range settings changed during search", "LOCKIN_RANGE_CHANGED_AFTER_AUTO")
-                    magnitude = self._check_range(channel, TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope], deadline, api)
+                    magnitude = self._check_range(channel, waits[channel], deadline, api)
                     if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
                         raise ModuleError(f"Channel {channel}: final range verification failed", "LOCKIN_AUTO_RANGE_UNCONVERGED")
                 self.auto_ranged = True
@@ -433,14 +475,21 @@ class Module:
                     f"Harmonic{suffix}": int(actual), f"Frequency{suffix}": base * actual if not status else None,
                 })
             if not status and nominal[f"{channel}p"]:
-                row[f"X{channel}p Squared"] = row[f"X{channel}p"] ** 2
+                squared = row[f"X{channel}p"] ** 2
+                if math.isfinite(squared):
+                    row[f"X{channel}p Squared"] = squared
         if row["X1p"] and not row["Status1"] and nominal["1p"]:
             base = row["X1p"]
+            base_sq = base * base
             for channel in (1, 2):
                 if not row[f"Status{channel}"] and nominal[f"{channel}s"]:
-                    row[f"Y{channel}s/X1p"] = row[f"Y{channel}s"] / base
-                    if base * base:
-                        row[f"Y{channel}s/X1p^2"] = row[f"Y{channel}s"] / base ** 2
+                    ratio_1 = row[f"Y{channel}s"] / base
+                    if math.isfinite(ratio_1):
+                        row[f"Y{channel}s/X1p"] = ratio_1
+                    if base_sq:
+                        ratio_2 = row[f"Y{channel}s"] / base_sq
+                        if math.isfinite(ratio_2):
+                            row[f"Y{channel}s/X1p^2"] = ratio_2
         self.latest.update({key: row[key] for key in ("X1p", "Y2s", "Status1", "Status2")})
         api.status(self._status())
         return row
