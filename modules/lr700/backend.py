@@ -394,13 +394,15 @@ class LR700Backend:
                     f"as ERROR: {data_failure}",
                     warning_context,
                 )
-                row = {
-                    "TemperatureAverage": temperature,
-                    "FieldAverage": field,
+                row: dict[str, Any] = {
                     "StatusCode": (
                         STATUS_CODE_INVALID_READING
                     ),
                 }
+                if temperature is not None:
+                    row["TemperatureAverage"] = temperature
+                if field is not None:
+                    row["FieldAverage"] = field
                 self.last_values = {
                     "slot": slot,
                     "input_channel": input_channel,
@@ -433,10 +435,12 @@ class LR700Backend:
                 "OVERLOAD": STATUS_CODE_OVERLOAD,
             }[status]
             row: dict[str, Any] = {
-                "TemperatureAverage": temperature,
-                "FieldAverage": field,
                 "StatusCode": status_code,
             }
+            if temperature is not None:
+                row["TemperatureAverage"] = temperature
+            if field is not None:
+                row["FieldAverage"] = field
             # OVER_RANGE/OVERLOAD 下桥读数不可信；保持当前 Rn/Xn 以及所有未测槽位
             # 为空，状态码和温场快照足以说明这次测量尝试。
             if status_code == STATUS_CODE_NORMAL:
@@ -1224,56 +1228,74 @@ class LR700Backend:
         cls,
         first: Mapping[str, Mapping[str, Any]],
         second: Mapping[str, Mapping[str, Any]],
-    ) -> tuple[float, float]:
-        """计算 dwell 前后主温度(K)和主磁场(Oe)的算术平均。"""
+    ) -> tuple[float | None, float | None]:
+        """计算 dwell 前后主温度(K)和主磁场(Oe)的算术平均；未配置的类型返回 None。"""
 
-        first_temperature = cls._primary_snapshot(
+        temperature: float | None = None
+        first_temperature = cls._optional_primary_snapshot(
             first,
             "temperature",
         )
-        second_temperature = cls._same_snapshot(
-            second,
-            first_temperature[0],
-            "temperature",
-        )
-        first_field = cls._primary_snapshot(
+        if first_temperature is not None:
+            second_temperature = cls._same_snapshot(
+                second,
+                first_temperature[0],
+                "temperature",
+            )
+            cls._require_newer_snapshot(
+                first_temperature,
+                second_temperature,
+            )
+            temperature = (
+                cls._temperature_kelvin(
+                    first_temperature[1],
+                    first_temperature[2],
+                )
+                + cls._temperature_kelvin(
+                    second_temperature[1],
+                    second_temperature[2],
+                )
+            ) / 2.0
+
+        field: float | None = None
+        first_field = cls._optional_primary_snapshot(
             first,
             "field",
         )
-        second_field = cls._same_snapshot(
-            second,
-            first_field[0],
-            "field",
-        )
-        cls._require_newer_snapshot(
-            first_temperature,
-            second_temperature,
-        )
-        cls._require_newer_snapshot(
-            first_field,
-            second_field,
-        )
-        temperature = (
-            cls._temperature_kelvin(
-                first_temperature[1],
-                first_temperature[2],
+        if first_field is not None:
+            second_field = cls._same_snapshot(
+                second,
+                first_field[0],
+                "field",
             )
-            + cls._temperature_kelvin(
-                second_temperature[1],
-                second_temperature[2],
+            cls._require_newer_snapshot(
+                first_field,
+                second_field,
             )
-        ) / 2.0
-        field = (
-            cls._field_oersted(
-                first_field[1],
-                first_field[2],
-            )
-            + cls._field_oersted(
-                second_field[1],
-                second_field[2],
-            )
-        ) / 2.0
+            field = (
+                cls._field_oersted(
+                    first_field[1],
+                    first_field[2],
+                )
+                + cls._field_oersted(
+                    second_field[1],
+                    second_field[2],
+                )
+            ) / 2.0
         return temperature, field
+
+    @classmethod
+    def _optional_primary_snapshot(
+        cls,
+        system: Mapping[str, Mapping[str, Any]],
+        kind: str,
+    ) -> tuple[str, float, str, float] | None:
+        if not any(
+            str(values.get("kind", "")).casefold() == kind
+            for values in system.values()
+        ):
+            return None
+        return cls._primary_snapshot(system, kind)
 
     @staticmethod
     def _primary_snapshot(
