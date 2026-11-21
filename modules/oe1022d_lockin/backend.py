@@ -261,8 +261,25 @@ class Module:
             raise
         return self._status()
 
+    @staticmethod
+    def _active_now(api):
+        """返回扣除核心已确认 Pause 时长后的活动单调时钟；绝不剔除正常 I/O 或调度开销。"""
+
+        paused = getattr(api, "paused_seconds", None)
+        if (
+            isinstance(paused, (int, float))
+            and not isinstance(paused, bool)
+            and math.isfinite(paused)
+            and paused >= 0.0
+        ):
+            return monotonic() - float(paused)
+        clock = getattr(api, "active_monotonic", None)
+        if callable(clock):
+            return float(clock())
+        return monotonic()
+
     def _check_range(self, channel, wait, deadline, api):
-        if monotonic() + wait + 8 * self.settings["io_timeout"] >= deadline:
+        if self._active_now(api) + wait + 8 * self.settings["io_timeout"] >= deadline:
             raise ModuleError(
                 f"Channel {channel}: insufficient operation time for the unchanged "
                 f"{wait:.1f} s filter settling wait; increase [modules] "
@@ -292,7 +309,7 @@ class Module:
             if type(optimize_reserve) is not bool:
                 raise ModuleError("Optimize dynamic reserve must be a boolean", "LOCKIN_INVALID_AUTO_RANGE")
             self.auto_ranged = False
-            deadline = monotonic() + api.timeout - 4 * self.settings["io_timeout"] - 0.4
+            deadline = self._active_now(api) + api.timeout - 4 * self.settings["io_timeout"] - 0.4
             options = {key: values for key, _, _, values, _ in CHANNEL_SETTINGS}
             filters = {}
             waits = {}
@@ -307,7 +324,7 @@ class Module:
                     waits[channel] = TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope]
                 min_checks_per_channel = 3 + (2 if optimize_reserve else 0)
                 min_required_wait = sum(waits[channel] * min_checks_per_channel for channel in (1, 2))
-                available_wait = deadline - monotonic() - 8 * self.settings["io_timeout"]
+                available_wait = deadline - self._active_now(api) - 8 * self.settings["io_timeout"]
                 if min_required_wait >= available_wait:
                     recommended_timeout = math.ceil(
                         min_required_wait + 12 * self.settings["io_timeout"] + 5.0
