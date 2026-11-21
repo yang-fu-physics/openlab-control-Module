@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `keithley_6221_2182a_delta` | Keithley 6221 + 2182A Delta 电阻测量（可选 7001 / 3706A 切换器） | **已实机验证（2026-11-05）**（仅限已测接线与配置） |
 | `keithley_6221_ac` | Keithley 6221 独立正弦 AC 电流源（扫流、扫频、Phase Marker） | Beta（仅仿真/协议测试） |
-| `oe1022d_lockin` | OE1022D 双通道锁相放大器（外参考/单机 Sine Out、1f/2f、软件 Auto Range） | Beta（仅仿真/协议测试） |
+| `oe1022d_lockin` | OE1022D 双通道锁相放大器（外参考/单机 Sine Out、1f/2f、软件 Auto Range） | Beta（已有 USB 空载写后回读及部分实机验证，仍按 Beta 对待） |
 | `keithley_2400` | Keithley 2400 两线/四线恒流或恒压电阻测量 | Beta（仅仿真/协议测试） |
 | `keithley_2614b` | Keithley 2614B 双通道 SMU A/B 电阻测量 | Beta（仅仿真/协议测试） |
 | `keithley_6517b` | Keithley 6517B 高阻测量（内置电压源 FVMI） | Beta（仅仿真/协议测试） |
