@@ -56,6 +56,11 @@ default_settings = load_source_object(
     "constants:default_settings",
     "test_keithley_6517b_constants",
 )
+parse_measurement = load_source_object(
+    MODULE,
+    "keithley_6517b:parse_measurement",
+    "test_keithley_6517b_protocol",
+)
 
 
 class _FakeState:
@@ -564,8 +569,6 @@ class Keithley6517BBackendTests(unittest.TestCase):
         self.assertEqual(timeout_error.exception.context, "operation_timeout_seconds")
 
     def test_parse_measurement_supports_figure_88_two_field_and_three_field_formats(self) -> None:
-        from keithley_6517b.keithley_6517b import parse_measurement
-
         self.assertEqual(
             parse_measurement("+1.000000E-09N,+100.000"),
             (1.0e-9, "N", 100.0),
