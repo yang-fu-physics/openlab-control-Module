@@ -106,16 +106,45 @@ def parse_numeric_element(value: str) -> float:
     return result
 
 
+_STATUS_CODES = frozenset({"N", "O", "U", "Z", "R", "L"})
+_READING_UNITS = frozenset({"", "ADC", "VDC", "OHMS", "COUL", "A", "V"})
+
+
 def parse_measurement(reply: str) -> tuple[float, str, float]:
+    """解析 ``FORM:ELEM READ,STAT,VSOUR`` 响应。
+
+    6517B 手册 Figure 88 规定 STAT 字符附着在 READ 字段末尾（例如
+    ``+1.000000E-09N,+100.000`` 或 ``+1.000000E-09NADC,+100.000VSRC``），
+    与 VSOUR 共组成 2 个逗号分隔段；同时兼容 3 段 ``READ,STAT,VSOUR`` 格式。
+    """
+
     parts = [item.strip() for item in reply.split(",")]
-    if len(parts) != 3:
-        raise ValueError(f"expected READ,STAT,VSOUR, received {reply!r}")
-    current = parse_numeric_element(parts[0])
-    status = parts[1].strip().strip('"').strip("'").upper()
-    voltage = parse_numeric_element(parts[2])
-    if not status:
-        raise ValueError(f"empty status in {reply!r}")
-    return current, status, voltage
+    if len(parts) == 3:
+        current = parse_numeric_element(parts[0])
+        status = parts[1].strip().strip('"').strip("'").upper()
+        voltage = parse_numeric_element(parts[2])
+        if not status:
+            raise ValueError(f"empty status in {reply!r}")
+        return current, status, voltage
+    if len(parts) == 2:
+        matched = _NUMBER_PREFIX.match(parts[0])
+        if matched is None:
+            raise ValueError(f"non-numeric READ element in {reply!r}")
+        current = float(matched.group(1))
+        if not math.isfinite(current):
+            raise ValueError(f"non-finite READ element in {reply!r}")
+        suffix = parts[0][matched.end():].strip().strip('"').strip("'").upper()
+        if not suffix or not suffix[0].isalpha():
+            raise ValueError(f"missing STAT flag in {reply!r}")
+        if len(suffix) == 1:
+            status = suffix
+        elif suffix[0] in _STATUS_CODES and suffix[1:] in _READING_UNITS:
+            status = suffix[0]
+        else:
+            raise ValueError(f"missing or invalid STAT flag in {reply!r}")
+        voltage = parse_numeric_element(parts[1])
+        return current, status, voltage
+    raise ValueError(f"expected READ+STAT,VSOUR or READ,STAT,VSOUR, received {reply!r}")
 
 
 def parse_error_code(reply: str) -> int:
