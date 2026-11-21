@@ -1,49 +1,44 @@
-# OpenLab Control Measurement Modules
+# OpenLab Control — Measurement Modules（测量模块仓库）
 
-这是 Measurement Module 的共享仓库。框架负责加载、进程隔离、Pause/Stop、操作总
-timeout、跨模块并行和 DAT 写入；模块负责仪表协议、通道、状态码和安全动作。
+本仓库维护 **OpenLab Control** 配套的 **Measurement Module** 插件，用于执行电输运与物性测量。主框架负责进程隔离、SEQ 调度、Pause/Stop、多模块并行与 DAT 写入；每个模块专注管好自己的仪表协议、通道逻辑、数字状态码与输出安全收尾。
 
-## 最小硬件模块
+> 如果你在找温控仪、磁体电源或压缩机开关，请前往 [openlab-control-Device](https://github.com/yang-fu-physics/openlab-control-Device)。
 
-新模块的底层通讯优先复用 [PyMeasure 驱动](https://pymeasure.readthedocs.io/en/latest/api/instruments/index.html)、
-[QCoDeS 官方驱动](https://microsoft.github.io/Qcodes/drivers_api/index.html)或
-[QCoDeS 社区驱动](https://github.com/QCoDeS/Qcodes_contrib_drivers)。先核对型号、接口和固件，
-复用匹配的命令、连接设置和回包解析；测量流程、超时和安全收尾仍由本模块负责。
-移植源码时保留许可证和出处，不因复用几条命令而引入整套框架。
-VISA 连接使用 `labcontrol.measurement.visa.VisaSession`，模块只提供自己的终止符和串口参数。
-关闭连接只释放该仪表的会话，不关闭当前模块进程共享的 VISA 管理器。
-使用这个连接接口的模块要与包含该接口的核心一起更新。
-选择物理仪表时，设置键使用 `resource`、`resource_*` 或 `*_resource`，值保存资源 ID。
-Apply 时框架按实际 VISA 地址检查是否被另一个模块占用。
+## 当前包含的模块
 
-| 仪表 | 优先参考 |
-| --- | --- |
-| 2400 / 6517B / 6221 | [PyMeasure Keithley 驱动](https://pymeasure.readthedocs.io/en/stable/api/instruments/keithley/) |
-| 2614B | [QCoDeS 2600 系列源码](https://microsoft.github.io/Qcodes/_modules/qcodes/instrument_drivers/Keithley/_Keithley_2600.html)，包含 2614B 专用边界 |
-| 2182A / 7001 / 3706A | [Delta 模块的通讯参考](modules/keithley_6221_2182a_delta/README.md#底层通讯参考) |
-| Lake Shore 372 | [QCoDeS 372 源码](https://microsoft.github.io/Qcodes/_modules/qcodes/instrument_drivers/Lakeshore/Lakeshore_model_372.html) |
-| SR830（待开发） | [QCoDeS SR830 源码](https://microsoft.github.io/Qcodes/_modules/qcodes/instrument_drivers/stanford_research/SR830.html)和 [PyMeasure SR830 驱动](https://pymeasure.readthedocs.io/en/stable/api/instruments/srs/sr830.html) |
+| 目录 ID | 适用仪表与功能 | 实机验证状态 |
+| --- | --- | --- |
+| `keithley_6221_2182a_delta` | Keithley 6221 + 2182A Delta 电阻测量（可选 7001 / 3706A 切换器） | **已实机验证（2026-11-05）**（仅限已测接线与配置） |
+| `keithley_6221_ac` | Keithley 6221 独立正弦 AC 电流源（扫流、扫频、Phase Marker） | Beta（仅仿真/协议测试） |
+| `oe1022d_lockin` | OE1022D 双通道锁相放大器（外参考/单机 Sine Out、1f/2f、软件 Auto Range） | Beta（已有 USB 空载写后回读及部分实机验证，仍按 Beta 对待） |
+| `keithley_2400` | Keithley 2400 两线/四线恒流或恒压电阻测量 | Beta（仅仿真/协议测试） |
+| `keithley_2614b` | Keithley 2614B 双通道 SMU A/B 电阻测量 | Beta（仅仿真/协议测试） |
+| `keithley_6517b` | Keithley 6517B 高阻测量（内置电压源 FVMI） | Beta（仅仿真/协议测试） |
+| `lakeshore_372a` | Lake Shore 372 / 372A 交流电阻电桥（1–16 通道扫描） | Beta（仅仿真/协议测试） |
+| `lr700` | Linear Research LR-700 + LR-720-16 交流电桥 | Beta（仅仿真/协议测试） |
+| `simulated_transport` | 无需硬件的四通道模拟电阻模块 | 教学与仿真测试用 |
 
-LR700 和 OE1022D 没找到匹配的上游驱动，仪表命令继续按各自的手册维护。
+> 接真机前请先阅读对应模块目录中的 `README.md`，并在假负载上完成低风险验证。软件测试不能替代硬件联锁、限流/限压和人工急停。
 
-参数精度约定：可编辑的等待/超时时间以秒保留一位，滤波参数保持各自规定；2400、6517B、
-2614B 的 NPLC 保留一位，Delta 的 PLC 仍为整数，372A 的硬件整秒参数仍为整数。
-加载超精度设置会报错而非静默舍入；SI 电流/电压输入在短格式会丢失有效数字时保留原文本，
-发送仪表的数值也保留相同浮点值。模拟模块的默认通道延时为 0.1 秒。
+## 离线安装（复制目录即可）
 
-本轮前端使用核心的 `PrecisionDoubleSpinBox` 校验加载值，部署时需同步更新核心和模块。
-Enable/加载设置仍不自动 Apply，固定的仪表协议等待不属于可编辑时间参数。
+1. 将需要的模块完整目录复制到主程序的 `OpenLabControl/modules/<模块ID>/`。
+2. 确保已通过 **Instrument Scanner** 扫描并保留了该仪表的 Measurement VISA 资源（写入 `configs/visa.resources.toml`）。
+3. 重启 OpenLab Control，在工具栏 **Modules** 中勾选启用（所有模块启动默认 Disabled）。
+4. 打开模块窗口的 **Settings** 页选择资源 ID 与参数，核对无误后点击 **Apply Settings** 下发。
+
+> 依赖说明：`PySide6`、`PyVISA`、`QtAwesome`、`packaging` 和 `typing_extensions` 由主框架统一锁定提供，各模块不再重复安装依赖。
+
+## 模块组织方式与最小骨架
+
+目录名即模块 ID，入口固定为 `backend.py` 里的 `Module` 类（**无需继承框架基类**）：
 
 ```text
 modules/my_meter/
-├─ module.toml
-├─ backend.py
-└─ my_meter.py
-```
-
-```toml
-name = "My Meter"
-version = "0.1.0"
+├─ module.toml        # 仅需 name 和 version
+├─ backend.py         # 生命周期、流程编排、超时、告警与安全收尾
+├─ my_meter.py        # 底层 VISA/串口命令与响应解析（一台仪表一个文件）
+└─ frontend.py        # 可选：PySide6 设置与状态界面
 ```
 
 ```python
@@ -54,24 +49,21 @@ from . import my_meter
 
 class Module:
     columns = {"Resistance": "Ohm", "StatusCode": ""}
-    display_columns = ("Resistance",)  # 可选：主窗口卡片显示的已有列
+    display_columns = ("Resistance",)  # 可选：主窗口左侧实时监视卡显示列
 
     def open(self, api: ModuleAPI):
         self.instrument = None
-        api.resources()  # 只读取核心给出的 Measurement 资源，不扫描 VISA
+        api.resources()  # 从核心读取扫描器确认的资源表，不自行全盘扫描 VISA
 
     def configure(self, settings, api: ModuleAPI):
-        resource_id = str(settings["resource"])
-        address = api.resource_address(resource_id)
+        address = api.resource_address(str(settings["resource"]))
         self.instrument = VisaSession(address, 3.0)
-        # 这里还必须查询身份、写入安全设置并读回确认。
+        # 此处须核对 *IDN?、写入安全设置并回读确认
 
     def measure(self, slot: int, api: ModuleAPI):
-        api.sleep(0)
+        api.checkpoint()
         return {
-            "Resistance": my_meter.parse_number(
-                self.instrument.query(my_meter.READ)
-            ),
+            "Resistance": my_meter.parse_number(self.instrument.query(my_meter.READ)),
             "StatusCode": 0,
         }
 
@@ -82,120 +74,19 @@ class Module:
             self.instrument = None
 ```
 
-不继承框架基类。目录名就是 ID，入口固定为 `backend:Module`。`columns` 是有序的
-`{列名: 单位}`。
+### 核心开发约定
 
-`backend.py` 只保留框架生命周期和流程编排：`open/configure/measure/close`、SEQ
-事件、通道循环、总超时预算、重试决策、Warning/Error 和安全清理。每个物理仪表使用
-一个同名 Python 文件，例如 `my_meter.py`；其中集中放置 VISA/串口适配器、命令常量、
-绝对设置命令构造、身份判断和响应解析。多仪表模块仍只保留一个 `backend.py`，并按
-物理仪表分别建立 `keithley_6221.py`、`keithley_2182a.py` 等文件。
+- **协议与编排分离**：每台物理仪表单独放一个同名 `.py` 文件（多仪表模块也只保留一个 `backend.py`）。仪表文件不调用 `ModuleAPI`，`backend.py` 不直接拼 SCPI/TSP 字符串。
+- **VISA 资源与共享会话**：统一使用 `labcontrol.measurement.visa.VisaSession`（只关本句柄，不关进程共享 ResourceManager）；设置键用 `resource`、`resource_*` 或 `*_resource` 保存稳定资源 ID，Apply 时由核心按实际地址检查跨模块占用。
+- **输出收尾原则**：会打开输出的模块必须处理 `on_event("run_end", data, api)`（`reason` 为 `completed` / `stopped` / `error`），默认一律关闭输出；确需跨 SEQ 保持连续偏置（如栅压）时，须提供默认勾选的“SEQ 结束关闭输出”选项，取消后仅在读回确认一致时保持，且 Disable / 重新 Apply / 退出 / 异常时仍须关闭。
+- **通道槽位与数据**：声明 `slots` 的模块由核心按槽位并集逐行调用，未测列直接省略，异常点写整数状态码并 `api.warn()`，需要原始序列时返回 `(row, raw_values)`；通讯或安全状态不明时抛 `ModuleError` 停机。
+- **上游驱动参考**：编写新驱动时优先对照 [PyMeasure](https://pymeasure.readthedocs.io/en/latest/api/instruments/index.html) 或 [QCoDeS](https://microsoft.github.io/Qcodes/drivers_api/index.html) 核对命令与固件差异（如 2400/6517B/6221 参考 PyMeasure，2614B/372 参考 QCoDeS，LR-700/OE1022D 按厂商手册维护），移植命令时保留出处，不引入整套第三方框架依赖。
+- **参数精度与 UI**：可编辑等待/超时和常规 NPLC 保留 1 位小数（Delta PLC、372A 整秒参数保留整数）；SI 电流/电压在缩短会丢精度时保留原文本；前端可使用核心的 `PrecisionDoubleSpinBox` 保持与核心一致。
 
-仪表文件不调用 `ModuleAPI`，也不决定重试、报警级别或 SEQ 是否终止。`backend.py`
-不直接拼接 SCPI/TSP 文本；它只调用仪表文件导出的命令和解析函数。这样更换某个仪表
-协议时不会同时改动框架生命周期。纯仿真模块没有物理仪表，可只保留
-`module.toml + backend.py`。
+## 运行测试
 
-除此以外，作者可自由增加界面、配置或辅助文件；不需要继承框架基类、Mixin，也不
-要求更深的固定目录层次。
-
-## 接口
-
-必需：
-
-- `open(api)`：Enable 时建立安全初始状态；不接收保存设置。
-- `measure(slot, api)`：返回一行 Mapping。
-- `close(api)`：Disable/退出时幂等地进入安全状态并释放资源。
-
-可选：
-
-- `display_columns`：最多八个已有 DAT 列名，供主窗口卡片显示最近结果。
-- `configure(settings, api)`：用户明确 Apply 时调用。
-- `on_event(event, data, api)`：统一处理 `run_start`、`run_end`、`status`、`action`。
-- `slots`：正整数、正整数序列或动态 property。
-
-`run_end` 的 `data["reason"]` 为 `completed`、`stopped` 或 `error`。`action` 的 data 为
-`{"name": str, "payload": dict}`。
-
-卡片只显示本次 `measure` 已返回并通过核心校验的缓存值，不会为了界面刷新再次访问
-仪表。声明 `slots` 时按逻辑通道显示；未声明时只保留最新一行。不写
-`display_columns` 不影响 Enable、测量或 DAT。
-
-会打开输出的模块默认应在三种 `run_end` 中关闭。确有连续栅压等需求时，可以提供默认
-勾选的“SEQ 结束关闭输出”设置；用户取消后，只有在读回确认输出和关键设置仍正确时才可
-保持，下一次 `run_start` 不能先关再开。Apply、Disable、应用退出、测量异常或状态无法
-确认时仍要关闭，`close(api)` 始终关闭输出并释放资源。
-
-## 槽位、行与 rawdata
-
-- `slots = 4` 等价于 `(1, 2, 3, 4)`。
-- 核心取所有模块槽位并集，每个槽位写一行；同槽位的不同模块并行。
-- 未声明 `slots` 的模块跟随每个槽位；所有模块都未声明时只有槽位 1。
-- 模块内部不循环发多行；当前槽位就是 `measure(slot, api)` 的 `slot`。
-- 未测量列省略；不要写文字占位。
-- 需要原始序列时返回 `(row, raw_values)`，否则直接返回 row。
-
-模块不直接写 DAT。数据异常时省略无效测量值，写模块自定义的数值状态码并调用
-`api.warn(...)`；通信、协议或安全状态无法确认时抛 `ModuleError` 或其他异常。
-
-## ModuleAPI
-
-- `api.sleep(seconds)`：Pause 不计时、Stop 可打断；`sleep(0)` 为检查点。
-- `api.instruments()`：请求一次测量专用的即时温度、磁场和 Monitor 快照；同一时刻多个
-  模块请求由核心合并，不复用最多一个前面板周期以前的缓存。
-- `api.warn(code, message, key="")`：报告 Warning；`message=None` 解除。
-- `api.status(mapping)`：更新状态页。
-- `api.timeout`：核心给本次调用的总时限。
-
-每个 VISA/串口/厂商 SDK 调用必须自行设置有限 I/O timeout，并为输出关闭预留时间。
-
-## 可选界面
-
-`frontend.py` 中的 `Frontend` 是普通 QWidget，只需 `load(settings)` 和 `dump()`：
-
-```python
-from PySide6.QtWidgets import QWidget
-
-
-class Frontend(QWidget):
-    def __init__(self, api):
-        super().__init__()
-        self.api = api
-
-    def load(self, settings): ...
-    def dump(self): return {}
+```powershell
+<OpenLabControl>\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-可选提供 `status_widget`、`show_status(mapping)`，并用 `api.action(...)` / `api.refresh()`
-向后端发请求。前端不连接仪表、不写文件、不控制温场，也不需要注册设置变化信号或
-Run 状态钩子；这些由核心处理。
-
-## 依赖
-
-PySide6、PyVISA、QtAwesome、packaging 和 typing_extensions 使用主框架版本，模块不得
-重复声明，也不建立单独 runtime。需要新 Python 包时更新核心 `pyproject.toml` 与
-`requirements-lock.txt`，完成全部测试并重新构建发布包。
-
-## 仪表地址
-
-所有模块使用主框架 `tools/instrument_scanner.py` 生成的统一 Measurement 资源表，不要
-在每个模块里重新全盘扫描 VISA。前端和后台都可调用
-`api.resources()`；设置只保存稳定的资源 ID，真正连接时再取
-`api.resource_address(resource_id)`。这样 GPIB/USB 地址变化只需更新一份本机配置。
-
-资源表只提供人工确认过的身份和地址，不替代模块在 `open`/`configure` 中再次核对型号、
-有限 I/O 超时、安全设置和回读。
-
-## 安全与协议测试
-
-真实模块必须保留：
-
-- 身份、地址、量程、限流/限压、互锁与关键设置读回；
-- 仪表命令顺序、响应解析、写 timeout 不重放；
-- 正常、超量程、compliance、损坏响应和模块状态码；
-- Pause/Stop、三种 run_end、重复 close、异常清理和资源释放；
-- 槽位、空列、rawdata、有限数值和并行模块；
-- 设置保存/SEQ 导入不自动 Apply。
-
-当前硬件模块均未完成真机验证，仍按 Beta 对待。软件测试不能替代硬件保护、互锁和
-人工急停。
+真实硬件模块须覆盖：身份/量程/限流/互锁校验、命令顺序、写超时不重放、超量程/compliance/乱码与状态码、Pause/Stop、三种 `run_end`、重复 `close`、资源释放以及导入设置不自动 Apply。
