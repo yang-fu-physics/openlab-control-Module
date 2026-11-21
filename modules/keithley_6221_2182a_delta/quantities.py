@@ -133,7 +133,9 @@ def format_quantity(
 
     number = parse_quantity(value, expected_unit=expected_unit)
     if expected_unit == "s":
-        return f"{require_precision(number, 1, 'Time (s)'):.1f}"
+        rounded = require_precision(number, 3, "Time (s)")
+        text = f"{rounded:.3f}".rstrip("0")
+        return f"{text}0" if text.endswith(".") else text
     if number == 0:
         return "0"
     exponent = int(math.floor(math.log10(abs(number)) / 3.0) * 3)

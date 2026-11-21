@@ -81,12 +81,13 @@ class ModuleParameterPrecisionTests(unittest.TestCase):
                     self.assertEqual(frontend.shared_widgets["digital_filter_window_percent"].decimals(), 3)
                     self.assertEqual(frontend.shared_widgets["delta_delay"].text(), "0.1")
 
-    def test_delta_delay_rejects_hidden_sub_tenth_precision(self) -> None:
+    def test_delta_delay_allows_millisecond_and_rejects_sub_millisecond_precision(self) -> None:
         directory = ROOT / "modules" / "keithley_6221_2182a_delta"
         render = load_source_object(directory, "quantities:format_quantity", "precision_delta_time")
         self.assertEqual(render("100m", expected_unit="s"), "0.1")
+        self.assertEqual(render("2m", expected_unit="s"), "0.002")
         with self.assertRaises(ValueError):
-            render("2m", expected_unit="s")
+            render("500u", expected_unit="s")
         backend_type = load_source_object(directory, "backend:Module", "precision_delta_backend")
         with self.assertRaisesRegex(ModuleError, "decimal places"):
             backend_type._number(0.25, 0.0, 300.0, "switch_settle_seconds")

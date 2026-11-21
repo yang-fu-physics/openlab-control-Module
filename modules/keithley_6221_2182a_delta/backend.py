@@ -1127,33 +1127,58 @@ class Keithley6221DeltaBackend:
             self.armed = False
             self.active_channel = ""
             return
-        self._enter_safe_source_state(api)
+        errors: list[str] = []
+        first_error: Exception | None = None
+        try:
+            self._enter_safe_source_state(api)
+        except Exception as exc:
+            first_error = exc
+            errors.append(f"6221 source: {exc}")
         if self.switcher_type != SWITCHER_NONE:
-            if self.transport_switcher is None:
-                raise ModuleError(
-                    f"Cannot confirm {self.switcher_type} routes are open because "
-                    "the switcher is not connected",
-                    "K6221_SAFE_STATE_FAILED",
-                    self.switcher_type,
-                )
-            routing = self.routing_table.for_switcher(self.switcher_type)
-            if self.switcher_type == SWITCHER_7001:
-                self._write_switcher(keithley_7001.OPEN_ALL, api)
-                command = keithley_7001.open_query(routing.all_routes)
-                self._expect_7001_states(
-                    self._query_switcher(command, api),
-                    len(routing.all_routes),
-                    expected=True,
-                    command=command,
-                )
-            else:
-                self._write_switcher(keithley_3706a.OPEN_ALL, api)
-                self._expect_3706a_routes(
-                    self._query_switcher(keithley_3706a.CLOSED_QUERY, api),
-                    frozenset(),
-                    keithley_3706a.OPEN_ALL,
-                )
+            try:
+                self._open_all_switcher_routes(api)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                errors.append(f"{self.switcher_type} switcher: {exc}")
         self.active_channel = ""
+        if first_error is not None:
+            if len(errors) == 1 and isinstance(first_error, ModuleError):
+                raise first_error
+            raise ModuleError(
+                "Failed to confirm safe state: " + "; ".join(errors),
+                "K6221_SAFE_STATE_FAILED",
+                "safe_state",
+            ) from first_error
+
+    def _open_all_switcher_routes(
+        self,
+        api: ModuleAPI,
+    ) -> None:
+        if self.transport_switcher is None:
+            raise ModuleError(
+                f"Cannot confirm {self.switcher_type} routes are open because "
+                "the switcher is not connected",
+                "K6221_SAFE_STATE_FAILED",
+                self.switcher_type,
+            )
+        routing = self.routing_table.for_switcher(self.switcher_type)
+        if self.switcher_type == SWITCHER_7001:
+            self._write_switcher(keithley_7001.OPEN_ALL, api)
+            command = keithley_7001.open_query(routing.all_routes)
+            self._expect_7001_states(
+                self._query_switcher(command, api),
+                len(routing.all_routes),
+                expected=True,
+                command=command,
+            )
+        else:
+            self._write_switcher(keithley_3706a.OPEN_ALL, api)
+            self._expect_3706a_routes(
+                self._query_switcher(keithley_3706a.CLOSED_QUERY, api),
+                frozenset(),
+                keithley_3706a.OPEN_ALL,
+            )
 
     def _enter_safe_source_state(
         self,
@@ -1872,7 +1897,7 @@ class Keithley6221DeltaBackend:
                 ),
                 expected_unit="s",
             )
-            delay = require_precision(delay, 1, f"{prefix}.delta_delay")
+            delay = require_precision(delay, 3, f"{prefix}.delta_delay")
         except ValueError as exc:
             raise ModuleError(
                 f"{prefix} contains an invalid SI value: {exc}",
@@ -2070,12 +2095,14 @@ class Keithley6221DeltaBackend:
                 "K6221_BEGIN_TIMEOUT_UNSAFE",
             )
 
-        measure_arm_total = (
+        # 核心按逻辑槽位逐次调用 measure(slot, api)，每个槽位拥有独立的 operation_timeout_seconds。
+        # 因此按最慢单槽位估算，而不是把所有启用槽位相加。
+        measure_arm_per_slot = (
             0.0
             if settings["mode"] == MODE_SHARED
-            else ARM_SETTLE_SECONDS * len(enabled)
+            else ARM_SETTLE_SECONDS
         )
-        measurement_total = sum(
+        measurement_per_slot = max(
             self._estimated_channel_seconds(
                 settings["shared"]
                 if settings["mode"] == MODE_SHARED
@@ -2083,14 +2110,11 @@ class Keithley6221DeltaBackend:
             )
             for key in enabled
         )
-        switching_total = (
-            float(settings["switch_settle_seconds"])
-            * len(enabled)
-        )
+        switching_per_slot = float(settings["switch_settle_seconds"])
         worst_case = (
-            measure_arm_total
-            + measurement_total
-            + switching_total
+            measure_arm_per_slot
+            + measurement_per_slot
+            + switching_per_slot
             + 5.0
         )
         if (
