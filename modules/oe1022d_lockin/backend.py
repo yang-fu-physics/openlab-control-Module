@@ -261,19 +261,15 @@ class Module:
             raise
         return self._status()
 
-    def _check_range(self, channel, wait, deadline_box, api):
-        if monotonic() + wait + 8 * self.settings["io_timeout"] >= deadline_box[0]:
+    def _check_range(self, channel, wait, deadline, api):
+        if monotonic() + wait + 8 * self.settings["io_timeout"] >= deadline:
             raise ModuleError(
                 f"Channel {channel}: insufficient operation time for the unchanged "
                 f"{wait:.1f} s filter settling wait; increase [modules] "
                 "operation_timeout_seconds in configs/general.toml",
                 "LOCKIN_AUTO_RANGE_TIMEOUT",
             )
-        before_sleep = monotonic()
         api.sleep(wait)
-        paused_extra = max(0.0, (monotonic() - before_sleep) - wait)
-        if paused_extra > 0.0:
-            deadline_box[0] += paused_extra
         shared = channel == 2 and self.settings["channel_2_reference"] == "channel_1"
         status = self.lockin.status_code(channel, channel != self.voltage_channel and not shared)
         if shared:
@@ -296,7 +292,7 @@ class Module:
             if type(optimize_reserve) is not bool:
                 raise ModuleError("Optimize dynamic reserve must be a boolean", "LOCKIN_INVALID_AUTO_RANGE")
             self.auto_ranged = False
-            deadline_box = [monotonic() + api.timeout - 4 * self.settings["io_timeout"] - 0.4]
+            deadline = monotonic() + api.timeout - 4 * self.settings["io_timeout"] - 0.4
             options = {key: values for key, _, _, values, _ in CHANNEL_SETTINGS}
             filters = {}
             waits = {}
@@ -311,7 +307,7 @@ class Module:
                     waits[channel] = TIME_CONSTANT_SECONDS[time_constant] * FILTER_WAIT_MULTIPLIERS[slope]
                 min_checks_per_channel = 3 + (2 if optimize_reserve else 0)
                 min_required_wait = sum(waits[channel] * min_checks_per_channel for channel in (1, 2))
-                available_wait = deadline_box[0] - monotonic() - 8 * self.settings["io_timeout"]
+                available_wait = deadline - monotonic() - 8 * self.settings["io_timeout"]
                 if min_required_wait >= available_wait:
                     recommended_timeout = math.ceil(
                         min_required_wait + 12 * self.settings["io_timeout"] + 5.0
@@ -333,7 +329,7 @@ class Module:
                     last_safe = None
                     confirmed = None
                     for _ in range(10):
-                        magnitude = self._check_range(channel, wait, deadline_box, api)
+                        magnitude = self._check_range(channel, wait, deadline, api)
                         if magnitude is None:
                             floor = max(floor, sensitivity + 1)
                             if sensitivity == len(SENSITIVITY_VOLTS) - 1:
@@ -370,10 +366,10 @@ class Module:
                         for candidate in (1, 0):
                             api.checkpoint()
                             self.lockin.set_reserve(channel, candidate)
-                            magnitude = self._check_range(channel, wait, deadline_box, api)
+                            magnitude = self._check_range(channel, wait, deadline, api)
                             if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
                                 self.lockin.set_reserve(channel, reserve)
-                                magnitude = self._check_range(channel, wait, deadline_box, api)
+                                magnitude = self._check_range(channel, wait, deadline, api)
                                 if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
                                     raise ModuleError(f"Channel {channel}: previous safe reserve no longer passes", "LOCKIN_AUTO_RANGE_UNCONVERGED")
                                 break
@@ -392,7 +388,7 @@ class Module:
                     expected = (self.settings[name]["reserve"], sensitivity)
                     if self.lockin.read_gain(channel) != expected:
                         raise ModuleError(f"Channel {channel}: range settings changed during search", "LOCKIN_RANGE_CHANGED_AFTER_AUTO")
-                    magnitude = self._check_range(channel, waits[channel], deadline_box, api)
+                    magnitude = self._check_range(channel, waits[channel], deadline, api)
                     if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
                         raise ModuleError(f"Channel {channel}: final range verification failed", "LOCKIN_AUTO_RANGE_UNCONVERGED")
                 self.auto_ranged = True
