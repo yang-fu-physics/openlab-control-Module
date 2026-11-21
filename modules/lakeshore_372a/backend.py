@@ -1100,23 +1100,28 @@ class LakeShore372ABackend:
         actual: tuple[int, ...],
         expected: tuple[int, ...],
     ) -> bool:
-        """比较 INTYPE? 读回；硬件自动量程开启时允许仪表自主调整激励/电阻档位。"""
+        """比较 INTYPE? 读回；硬件自动量程开启时仅允许兼容矩阵内的电阻档位变化。"""
 
         if len(actual) != 6 or len(expected) != 6:
             return False
         if expected[2] == 0:
             return actual == expected
-        # autorange != 0：mode、autorange、cs_off（分流状态）和 units 必须严格一致，
-        # 激励量程和电阻量程只需处于硬件合法索引范围内。
-        if (actual[0], actual[2], actual[4], actual[5]) != (
+        # autorange=1（Current autorange）只允许硬件调整电阻量程（索引 3）；
+        # mode、excitation_range、autorange、cs_off（分流安全位）与 units 必须严格一致，
+        # 且读回的电阻量程必须落在当前激励对应的 Figure 1-16 兼容矩阵内。
+        if (actual[0], actual[1], actual[2], actual[4], actual[5]) != (
             expected[0],
+            expected[1],
             expected[2],
             expected[4],
             expected[5],
         ):
             return False
-        max_excitation = 22 if actual[0] == 1 else 12
-        return 1 <= actual[1] <= max_excitation and 1 <= actual[3] <= 22
+        mode = "current" if actual[0] == 1 else "voltage"
+        return actual[3] in compatible_resistance_range_indices(
+            mode,
+            actual[1],
+        )
 
     def _expect_integers(
         self,
