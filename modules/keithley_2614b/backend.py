@@ -331,6 +331,11 @@ class Keithley2614BBackend:
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
         self.sequence_active = False
+        if self.applied_settings is None or self.transport is None:
+            self.last_status = f"Sequence {reason} - not applied"
+            status = self._status()
+            api.status(status)
+            return status
         settings = self._require_applied()
         if bool(settings["output_off_at_sequence_end"]):
             self._enter_safe_state(api)
@@ -1179,7 +1184,10 @@ class Keithley2614BBackend:
             )
         try:
             result = float(value)
-            if field.endswith("_seconds") or field.endswith(".nplc"):
+            if (
+                field.endswith("_seconds")
+                and field != "operation_timeout_seconds"
+            ) or field.endswith(".nplc"):
                 result = require_precision(result, 1, field)
         except (TypeError, ValueError) as exc:
             raise ModuleError(

@@ -282,6 +282,11 @@ class Keithley2400Backend:
         """结束本轮 SEQ；可选择保留上一条成功测量留下的连续偏置。"""
 
         self.sequence_active = False
+        if self.applied_settings is None or self.transport is None:
+            self.last_status = f"Sequence {reason} - not applied"
+            status = self._status()
+            api.status(status)
+            return status
         settings = self._require_applied()
         if bool(settings["output_off_at_sequence_end"]):
             self._set_output(False, api)
@@ -1005,7 +1010,10 @@ class Keithley2400Backend:
             )
         try:
             result = float(value)
-            if field.endswith("_seconds") or field == "nplc":
+            if (
+                field.endswith("_seconds")
+                and field != "operation_timeout_seconds"
+            ) or field == "nplc":
                 result = require_precision(result, 1, field)
         except (TypeError, ValueError) as exc:
             raise ModuleError(
