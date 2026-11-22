@@ -238,17 +238,22 @@ class Module:
     def _cleanup_after_failure(self, exc, api, deadline):
         try:
             self._ramp_off(api, deadline=deadline)
-        except ModuleError as cleanup_exc:
+        except Exception as cleanup_exc:
             is_cancel = (
                 not isinstance(exc, Exception)
                 or isinstance(exc, InterruptedError)
                 or type(exc).__name__ == "_ModuleOperationCancelled"
             )
-            if cleanup_exc.code == "K6221_AC_SAFE_STATE_UNCONFIRMED" or is_cancel:
+            is_unconfirmed = (
+                isinstance(cleanup_exc, ModuleError)
+                and cleanup_exc.code == "K6221_AC_SAFE_STATE_UNCONFIRMED"
+            )
+            if is_unconfirmed or is_cancel:
                 raise cleanup_exc from exc
             if isinstance(exc, ModuleError):
+                detail = str(cleanup_exc) or type(cleanup_exc).__name__
                 raise ModuleError(
-                    f"{exc} (ramp-down skipped: {cleanup_exc}; output off confirmed)",
+                    f"{exc} (ramp-down skipped: {detail}; output off confirmed)",
                     exc.code,
                     exc.context,
                 ) from cleanup_exc

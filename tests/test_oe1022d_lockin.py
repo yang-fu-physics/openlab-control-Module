@@ -282,6 +282,28 @@ class LockInTests(unittest.TestCase):
         self.assertNotIn("SOUR:WAVE:INIT", self.source.writes[before:])
         self.assertEqual(self.source.values["OUTP?"], "0")
 
+    def test_amplitude_readback_failure_preserves_root_code_on_cleanup_timeout_error(self):
+        self.start_current()
+        self.scan("current", "100u")
+        original = self.source.query
+        before = len(self.source.writes)
+        ampl_queries_after = [0]
+
+        def query(command):
+            if command == "SOUR:WAVE:AMPL?" and len(self.source.writes) > before:
+                ampl_queries_after[0] += 1
+                if ampl_queries_after[0] == 1:
+                    return "0"
+                raise TimeoutError("VISA read timed out during ramp-down")
+            return original(command)
+
+        with patch.object(self.source, "query", side_effect=query):
+            with self.assertRaises(ModuleError) as raised:
+                self.scan("current", "200u")
+        self.assertEqual(raised.exception.code, "K6221_AC_READBACK_MISMATCH")
+        self.assertRegex(str(raised.exception), "expected.*got.*VISA read timed out.*output off confirmed")
+        self.assertEqual(self.source.values["OUTP?"], "0")
+
     def test_set_current_holds_rejects_below_range_floor_and_ramps_to_zero(self):
         self.start_current()
         with patch.object(ModuleAPI, "sleep", autospec=True):
