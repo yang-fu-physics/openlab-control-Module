@@ -11,7 +11,7 @@ T     Measure
 T End Scan
 ```
 
-`Scan Current` 支持框架原生的 **Linear**、**Log** 和 **List** 三种模式（旧式仅含 `points` 的 SEQ 保持兼容），参数窗口自动同步 Settings 中的样品电流上限（`max_current`）。
+`Scan Current` 支持框架原生的 **Linear**、**Log** 和 **List** 三种模式（SEQ 中显式携带 `point_mode`），`Scan Current` 与 `Set Current` 参数窗口自动同步 Settings 中的样品电流上限（`max_current`）。
 
 也可加入 `Scan Frequency`（保持 List 模式）。参数支持 Hz、mHz 和 kHz（例如 `137.77`、`1kHz`），
 每点改变频率后等待，再执行子指令。如果已经设了非零电流，扫频保持该幅值和 Marker，
