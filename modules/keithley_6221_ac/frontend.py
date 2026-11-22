@@ -40,7 +40,7 @@ class Frontend(QWidget):
             box.setKeyboardTracking(False)
             self.numbers[key] = box
             form.addRow(label, box)
-        note = QLabel("Scan Current sets the RMS excitation. Negative points move the reference marker to 180°, not the physical waveform.")
+        note = QLabel("Set Current and Scan Current set the RMS excitation. Negative points move the reference marker to 180°, not the physical waveform.")
         note.setWordWrap(True)
         form.addRow(note)
         self.status_widget = QLabel("No measurement yet")
