@@ -150,6 +150,7 @@ class Module:
             self._release()
             raise
         self.settings = settings
+        api.warn("LOCKIN_AUTO_RANGE_UNCONVERGED", None)
         return self._status()
 
     @staticmethod
@@ -172,6 +173,7 @@ class Module:
                 raise ModuleError("Apply instrument settings before starting SEQ", "LOCKIN_NOT_CONFIGURED")
             self.auto_ranged = False
             self.active = True
+            api.warn("LOCKIN_AUTO_RANGE_UNCONVERGED", None)
         elif event == "run_end":
             self.active = False
             self.auto_ranged = False
@@ -302,6 +304,61 @@ class Module:
             raise ModuleError(f"Channel {channel}: negative harmonic magnitude", "LOCKIN_BAD_REPLY")
         return max(magnitudes)
 
+    def _auto_range_channel(self, channel, wait, deadline, optimize_reserve, api):
+        _, sensitivity = self.lockin.read_gain(channel)
+        api.checkpoint()
+        self.lockin.set_reserve(channel, 2)
+        floor = 0
+        last_safe = None
+        confirmed = None
+        for _ in range(10):
+            magnitude = self._check_range(channel, wait, deadline, api)
+            if magnitude is None:
+                floor = max(floor, sensitivity + 1)
+                if sensitivity == len(SENSITIVITY_VOLTS) - 1:
+                    raise ModuleError(f"Channel {channel}: gain overload at maximum range", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                if last_safe is None:
+                    target = next((index for index in range(sensitivity + 1, len(SENSITIVITY_VOLTS)) if SENSITIVITY_VOLTS[index] >= 10 * SENSITIVITY_VOLTS[sensitivity]), len(SENSITIVITY_VOLTS) - 1)
+                else:
+                    target = sensitivity + 1
+            else:
+                last_safe = sensitivity
+                occupancy = magnitude / SENSITIVITY_VOLTS[sensitivity]
+                if 0.2 <= occupancy <= 0.8:
+                    if confirmed == sensitivity:
+                        break
+                    confirmed = sensitivity
+                    continue
+                if occupancy > 0.8:
+                    if sensitivity == len(SENSITIVITY_VOLTS) - 1:
+                        raise ModuleError(f"Channel {channel}: signal exceeds 80% of maximum range", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                    target = sensitivity + 1
+                else:
+                    candidates = [index for index in range(floor, len(SENSITIVITY_VOLTS)) if 0.2 <= magnitude / SENSITIVITY_VOLTS[index] <= 0.8]
+                    if not candidates:
+                        raise ModuleError(f"Channel {channel}: no safe range meets 20–80% occupancy", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                    target = min(candidates, key=lambda index: abs(magnitude / SENSITIVITY_VOLTS[index] - 0.55))
+            confirmed = None
+            api.checkpoint()
+            self.lockin.set_sensitivity(channel, target)
+            sensitivity = target
+        else:
+            raise ModuleError(f"Channel {channel}: range search exceeded 10 checks", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+        reserve = 2
+        if optimize_reserve:
+            for candidate in (1, 0):
+                api.checkpoint()
+                self.lockin.set_reserve(channel, candidate)
+                magnitude = self._check_range(channel, wait, deadline, api)
+                if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
+                    self.lockin.set_reserve(channel, reserve)
+                    magnitude = self._check_range(channel, wait, deadline, api)
+                    if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
+                        raise ModuleError(f"Channel {channel}: previous safe reserve no longer passes", "LOCKIN_AUTO_RANGE_UNCONVERGED")
+                    break
+                reserve = candidate
+        return reserve, sensitivity
+
     def execute_sequence_command(self, command_id, parameters, api):
         self._require_active()
         if command_id == "auto_range":
@@ -313,6 +370,7 @@ class Module:
             options = {key: values for key, _, _, values, _ in CHANNEL_SETTINGS}
             filters = {}
             waits = {}
+            unconverged = []
             try:
                 reference_channels = (1,) if self.settings["channel_2_reference"] == "channel_1" else (1, 2)
                 for channel in reference_channels:
@@ -337,60 +395,19 @@ class Module:
                         "in configs/general.toml",
                         "LOCKIN_AUTO_RANGE_TIMEOUT",
                     )
+                converged_channels = set()
                 for channel, name in enumerate(CHANNELS, 1):
-                    wait = waits[channel]
-                    _, sensitivity = self.lockin.read_gain(channel)
-                    api.checkpoint()
-                    self.lockin.set_reserve(channel, 2)
-                    floor = 0
-                    last_safe = None
-                    confirmed = None
-                    for _ in range(10):
-                        magnitude = self._check_range(channel, wait, deadline, api)
-                        if magnitude is None:
-                            floor = max(floor, sensitivity + 1)
-                            if sensitivity == len(SENSITIVITY_VOLTS) - 1:
-                                raise ModuleError(f"Channel {channel}: gain overload at maximum range", "LOCKIN_AUTO_RANGE_UNCONVERGED")
-                            if last_safe is None:
-                                target = next((index for index in range(sensitivity + 1, len(SENSITIVITY_VOLTS)) if SENSITIVITY_VOLTS[index] >= 10 * SENSITIVITY_VOLTS[sensitivity]), len(SENSITIVITY_VOLTS) - 1)
-                            else:
-                                target = sensitivity + 1
-                        else:
-                            last_safe = sensitivity
-                            occupancy = magnitude / SENSITIVITY_VOLTS[sensitivity]
-                            if 0.2 <= occupancy <= 0.8:
-                                if confirmed == sensitivity:
-                                    break
-                                confirmed = sensitivity
-                                continue
-                            if occupancy > 0.8:
-                                if sensitivity == len(SENSITIVITY_VOLTS) - 1:
-                                    raise ModuleError(f"Channel {channel}: signal exceeds 80% of maximum range", "LOCKIN_AUTO_RANGE_UNCONVERGED")
-                                target = sensitivity + 1
-                            else:
-                                candidates = [index for index in range(floor, len(SENSITIVITY_VOLTS)) if 0.2 <= magnitude / SENSITIVITY_VOLTS[index] <= 0.8]
-                                if not candidates:
-                                    raise ModuleError(f"Channel {channel}: no safe range meets 20–80% occupancy", "LOCKIN_AUTO_RANGE_UNCONVERGED")
-                                target = min(candidates, key=lambda index: abs(magnitude / SENSITIVITY_VOLTS[index] - 0.55))
-                        confirmed = None
-                        api.checkpoint()
-                        self.lockin.set_sensitivity(channel, target)
-                        sensitivity = target
+                    try:
+                        reserve, sensitivity = self._auto_range_channel(
+                            channel, waits[channel], deadline, optimize_reserve, api
+                        )
+                    except ModuleError as exc:
+                        if exc.code != "LOCKIN_AUTO_RANGE_UNCONVERGED":
+                            raise
+                        unconverged.append(str(exc))
+                        reserve, sensitivity = self.lockin.read_gain(channel)
                     else:
-                        raise ModuleError(f"Channel {channel}: range search exceeded 10 checks", "LOCKIN_AUTO_RANGE_UNCONVERGED")
-                    reserve = 2
-                    if optimize_reserve:
-                        for candidate in (1, 0):
-                            api.checkpoint()
-                            self.lockin.set_reserve(channel, candidate)
-                            magnitude = self._check_range(channel, wait, deadline, api)
-                            if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
-                                self.lockin.set_reserve(channel, reserve)
-                                magnitude = self._check_range(channel, wait, deadline, api)
-                                if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
-                                    raise ModuleError(f"Channel {channel}: previous safe reserve no longer passes", "LOCKIN_AUTO_RANGE_UNCONVERGED")
-                                break
-                            reserve = candidate
+                        converged_channels.add(channel)
                     self.settings[name].update(reserve=reserve, sensitivity=sensitivity)
                     self.latest.update({
                         f"Dynamic Reserve {channel}": options["reserve"][reserve],
@@ -398,32 +415,27 @@ class Module:
                     })
                     api.status(self._status())
                 for channel, name in enumerate(CHANNELS, 1):
-                    time_constant, slope = filters[channel]
                     if self.lockin.read_filter(channel) != filters[channel]:
                         raise ModuleError(f"Channel {channel}: time constant or slope changed during range search", "LOCKIN_AUTO_RANGE_FILTER_CHANGED")
                     sensitivity = self.settings[name]["sensitivity"]
                     expected = (self.settings[name]["reserve"], sensitivity)
                     if self.lockin.read_gain(channel) != expected:
                         raise ModuleError(f"Channel {channel}: range settings changed during search", "LOCKIN_RANGE_CHANGED_AFTER_AUTO")
+                    if channel not in converged_channels:
+                        continue
                     magnitude = self._check_range(channel, waits[channel], deadline, api)
                     if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
-                        raise ModuleError(f"Channel {channel}: final range verification failed", "LOCKIN_AUTO_RANGE_UNCONVERGED")
-                self.auto_ranged = True
-                api.warn("LOCKIN_AUTO_RANGE_UNCONVERGED", None)
-            except ModuleError as exc:
-                if exc.code != "LOCKIN_AUTO_RANGE_UNCONVERGED":
-                    self._zero()
-                    raise
-                # A failed search is not a successful fixed range. Keep the actual
-                # settings and let Measure record readings/status with warnings.
-                for channel, name in enumerate(CHANNELS, 1):
-                    reserve, sensitivity = self.lockin.read_gain(channel)
-                    self.settings[name].update(reserve=reserve, sensitivity=sensitivity)
-                    self.latest.update({
-                        f"Dynamic Reserve {channel}": options["reserve"][reserve],
-                        f"Sensitivity {channel}": options["sensitivity"][sensitivity],
-                    })
-                api.warn(exc.code, f"{exc}; continuing with current instrument settings")
+                        unconverged.append(f"Channel {channel}: final range verification failed")
+                if unconverged:
+                    # A failed search is not a successful fixed range. Keep the actual
+                    # settings and let Measure record readings/status with warnings.
+                    api.warn(
+                        "LOCKIN_AUTO_RANGE_UNCONVERGED",
+                        "; ".join(unconverged) + "; continuing with current instrument settings",
+                    )
+                else:
+                    self.auto_ranged = True
+                    api.warn("LOCKIN_AUTO_RANGE_UNCONVERGED", None)
             except BaseException:
                 self._zero()
                 raise
