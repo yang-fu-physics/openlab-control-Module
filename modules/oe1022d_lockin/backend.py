@@ -57,7 +57,17 @@ class Module:
     }
     display_columns = ("X1p", "Y1s", "X2p", "Y2s", "Source Voltage")
     sequence_commands = [{
-        "id": "scan_voltage", "label": "Scan Voltage", "kind": "scan", "points_field": "points", "point_parameter": "voltage",
+        "id": "scan_voltage", "label": "Scan Voltage", "kind": "scan",
+        "points_field": "points", "point_parameter": "voltage",
+        "scan_modes": ["Linear", "Log", "List"],
+        "point_unit": "V",
+        "point_decimals": 3,
+        "point_limits": {
+            "setting": "max_voltage",
+            "symmetric": False,
+            "minimum": 0.0,
+            "maximum": 5.0,
+        },
         "fields": [
             {"name": "points", "label": "RMS points (V)", "type": "list", "default": ["10m", "20m", "50m"]},
             {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},

@@ -54,7 +54,16 @@ class Module:
     }
     display_columns = ("Source Current", "6221 Compliance")
     sequence_commands = [{
-        "id": "scan_current", "label": "Scan Current", "kind": "scan", "points_field": "points", "point_parameter": "current",
+        "id": "scan_current", "label": "Scan Current", "kind": "scan",
+        "points_field": "points", "point_parameter": "current",
+        "scan_modes": ["Linear", "Log", "List"],
+        "point_unit": "A",
+        "point_limits": {
+            "setting": "max_current",
+            "symmetric": True,
+            "minimum": -MAX_PEAK / RMS_TO_PEAK,
+            "maximum": MAX_PEAK / RMS_TO_PEAK,
+        },
         "fields": [
             {"name": "points", "label": "RMS points (A)", "type": "list", "default": ["100u", "200u", "500u"]},
             {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},
@@ -69,6 +78,14 @@ class Module:
     }, {
         "id": "set_current", "label": "Set Current", "kind": "command",
         "description": "Ramp to the RMS current and hold it for subsequent commands. Zero ramps down and turns output off.",
+        "point_unit": "A",
+        "point_limits": {
+            "field": "current",
+            "setting": "max_current",
+            "symmetric": True,
+            "minimum": -MAX_PEAK / RMS_TO_PEAK,
+            "maximum": MAX_PEAK / RMS_TO_PEAK,
+        },
         "fields": [
             {"name": "current", "label": "RMS current (A)", "type": "text", "default": "100u"},
             {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},

@@ -12,7 +12,12 @@ sys.path.insert(0, str(ROOT.parent / "OpenLabControl" / "src"))
 from PySide6.QtWidgets import QApplication, QTabWidget
 from labcontrol.measurement.frontend_api import ModuleUIAPI
 from labcontrol.module_api import ModuleAPI, ModuleError
-from labcontrol.module_commands import normalize_module_commands
+from labcontrol.module_commands import (
+    normalize_module_commands,
+    resolve_module_point_bounds,
+    resolve_module_scan_points,
+    validate_module_command_parameters,
+)
 from labcontrol.package_support.loading import load_source_object
 
 
@@ -113,8 +118,12 @@ class LockInTests(unittest.TestCase):
         self.manager.open_resource.assert_not_called()
         commands = normalize_module_commands("oe1022d_lockin", self.module.sequence_commands)
         self.assertEqual([item.command_id for item in commands], ["scan_voltage", "auto_range"])
+        self.assertEqual(commands[0].scan_modes, ("Linear", "Log", "List"))
+        self.assertEqual(commands[0].point_decimals, 3)
         commands = normalize_module_commands("keithley_6221_ac", self.current_module.sequence_commands)
         self.assertEqual([item.command_id for item in commands], ["scan_current", "scan_frequency", "set_current"])
+        self.assertEqual(commands[0].scan_modes, ("Linear", "Log", "List"))
+        self.assertEqual(commands[1].scan_modes, ())
 
     def test_signed_current_has_positive_peak_and_changes_only_marker(self):
         self.start()
@@ -443,3 +452,41 @@ class LockInTests(unittest.TestCase):
                 self.module.execute_sequence_command("auto_range", {"auto_reserve": True}, self.api)
         self.assertEqual(self.lockin.writes[-2:], ["SVDCD 1,0", "SWVTD 1,3"])
         self.assertIsNone(self.module.point)
+
+    def test_scan_current_and_voltage_support_linear_log_list_and_limit_sync(self):
+        current_specs = normalize_module_commands("keithley_6221_ac", self.current_module.sequence_commands)
+        scan_current, scan_frequency, set_current = current_specs
+        voltage_spec = normalize_module_commands("oe1022d_lockin", self.module.sequence_commands)[0]
+
+        self.assertEqual(scan_frequency.scan_modes, ())
+        # Limit sync binds to max_current (symmetric) and max_voltage (unipolar).
+        c_low, c_high, _ = resolve_module_point_bounds(scan_current, self.source_values)
+        self.assertAlmostEqual(c_low, -1e-3)
+        self.assertAlmostEqual(c_high, 1e-3)
+        self.assertEqual(resolve_module_point_bounds(set_current, self.source_values)[:2], (c_low, c_high))
+        v_low, v_high, _ = resolve_module_point_bounds(voltage_spec, self.values)
+        self.assertEqual(v_low, 0.0)
+        self.assertAlmostEqual(v_high, 0.1)
+
+        # Linear & Log current points execute end-to-end on 6221 (including bipolar zero crossing).
+        linear_params = {"point_mode": "Linear", "start": "-200u", "stop": "200u", "steps": 5, "settle_seconds": 0.0}
+        log_params = {"point_mode": "Log", "start": "10u", "stop": "1m", "steps": 3, "settle_seconds": 0.0}
+        self.assertEqual(validate_module_command_parameters(scan_current, linear_params), ())
+        self.assertEqual(validate_module_command_parameters(scan_current, log_params), ())
+        self.assertEqual(resolve_module_scan_points(scan_current, linear_params), ["-200u", "-100u", "0", "100u", "200u"])
+        self.assertEqual(resolve_module_scan_points(scan_current, log_params), ["10u", "100u", "1m"])
+        self.start_current()
+        for point in resolve_module_scan_points(scan_current, linear_params):
+            self.scan("current", point)
+        self.assertAlmostEqual(self.current_module.measure(1, self.api)["Source Current"], 2e-4)
+
+        # Log voltage points quantize to 1 mV resolution and execute cleanly on OE1022D Sine Out.
+        v_log = {"point_mode": "Log", "start": "10m", "stop": "100m", "steps": 5, "settle_seconds": 0.0}
+        self.assertEqual(validate_module_command_parameters(voltage_spec, v_log), ())
+        v_points = resolve_module_scan_points(voltage_spec, v_log)
+        self.assertEqual(v_points, ["10m", "18m", "32m", "56m", "100m"])
+        self.values.update(mode="sine_out", sine_channel=1)
+        self.start()
+        for point in v_points:
+            self.scan("voltage", point)
+        self.assertAlmostEqual(self.module.measure(1, self.api)["Source Voltage"], 0.1)
