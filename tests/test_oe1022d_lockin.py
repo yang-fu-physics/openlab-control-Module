@@ -114,7 +114,7 @@ class LockInTests(unittest.TestCase):
         commands = normalize_module_commands("oe1022d_lockin", self.module.sequence_commands)
         self.assertEqual([item.command_id for item in commands], ["scan_voltage", "auto_range"])
         commands = normalize_module_commands("keithley_6221_ac", self.current_module.sequence_commands)
-        self.assertEqual([item.command_id for item in commands], ["scan_current", "scan_frequency"])
+        self.assertEqual([item.command_id for item in commands], ["scan_current", "scan_frequency", "set_current"])
 
     def test_signed_current_has_positive_peak_and_changes_only_marker(self):
         self.start()
@@ -277,7 +277,7 @@ class LockInTests(unittest.TestCase):
             return original(command)
 
         with patch.object(self.source, "query", side_effect=query):
-            with self.assertRaisesRegex(ModuleError, "expected.*got"):
+            with self.assertRaisesRegex(ModuleError, "amplitude before ramp-down"):
                 self.scan("current", "200u")
         self.assertNotIn("SOUR:WAVE:INIT", self.source.writes[before:])
         self.assertEqual(self.source.values["OUTP?"], "0")

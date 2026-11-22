@@ -2,11 +2,12 @@
 
 import math
 import re
+from time import sleep
 
 from labcontrol.formatting import require_precision
 from labcontrol.module_api import ModuleError
 
-from .keithley_6221 import CurrentSource, MAX_PEAK, MIN_PEAK, RMS_TO_PEAK
+from .keithley_6221 import CurrentSource, MAX_PEAK, MIN_PEAK, RMS_TO_PEAK, fixed_range
 
 
 MIN_RMS = MIN_PEAK / RMS_TO_PEAK
@@ -65,6 +66,13 @@ class Module:
             {"name": "points", "label": "Frequency points (Hz)", "type": "list", "default": [17, 137.77, "1kHz"]},
             {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},
         ],
+    }, {
+        "id": "set_current", "label": "Set Current", "kind": "command",
+        "description": "Ramp to the RMS current and hold it for subsequent commands. Zero ramps down and turns output off.",
+        "fields": [
+            {"name": "current", "label": "RMS current (A)", "type": "text", "default": "100u"},
+            {"name": "settle_seconds", "label": "Settle time", "type": "float", "default": 3.0, "minimum": 0.0, "unit": "s"},
+        ],
     }]
 
     def __init__(self, source_factory=CurrentSource):
@@ -95,8 +103,10 @@ class Module:
             if type(line) is not int or not 1 <= line <= 6:
                 raise ValueError("Phase Marker line must be 1–6")
             cap = settings["cap"] = current_amperes(settings["max_current"])
-            if not 0 < cap <= MAX_PEAK / RMS_TO_PEAK:
+            if not MIN_RMS <= cap <= MAX_PEAK / RMS_TO_PEAK:
                 raise ValueError("Enter a positive sample current limit within the 6221 waveform range")
+            # Armed amplitude changes are clamped to 0.1% of the fixed range.
+            settings["minimum_current"] = fixed_range(cap) * 0.001 / RMS_TO_PEAK
             step = settings["ramp_step"] = current_amperes(settings["ramp_step"])
             if not MIN_RMS <= step <= cap:
                 raise ValueError("Enter a ramp step between the minimum waveform amplitude and the sample limit")
@@ -129,11 +139,11 @@ class Module:
             self.point = 0.0
 
     def close(self, api):
-        self.settings = None
         self.active = False
         try:
-            self._off()
+            self._ramp_off(api)
         finally:
+            self.settings = None
             source = self.source
             self.source = self.point = None
             self.frequency = None
@@ -151,12 +161,7 @@ class Module:
             self.active = True
         elif event == "run_end":
             self.active = False
-            try:
-                if data["reason"] != "error" and self.point:
-                    self._check_budget(abs(self.point), 0, api)
-                    self._ramp(abs(self.point), MIN_RMS, api)
-            finally:
-                self._off()
+            self._ramp_off(api)
         return self._status()
 
     def _require_active(self):
@@ -171,16 +176,38 @@ class Module:
         if settle + steps * (interval + 3 * timeout) + 4 * timeout >= api.timeout:
             raise ValueError("Ramp and settle exceed the operation budget; use smaller scan increments or a longer operation timeout")
 
-    def _ramp(self, start, target, api):
+    def _ramp_off(self, api):
+        try:
+            if self.settings is not None and self.identity:
+                output = self.source.number("OUTP?")
+                if output not in (0, 1):
+                    raise ModuleError("Cannot determine 6221 output state before ramp-down", "K6221_AC_BAD_REPLY")
+                if output:
+                    start = self.source.number("SOUR:WAVE:AMPL?") / RMS_TO_PEAK
+                    if not MIN_RMS <= start <= MAX_PEAK / RMS_TO_PEAK:
+                        raise ModuleError("Invalid 6221 amplitude before ramp-down", "K6221_AC_BAD_REPLY")
+                    # Read the actual amplitude: cancellation may interrupt a ramp
+                    # between measurement points. Never ramp up during cleanup.
+                    if start > self.settings["minimum_current"]:
+                        self._ramp(start, self.settings["minimum_current"], api, stopping=True)
+        finally:
+            self._off()
+
+    def _ramp(self, start, target, api, *, stopping=False):
         count = math.ceil(abs(target - start) / self.settings["ramp_step"])
         for index in range(1, count + 1):
-            api.sleep(self.settings["ramp_interval"])
+            if stopping:
+                # Stop is already requested; another cancellation checkpoint must
+                # not interrupt the ramp-down that makes the output safe.
+                sleep(self.settings["ramp_interval"])
+            else:
+                api.sleep(self.settings["ramp_interval"])
             magnitude = target if index == count else start + (target - start) * index / count
             self.source.set_amplitude(magnitude)
 
     def execute_sequence_command(self, command_id, parameters, api):
         self._require_active()
-        if command_id not in {"scan_current", "scan_frequency"}:
+        if command_id not in {"set_current", "scan_current", "scan_frequency"}:
             raise ModuleError(f"Unknown 6221 command {command_id!r}", "K6221_AC_UNKNOWN_COMMAND", command_id)
         try:
             settle = require_precision(parameters["settle_seconds"], 1, "Settle time")
@@ -193,8 +220,8 @@ class Module:
             point = current_amperes(parameters["current"])
             if abs(point) > self.settings["cap"]:
                 raise ValueError("Current exceeds the sample limit")
-            if point and abs(point) < MIN_RMS:
-                raise ValueError("Current is below the minimum 6221 waveform amplitude")
+            if point and abs(point) < self.settings["minimum_current"]:
+                raise ValueError("Current is below the minimum waveform amplitude on the fixed range")
             # Check the transition and the eventual return from the requested point.
             span = abs(point - self.point)
             self._check_budget(max(span, abs(point)), settle, api)
@@ -209,25 +236,25 @@ class Module:
                         self.frequency, self.settings["compliance"],
                         self.settings["marker_line"], phase, self.settings["cap"], api.checkpoint,
                     )
-                    start = MIN_RMS
+                    start = self.settings["minimum_current"]
                 else:
                     self.source.read_source(self.point, self.frequency)
                     start = abs(self.point)
                     if (point < 0) != (self.point < 0):
-                        self._ramp(start, MIN_RMS, api)
+                        self._ramp(start, self.settings["minimum_current"], api)
                         self.source.set_marker(phase)
-                        start = MIN_RMS
+                        start = self.settings["minimum_current"]
                 self._ramp(start, abs(point), api)
                 self.point = point
                 self.compliance = None
             elif self.point:
-                self._ramp(abs(self.point), MIN_RMS, api)
+                self._ramp(abs(self.point), self.settings["minimum_current"], api)
                 self._off()
             else:
                 self.source.verify("OUTP?", 0)
             api.sleep(settle)
         except BaseException:
-            self._off()
+            self._ramp_off(api)
             raise
         return self._status()
 
@@ -243,7 +270,7 @@ class Module:
             self.frequency = frequency
             api.sleep(settle)
         except BaseException:
-            self._off()
+            self._ramp_off(api)
             raise
         return self._status()
 
@@ -253,7 +280,7 @@ class Module:
             api.checkpoint()
             magnitude, phase, frequency, compliance = self.source.read_source(self.point, self.frequency)
         except BaseException:
-            self._off()
+            self._ramp_off(api)
             raise
         self.compliance = compliance
         api.warn("K6221_AC_COMPLIANCE", "6221 in voltage compliance" if compliance else None)

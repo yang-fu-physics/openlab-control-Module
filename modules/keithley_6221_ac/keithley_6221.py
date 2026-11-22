@@ -13,6 +13,10 @@ MAX_PEAK = FIXED_RANGES[-1]
 RMS_TO_PEAK = sqrt(2)
 
 
+def fixed_range(current_cap):
+    return next(value for value in FIXED_RANGES if value >= current_cap * RMS_TO_PEAK)
+
+
 class CurrentSource(VisaSession):
     def query(self, command):
         return super().query(command).strip()
@@ -43,19 +47,21 @@ class CurrentSource(VisaSession):
         return identity
 
     def output_off(self):
-        self.write("SOUR:WAVE:ABOR")
-        self.write("OUTP OFF")
-        self.verify("OUTP?", 0)
+        try:
+            self.write("SOUR:WAVE:ABOR")
+        finally:
+            self.write("OUTP OFF")
+            self.verify("OUTP?", 0)
 
     def start_wave(self, frequency, compliance, marker_line, phase, current_cap, checkpoint):
         self.verify("OUTP?", 0)
-        source_range = next(value for value in FIXED_RANGES if value >= current_cap * RMS_TO_PEAK)
+        source_range = fixed_range(current_cap)
         self.write(f"SOUR:CURR:RANG {source_range:.12g}")
         self.verify("SOUR:CURR:RANG?", source_range)
         fixed = (
             ("FUNC", "SIN", ("SIN", "SINUSOID")), ("OFFS", 0, 0),
             ("RANG", "FIX", ("FIX", "FIXED")), ("DUR:TIME", "INF", None), ("EXTR", 0, 0),
-            ("FREQ", frequency, frequency), ("AMPL", MIN_PEAK, MIN_PEAK),
+            ("FREQ", frequency, frequency), ("AMPL", source_range * 0.001, source_range * 0.001),
             ("PMAR", phase, phase), ("PMAR:OLIN", marker_line, marker_line), ("PMAR:STAT", 1, 1),
         )
         self.write(f"SOUR:CURR:COMP {compliance:.12g}")
