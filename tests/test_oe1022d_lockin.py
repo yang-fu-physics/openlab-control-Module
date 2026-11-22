@@ -114,7 +114,7 @@ class LockInTests(unittest.TestCase):
         commands = normalize_module_commands("oe1022d_lockin", self.module.sequence_commands)
         self.assertEqual([item.command_id for item in commands], ["scan_voltage", "auto_range"])
         commands = normalize_module_commands("keithley_6221_ac", self.current_module.sequence_commands)
-        self.assertEqual([item.command_id for item in commands], ["scan_current", "scan_frequency"])
+        self.assertEqual([item.command_id for item in commands], ["scan_current", "scan_frequency", "set_current"])
 
     def test_signed_current_has_positive_peak_and_changes_only_marker(self):
         self.start()
@@ -277,7 +277,169 @@ class LockInTests(unittest.TestCase):
             return original(command)
 
         with patch.object(self.source, "query", side_effect=query):
-            with self.assertRaisesRegex(ModuleError, "expected.*got"):
+            with self.assertRaisesRegex(ModuleError, "expected.*got.*amplitude before ramp-down"):
                 self.scan("current", "200u")
         self.assertNotIn("SOUR:WAVE:INIT", self.source.writes[before:])
         self.assertEqual(self.source.values["OUTP?"], "0")
+
+    def test_amplitude_readback_failure_preserves_root_code_on_cleanup_timeout_error(self):
+        self.start_current()
+        self.scan("current", "100u")
+        original = self.source.query
+        before = len(self.source.writes)
+        ampl_queries_after = [0]
+
+        def query(command):
+            if command == "SOUR:WAVE:AMPL?" and len(self.source.writes) > before:
+                ampl_queries_after[0] += 1
+                if ampl_queries_after[0] == 1:
+                    return "0"
+                raise TimeoutError("VISA read timed out during ramp-down")
+            return original(command)
+
+        with patch.object(self.source, "query", side_effect=query):
+            with self.assertRaises(ModuleError) as raised:
+                self.scan("current", "200u")
+        self.assertEqual(raised.exception.code, "K6221_AC_READBACK_MISMATCH")
+        self.assertRegex(str(raised.exception), "expected.*got.*VISA read timed out.*output off confirmed")
+        self.assertEqual(self.source.values["OUTP?"], "0")
+
+    def test_set_current_holds_rejects_below_range_floor_and_ramps_to_zero(self):
+        self.start_current()
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            status = self.current_module.execute_sequence_command(
+                "set_current", {"current": "100u", "settle_seconds": 0.0}, self.api
+            )
+        self.assertAlmostEqual(status["Set RMS Current"], 1e-4)
+        self.assertEqual(self.source.values["OUTP?"], "1")
+        with self.assertRaisesRegex(ModuleError, "minimum waveform amplitude"):
+            self.current_module.execute_sequence_command(
+                "set_current", {"current": "1u", "settle_seconds": 0.0}, self.api
+            )
+        before = len(self.source.writes)
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            status = self.current_module.execute_sequence_command(
+                "set_current", {"current": "0", "settle_seconds": 0.0}, self.api
+            )
+        self.assertEqual(status["Set RMS Current"], 0.0)
+        self.assertTrue(self.source.writes[before].startswith("SOUR:WAVE:AMPL "))
+        self.assertEqual(self.source.writes[-2:], ["SOUR:WAVE:ABOR", "OUTP OFF"])
+        self.assertEqual(self.source.values["OUTP?"], "0")
+
+    def test_ramp_off_respects_timeout_budget_and_readback_boundary_tolerance(self):
+        self.source_values.update(max_current="1m", ramp_step="10u", ramp_interval=0.8, io_timeout=0.1)
+        self.start_current()
+        # Forward 0 -> 1 mA + settle 8 s + interrupted ramp-down 1 mA -> min exceeds 120 s.
+        with self.assertRaisesRegex(ModuleError, "operation budget"):
+            self.current_module.execute_sequence_command(
+                "set_current", {"current": "1m", "settle_seconds": 8.0}, self.api
+            )
+        self.assertEqual(self.source.values["OUTP?"], "0")
+
+        self.source_values.update(max_current="1m", ramp_step="20u", ramp_interval=0.5, io_timeout=0.1)
+        self.start_current()
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            self.current_module.execute_sequence_command(
+                "set_current", {"current": "1m", "settle_seconds": 0.0}, self.api
+            )
+        short_events = []
+        short_api = ModuleAPI(
+            {},
+            lambda *event: short_events.append(event),
+            _operation_timeout_seconds=3.0,
+            _instrument_resources=RESOURCES,
+        )
+        sleep_calls = []
+        clock = [100.0]
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            clock[0] += seconds
+
+        with (
+            patch.object(SourceModule, "_active_now", side_effect=lambda _api: clock[0]),
+            patch.object(SourceModule, "_sleep", side_effect=fake_sleep),
+        ):
+            self.current_module.close(short_api)
+        self.assertGreater(len(sleep_calls), 0)
+        self.assertLess(sum(sleep_calls), 3.0)
+        self.assertEqual(self.source.values["OUTP?"], "0")
+        self.assertTrue(
+            any(
+                kind == "warning" and payload.get("code") == "K6221_AC_RAMP_TRUNCATED"
+                for kind, payload in short_events
+            )
+        )
+
+        # Amplitude readback within 5e-6 of MAX_PEAK must still ramp down cleanly.
+        self.source_values.update(max_current="70.71m", ramp_step="35m", ramp_interval=0.1, io_timeout=0.1)
+        self.start_current()
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            self.current_module.execute_sequence_command(
+                "set_current", {"current": "70.71m", "settle_seconds": 0.0}, self.api
+            )
+        self.source.values["SOUR:WAVE:AMPL?"] = "0.1000001"
+        before = len(self.source.writes)
+        with patch.object(SourceModule, "_sleep"):
+            self.current_module.on_event("run_end", {"reason": "completed"}, self.api)
+        self.assertTrue(any(w.startswith("SOUR:WAVE:AMPL ") for w in self.source.writes[before:]))
+        self.assertEqual(self.source.values["OUTP?"], "0")
+
+    def test_auto_range_channel_1_unconverged_still_ranges_channel_2(self):
+        for channel in ("channel_1", "channel_2"):
+            self.values[channel]["time_constant"] = 4  # 1 ms
+            self.values[channel]["slope"] = 0
+        self.start()
+        self.lockin.values["SNAPD? 1,5,6,7,8,4"] = "0,0,0,0,137.77"
+        self.lockin.values["SNAPD? 1,9,10,11,12,4"] = "0,0,0,0,137.77"
+        self.lockin.values["SNAPD? 2,5,6,7,8,4"] = "1e-5,0,1e-5,0,137.77"
+        self.lockin.values["SNAPD? 2,9,10,11,12,4"] = "0,0,0,0,137.77"
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            self.module.execute_sequence_command("auto_range", {"auto_reserve": True}, self.api)
+        self.assertFalse(self.module.auto_ranged)
+        # Channel 2 should still converge from 100 mV (index 24) to 20 uV (index 13).
+        self.assertEqual(int(self.lockin.values["SENSD? 2"]), 13)
+        self.assertTrue(
+            any(
+                kind == "warning" and payload.get("code") == "LOCKIN_AUTO_RANGE_UNCONVERGED"
+                for kind, payload in self.events
+            )
+        )
+        self.events.clear()
+        self.module.on_event("run_start", {}, self.api)
+        self.assertTrue(
+            any(
+                kind == "resolve" and payload.get("code") == "LOCKIN_AUTO_RANGE_UNCONVERGED"
+                for kind, payload in self.events
+            )
+        )
+
+    def test_auto_range_unconverged_read_gain_error_still_zeros_sine_out(self):
+        self.values.update(mode="sine_out", sine_channel=1)
+        for channel in ("channel_1", "channel_2"):
+            self.values[channel]["time_constant"] = 4
+            self.values[channel]["slope"] = 0
+        self.start()
+        self.scan("voltage", "50mV")
+        self.lockin.values["SNAPD? 1,5,6,7,8,4"] = "0,0,0,0,137.77"
+        self.lockin.values["SNAPD? 1,9,10,11,12,4"] = "0,0,0,0,137.77"
+        original_query = self.lockin.query
+        rmodd_calls = [0]
+
+        def failing_query(command):
+            if command == "RMODD? 1":
+                rmodd_calls[0] += 1
+                # Call 1: initial read_gain; call 2: verify after set_reserve(2);
+                # call 3: recovery read_gain inside unconverged handler.
+                if rmodd_calls[0] >= 3:
+                    raise ModuleError("Simulated VISA timeout", "LOCKIN_IO_ERROR")
+            return original_query(command)
+
+        with (
+            patch.object(ModuleAPI, "sleep", autospec=True),
+            patch.object(self.lockin, "query", side_effect=failing_query),
+        ):
+            with self.assertRaisesRegex(ModuleError, "Simulated VISA timeout"):
+                self.module.execute_sequence_command("auto_range", {"auto_reserve": True}, self.api)
+        self.assertEqual(self.lockin.writes[-2:], ["SVDCD 1,0", "SWVTD 1,3"])
+        self.assertIsNone(self.module.point)
