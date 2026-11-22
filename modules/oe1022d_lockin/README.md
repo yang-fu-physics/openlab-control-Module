@@ -23,7 +23,7 @@ Beta 版本。用于两路电压的同步参考测量，默认读取每个通道
 
 ## SEQ 和 DAT
 
-外部参考模式把 `Measure` 放进外部源的扫描块；单机模式用 `Scan Voltage`。
+外部参考模式把 `Measure` 放进外部源的扫描块；单机模式用 `Scan Voltage`（支持 **Linear**、**Log** 和 **List**，参数窗口自动同步 `max_voltage` 上限，生成点自动按 1 mV 分辨率量化）。
 Measure 合并两个通道为一行。保留原始电压；Measure 本身保持量程，自动量程由 SEQ 中明确插入的 Auto Range 执行。
 OE1022D 电压点是非负 RMS 值，非零点须是 1 mV 的整数倍；
 零点、SEQ 结束/停止/出错以及 Disable 时，选定的 Sine Out 切到 **DC 0 V** 并读回确认。

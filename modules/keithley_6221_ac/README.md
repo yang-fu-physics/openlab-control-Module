@@ -6,12 +6,14 @@
 compliance、频率和物理接线对应的 Phase Marker 输出线。
 
 ```text
-T Module Scan "keithley_6221_ac" "scan_current" {"points":["100u","200u","300u","0"],"settle_seconds":3.0}
+T Module Scan "keithley_6221_ac" "scan_current" {"point_mode":"Linear","start":"100u","stop":"500u","steps":5,"settle_seconds":3.0}
 T     Measure
 T End Scan
 ```
 
-也可加入 `Scan Frequency`。参数支持 Hz、mHz 和 kHz（例如 `137.77`、`1kHz`），
+`Scan Current` 支持框架原生的 **Linear**、**Log** 和 **List** 三种模式（旧式仅含 `points` 的 SEQ 保持兼容），参数窗口自动同步 Settings 中的样品电流上限（`max_current`）。
+
+也可加入 `Scan Frequency`（保持 List 模式）。参数支持 Hz、mHz 和 kHz（例如 `137.77`、`1kHz`），
 每点改变频率后等待，再执行子指令。如果已经设了非零电流，扫频保持该幅值和 Marker，
 不关断或重新 ARM；如果输出本来是关的，就只更新后续扫流会使用的频率。要以固定
 电流扫频，先执行 `Set Current`，再放 `Scan Frequency` 和 `Measure`；原来的单点 `Scan Current` 写法也保留。
