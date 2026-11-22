@@ -55,7 +55,7 @@ class Module:
         "Status2": "", "Y2s/X1p": "", "Y2s/X1p^2": "1/V",
         "Source Voltage": "V", "X1p Squared": "V^2", "X2p Squared": "V^2",
     }
-    display_columns = ("X1p", "Y2s", "Source Voltage")
+    display_columns = ("X1p", "Y1s", "X2p", "Y2s", "Source Voltage")
     sequence_commands = [{
         "id": "scan_voltage", "label": "Scan Voltage", "kind": "scan", "points_field": "points", "point_parameter": "voltage",
         "fields": [
@@ -409,6 +409,21 @@ class Module:
                     if magnitude is None or not 0.2 <= magnitude / SENSITIVITY_VOLTS[sensitivity] <= 0.8:
                         raise ModuleError(f"Channel {channel}: final range verification failed", "LOCKIN_AUTO_RANGE_UNCONVERGED")
                 self.auto_ranged = True
+                api.warn("LOCKIN_AUTO_RANGE_UNCONVERGED", None)
+            except ModuleError as exc:
+                if exc.code != "LOCKIN_AUTO_RANGE_UNCONVERGED":
+                    self._zero()
+                    raise
+                # A failed search is not a successful fixed range. Keep the actual
+                # settings and let Measure record readings/status with warnings.
+                for channel, name in enumerate(CHANNELS, 1):
+                    reserve, sensitivity = self.lockin.read_gain(channel)
+                    self.settings[name].update(reserve=reserve, sensitivity=sensitivity)
+                    self.latest.update({
+                        f"Dynamic Reserve {channel}": options["reserve"][reserve],
+                        f"Sensitivity {channel}": options["sensitivity"][sensitivity],
+                    })
+                api.warn(exc.code, f"{exc}; continuing with current instrument settings")
             except BaseException:
                 self._zero()
                 raise
@@ -490,7 +505,7 @@ class Module:
                         ratio_2 = row[f"Y{channel}s"] / base_sq
                         if math.isfinite(ratio_2):
                             row[f"Y{channel}s/X1p^2"] = ratio_2
-        self.latest.update({key: row[key] for key in ("X1p", "Y2s", "Status1", "Status2")})
+        self.latest.update({key: row[key] for key in ("X1p", "Y1s", "X2p", "Y2s", "Status1", "Status2")})
         api.status(self._status())
         return row
 
