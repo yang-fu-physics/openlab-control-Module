@@ -50,17 +50,17 @@ current resistance range. During Measure, this module's dynamic `slots`
 property makes it run once for the current enabled logical slot and applies and
 verifies only that corresponding sensor.
 
-For every enabled sensor, the module:
+For every enabled sensor:
 
-1. confirms minimum excitation (at 5%) for the current resistance range before switching;
-2. sends `SELECT S=nn`, selects R/X mode (`MODE 0`), steps through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from high-resistance ranges (`200 kOhm` / `2 MOhm`) to lower ranges so excitation is not left elevated during range transitions, writes either fixed `RANGE`/`EXCITATION`/`FILTER`/`VAREXC` (ramping percentage last) or autorange starting at the upper range limit with its minimum allowable excitation followed by `AUTORANGE L=` / `AUTORANGE 1` (leaving the bridge's pre-configured trace untouched);
-3. verifies sensor and settings through `GET 6` (in Autorange mode, confirming range is within `[min, max]` and the `(range, excitation)` pair is hardware-valid);
-4. waits the configured switch/filter settle time (in Autorange mode, checks `GET 6` at 1/4 and at the end of the settle window and restarts the settle wait if range or excitation changed between them);
-5. requests a fresh primary temperature/field snapshot from OpenLab Control;
-6. waits the configured dwell time and requests a second fresh snapshot;
-7. reads R with `GET 0`, X with `GET 1`, and overload state with `GET 7`;
-8. verifies `GET 6` again so a front-panel change or mid-read autorange step cannot silently mix or relabel data (in Autorange mode, any shift detected between settle, dwell, and read retries the full settle/dwell cycle within `retry_attempts`);
-9. emits one sparse DAT row for that sensor, restores minimum excitation, and refreshes the Status page's current range/excitation/current fields to the confirmed safe state.
+- **Fixed-range slots**:
+  1. confirm minimum excitation (at 5%) for the current resistance range before switching;
+  2. send `AUTORANGE 0`, `MODE 0`, `SELECT S=nn`, step through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from `200 kOhm` / `2 MOhm` to `< 20 kOhm`, then write `RANGE`, `EXCITATION`, `FILTER`, and ramp `VAREXC` last;
+  3. verify sensor and settings through `GET 6`, wait `switch_settle_seconds`, take two fresh temperature/field snapshots across `dwell_seconds`, read `GET 0`/`GET 1`/`GET 7`, verify `GET 6` again, emit one sparse DAT row, and restore minimum 5% excitation.
+- **Autorange slots (continuous Run mode)**:
+  1. Apply (`configure`) leaves the bridge at minimum 5% excitation; when the Run starts (`run_start`), if the first enabled slot is Autorange, the module turns on `AUTORANGE 1` **once** (keeping the current range unless outside `[min, max]`, never jumping to `max_range` and never writing `AUTORANGE T=` or `AUTORANGE U=`);
+  2. while the Run stays in Autorange mode, switching channels only sends `SELECT S=nn` (plus `AUTORANGE L=` or `FILTER` only if changed between slots) — no repeated `AUTORANGE 0/1`, no `RANGE` reset, and no 5% drop between channels;
+  3. for each slot, the module checks `GET 6` at `1/4` and at the end of `switch_settle_seconds` (restarting the settle wait if range/excitation changed), takes two fresh temperature/field snapshots across `dwell_seconds`, reads `GET 0`/`GET 1`/`GET 7` with before/after `GET 6` verification, and emits one sparse DAT row;
+  4. on Run end (`completed`/`stopped`/`error`), `Disable` (`close`), switching into a Fixed-range slot, or any error/cancellation during `Measure`, the module restores and readback-confirms `AUTORANGE 0` + minimum 5% excitation and refreshes the Status page's current range/excitation/current fields.
 
 The fixed output columns are `TemperatureAverage`, `FieldAverage`, `R1/X1`
 through `R4/X4`, and one common integer `StatusCode` column. Only the current

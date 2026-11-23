@@ -110,6 +110,9 @@ class LR700Backend:
         self.sequence_active = False
         self.last_values: dict[str, Any] = {}
         self._last_safe_bridge: dict[str, int] | None = None
+        self._autorange_running = False
+        self._autorange_active_limits: tuple[int, int] | None = None
+        self._autorange_active_filter: int | None = None
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
         """Enable 只读取核心资源表，不连接、不写 LR-700。"""
@@ -233,11 +236,32 @@ class LR700Backend:
         self,
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """开始 Run 前重新确认最低激励，防止 Idle 期间前面板改变输出。"""
+        """开始 Run 前确认安全态；若首个启用槽位为自动量程则一次性开启 AUTORANGE 1。"""
 
         self._require_ready()
+        first_slot = self.slots[0]
+        first_channel = self.applied_settings["channels"][f"r{first_slot}"]
+        first_is_autorange = (
+            str(first_channel.get("range_mode", "fixed")).strip().casefold()
+            == "autorange"
+        )
         try:
             safe_bridge = self._set_safe_state(api)
+            active_bridge = safe_bridge
+            safety_text = self._safe_state_text(safe_bridge)
+            if first_is_autorange:
+                first_input = int(first_channel["input_channel"])
+                active_bridge = self._start_autorange_session(
+                    first_input,
+                    first_channel,
+                    api,
+                    current_range_index=int(safe_bridge["range_index"]),
+                )
+                safety_text = (
+                    f"Autorange active (R{first_slot} / S{first_input}); "
+                    "minimum excitation will be restored on "
+                    "Run end/Stop/Error/Disable"
+                )
         except Exception as failure:
             cleanup_error = (
                 self._best_effort_safe_state(api)
@@ -253,8 +277,8 @@ class LR700Backend:
         self.sequence_active = True
         status = {
             "Sequence": "Running",
-            "Excitation Safety": self._safe_state_text(safe_bridge),
-            **self._bridge_status_fields(safe_bridge),
+            "Excitation Safety": safety_text,
+            **self._bridge_status_fields(active_bridge),
         }
         api.status(status)
         return status
@@ -311,22 +335,55 @@ class LR700Backend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """执行一个逻辑槽位的完整事务，并在 finally 中确认最低激励。"""
+        """执行一个逻辑槽位的完整事务。
 
-        failure: Exception | None = None
+        固定量程槽位每次测量前后都恢复并确认最低激励；连续自动量程 Run 期间
+        保持 ``AUTORANGE 1``，切通道只下发 ``SELECT S=nn``（及发生变化的 ``L=``
+        与 ``FILTER``），仅在 Run 结束、Stop、Error、Disable 或任何异常时恢复
+        ``AUTORANGE 0`` + 5% 最低激励。
+        """
+
+        is_autorange = (
+            str(channel.get("range_mode", "fixed")).strip().casefold()
+            == "autorange"
+        )
+        failure: BaseException | None = None
         try:
-            safe_bridge = self._set_safe_state(api)
-            configured_bridge = self._configure_sensor(
-                input_channel,
-                channel,
-                api,
-                current_range_index=int(safe_bridge["range_index"]),
-            )
+            if is_autorange and self._autorange_running:
+                configured_bridge = self._switch_autorange_sensor(
+                    input_channel,
+                    channel,
+                    api,
+                )
+            elif is_autorange:
+                safe_bridge = self._set_safe_state(api)
+                configured_bridge = self._start_autorange_session(
+                    input_channel,
+                    channel,
+                    api,
+                    current_range_index=int(safe_bridge["range_index"]),
+                )
+            else:
+                safe_bridge = self._set_safe_state(api)
+                configured_bridge = self._configure_sensor(
+                    input_channel,
+                    channel,
+                    api,
+                    current_range_index=int(safe_bridge["range_index"]),
+                )
             api.status({
                 **self._bridge_status_fields(configured_bridge),
                 "Excitation Safety": (
-                    "Measurement excitation active on "
-                    f"R{slot} / sensor {input_channel}"
+                    (
+                        f"Autorange active on R{slot} / S{input_channel}; "
+                        "minimum excitation will be restored on "
+                        "Run end/Stop/Error/Disable"
+                    )
+                    if is_autorange and self.sequence_active
+                    else (
+                        "Measurement excitation active on "
+                        f"R{slot} / sensor {input_channel}"
+                    )
                 ),
                 "Last Slot / Sensor": (
                     f"R{slot} / S{input_channel}"
@@ -337,10 +394,6 @@ class LR700Backend:
             # 操作者仍可使用前面板；两次读回可避免把中途改变后的值写入错误通道。
             # 自动量程模式下把等待拆为 1/4 与结束两次 GET 6 核对：不一致则直接
             # 重等一整轮；若进入 dwell 或读数瞬间又发生换挡，同样重等并刷新温场快照。
-            is_autorange = (
-                str(channel.get("range_mode", "fixed")).strip().casefold()
-                == "autorange"
-            )
             read_attempts = self._slot_measure_attempts(channel, settings)
             temperature: float | None = None
             field: float | None = None
@@ -548,36 +601,43 @@ class LR700Backend:
                 ),
             })
             return row
-        except Exception as exc:
+        except BaseException as exc:
             failure = exc
             raise
         finally:
-            # Stop 会让普通 api checkpoint 立即取消，因此清理路径直接使用带
-            # VISA timeout 的底层 transport，不依赖协作上下文。
-            cleanup_error = (
-                self._best_effort_safe_state(api)
+            keep_autorange_running = (
+                failure is None
+                and is_autorange
+                and self.sequence_active
+                and self._autorange_running
             )
-            if cleanup_error is None and self._last_safe_bridge is not None:
-                api.status({
-                    **self._bridge_status_fields(self._last_safe_bridge),
-                    "Excitation Safety": self._safe_state_text(
-                        self._last_safe_bridge
-                    ),
-                })
-            else:
-                api.status({
-                    **self._cleared_bridge_status_fields("Unknown"),
-                    "Excitation Safety": "Minimum excitation unconfirmed",
-                })
-            if cleanup_error is not None:
-                raise ModuleError(
-                    "Could not confirm LR-700 minimum "
-                    f"excitation after sensor "
-                    f"{input_channel}: "
-                    f"{cleanup_error}",
-                    "LR700_SAFE_STATE_FAILED",
-                    f"sensor {input_channel}",
-                ) from failure
+            if not keep_autorange_running:
+                # Stop 会让普通 api checkpoint 立即取消，因此清理路径直接使用带
+                # VISA timeout 的底层 transport，不依赖协作上下文。
+                cleanup_error = (
+                    self._best_effort_safe_state(api)
+                )
+                if cleanup_error is None and self._last_safe_bridge is not None:
+                    api.status({
+                        **self._bridge_status_fields(self._last_safe_bridge),
+                        "Excitation Safety": self._safe_state_text(
+                            self._last_safe_bridge
+                        ),
+                    })
+                else:
+                    api.status({
+                        **self._cleared_bridge_status_fields("Unknown"),
+                        "Excitation Safety": "Minimum excitation unconfirmed",
+                    })
+                if cleanup_error is not None:
+                    raise ModuleError(
+                        "Could not confirm LR-700 minimum "
+                        f"excitation after sensor "
+                        f"{input_channel}: "
+                        f"{cleanup_error}",
+                        "LR700_SAFE_STATE_FAILED",
+                        f"sensor {input_channel}",
+                    ) from failure
 
     def _run_end(
         self,
@@ -981,6 +1041,76 @@ class LR700Backend:
             self._protocol_text(bridge)
         )
 
+    def _reset_autorange_session(self) -> None:
+        self._autorange_running = False
+        self._autorange_active_limits = None
+        self._autorange_active_filter = None
+
+    def _start_autorange_session(
+        self,
+        input_channel: int,
+        channel: Mapping[str, Any],
+        api: ModuleAPI,
+        *,
+        current_range_index: int | None = None,
+    ) -> dict[str, int]:
+        """一次性写入 AUTORANGE L= 与 AUTORANGE 1 并建立连续自动量程会话。"""
+
+        commands = instrument.autorange_start_commands(
+            input_channel,
+            channel,
+            current_range_index=current_range_index,
+        )
+        for command in commands:
+            self._write_absolute(command, api)
+        bridge = self._query_bridge_settings(api)
+        self._verify_channel_readback(
+            input_channel,
+            channel,
+            bridge,
+        )
+        self._autorange_running = True
+        self._autorange_active_limits = (
+            int(channel["autorange_min_range"]),
+            int(channel["autorange_max_range"]),
+        )
+        self._autorange_active_filter = int(channel["filter_index"])
+        return bridge
+
+    def _switch_autorange_sensor(
+        self,
+        input_channel: int,
+        channel: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> dict[str, int]:
+        """连续自动量程期间切换通道：只发 SELECT（及变化的 L= / FILTER）。"""
+
+        new_limits = (
+            int(channel["autorange_min_range"]),
+            int(channel["autorange_max_range"]),
+        )
+        limits_changed = new_limits != self._autorange_active_limits
+        commands = instrument.autorange_switch_commands(
+            input_channel,
+            channel,
+            active_limits=self._autorange_active_limits,
+            active_filter=self._autorange_active_filter,
+        )
+        for command in commands:
+            self._write_absolute(command, api)
+        bridge = self._query_bridge_settings(api)
+        # 若跨槽位更改了 L= 边界，允许仪表在随后的 switch_settle_seconds 内步进到新边界，
+        # 此处先核对传感器、滤波、模式、100% 和硬件合法性；1/4 稳定点起强制检查新边界。
+        self._verify_channel_readback(
+            input_channel,
+            channel,
+            bridge,
+            check_autorange_bounds=not limits_changed,
+        )
+        self._autorange_active_limits = new_limits
+        self._autorange_active_filter = int(channel["filter_index"])
+        return bridge
+
     def _configure_sensor(
         self,
         input_channel: int,
@@ -1015,6 +1145,7 @@ class LR700Backend:
     ) -> dict[str, int]:
         """通过普通受控 I/O 按当前电阻量程设置并读回最低激励（× 5%）。"""
 
+        self._reset_autorange_session()
         current = self._query_bridge_settings(api)
         current_range = int(current["range_index"])
         for command in instrument.safe_state_commands(current_range):
@@ -1046,6 +1177,7 @@ class LR700Backend:
         等同于仪表安全。
         """
 
+        self._reset_autorange_session()
         settings = (
             self.applied_settings
             or self.desired_settings
@@ -1245,6 +1377,8 @@ class LR700Backend:
         input_channel: int,
         channel: Mapping[str, Any],
         bridge: Mapping[str, int],
+        *,
+        check_autorange_bounds: bool = True,
     ) -> None:
         range_mode = (
             str(channel.get("range_mode", "fixed")).strip().casefold()
@@ -1264,9 +1398,13 @@ class LR700Backend:
             actual_excitation = int(bridge["excitation_index"])
             min_range = int(channel["autorange_min_range"])
             max_range = int(channel["autorange_max_range"])
+            out_of_bounds = (
+                check_autorange_bounds
+                and not min_range <= actual_range <= max_range
+            )
             if (
                 actual_common != expected_common
-                or not min_range <= actual_range <= max_range
+                or out_of_bounds
                 or not is_valid_range_excitation(
                     actual_range,
                     actual_excitation,
@@ -1681,6 +1819,7 @@ class LR700Backend:
         self.transport = None
         self.protocol_signature = ""
         self._last_safe_bridge = None
+        self._reset_autorange_session()
         if transport is not None:
             try:
                 transport.close()

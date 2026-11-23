@@ -111,6 +111,62 @@ def _range_transition_commands(
     return (f"RANGE {int(target_range)}",)
 
 
+def autorange_start_commands(
+    input_channel: object,
+    channel: Mapping[str, object],
+    *,
+    current_range_index: int | None = None,
+) -> tuple[str, ...]:
+    """在 Run 开始（或首次进入自动量程）时一次性开启 AUTORANGE 1。
+
+    不强行跳到最高量程、不下发 ``AUTORANGE T=`` 以保留仪器预设跟踪表；仅当当前
+    量程落在 ``[min_range, max_range]`` 之外时才钳位进边界。
+    """
+
+    min_range = int(channel["autorange_min_range"])
+    max_range = int(channel["autorange_max_range"])
+    filter_index = int(channel["filter_index"])
+    range_commands: tuple[str, ...] = ()
+    if current_range_index is not None:
+        current = int(current_range_index)
+        clamped = max(min_range, min(max_range, current))
+        if clamped != current:
+            range_commands = (
+                *_range_transition_commands(clamped, current),
+                f"EXCITATION {minimum_excitation_index(clamped)}",
+            )
+    return (
+        "AUTORANGE 0",
+        "MODE 0",
+        f"SELECT S={int(input_channel):02d}",
+        *range_commands,
+        f"FILTER {filter_index}",
+        "VAREXC 0",
+        f"AUTORANGE L={min_range}{max_range}",
+        "AUTORANGE 1",
+    )
+
+
+def autorange_switch_commands(
+    input_channel: object,
+    channel: Mapping[str, object],
+    *,
+    active_limits: tuple[int, int] | None = None,
+    active_filter: int | None = None,
+) -> tuple[str, ...]:
+    """连续自动量程 Run 期间切换通道：只发 SELECT（及发生变化的 L=/FILTER）。"""
+
+    min_range = int(channel["autorange_min_range"])
+    max_range = int(channel["autorange_max_range"])
+    filter_index = int(channel["filter_index"])
+    commands: list[str] = [f"SELECT S={int(input_channel):02d}"]
+    if active_limits != (min_range, max_range):
+        commands.append(f"AUTORANGE L={min_range}{max_range}")
+    if active_filter != filter_index:
+        commands.append(f"FILTER {filter_index}")
+    return tuple(commands)
+
+
 def configuration_commands(
     input_channel: object,
     channel: Mapping[str, object],
@@ -120,29 +176,19 @@ def configuration_commands(
     """生成当前传感器的完整绝对配置，并保证切换中间态不提前抬高激励。
 
     调用前桥应处于最低激励 x 5%。固定量程模式先切传感器、量程、激励档和滤波，
-    最后才抬升激励百分比；自动量程模式先切传感器并置于最高允许电阻量程（电流最小）
-    与最低激励，再写入 ``AUTORANGE L=`` 并开启 ``AUTORANGE 1``，不下发
-    ``AUTORANGE T=`` 以保留仪器上预先配置的跟踪曲线。
+    最后才抬升激励百分比；自动量程模式复用 ``autorange_start_commands``，
+    保持当前量程（仅越界时钳位）且不下发 ``AUTORANGE T=``。
     """
 
     mode = str(channel.get("range_mode", "fixed")).strip().casefold()
-    filter_index = int(channel["filter_index"])
     if mode == "autorange":
-        min_range = int(channel["autorange_min_range"])
-        max_range = int(channel["autorange_max_range"])
-        start_excitation = minimum_excitation_index(max_range)
-        return (
-            "AUTORANGE 0",
-            "MODE 0",
-            f"SELECT S={int(input_channel):02d}",
-            *_range_transition_commands(max_range, current_range_index),
-            f"EXCITATION {start_excitation}",
-            f"FILTER {filter_index}",
-            "VAREXC 0",
-            f"AUTORANGE L={min_range}{max_range}",
-            "AUTORANGE 1",
+        return autorange_start_commands(
+            input_channel,
+            channel,
+            current_range_index=current_range_index,
         )
 
+    filter_index = int(channel["filter_index"])
     target_range = int(channel["range_index"])
     target_excitation = int(channel["excitation_index"])
     return (
@@ -271,6 +317,8 @@ __all__ = [
     "GET_REACTANCE",
     "GET_SETTINGS",
     "GET_OVERLOADS",
+    "autorange_start_commands",
+    "autorange_switch_commands",
     "configuration_commands",
     "variable_excitation_commands",
     "safe_state_commands",

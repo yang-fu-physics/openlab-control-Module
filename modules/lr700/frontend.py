@@ -289,12 +289,14 @@ class LR700Frontend(QWidget):
 
         safety_note = QLabel(
             "Important: LR-700 has no excitation-off command. "
-            "Before switching sensors and after Measure/Stop/"
-            "Error/Disable, the module confirms the minimum "
-            "available excitation for the current resistance range "
-            "at 5% (20 uV on 2 mOhm-20 kOhm, 200 uV on 200 kOhm, "
-            "2 mV on 2 MOhm). Enable only discovers resources. "
-            "Test Connection is read-only. Apply Settings is always required."
+            "Apply, Fixed-range switches, and every Run end/Stop/Error/"
+            "Disable confirm the minimum available excitation for the "
+            "current resistance range at 5% (20 uV on 2 mOhm-20 kOhm, "
+            "200 uV on 200 kOhm, 2 mV on 2 MOhm). Continuous Autorange "
+            "runs enable AUTORANGE 1 once at Run start and only send "
+            "SELECT (plus changed L=/FILTER) between Autorange slots. "
+            "Enable only discovers resources. Test Connection is read-only. "
+            "Apply Settings is always required."
         )
         safety_note.setWordWrap(True)
         safety_note.setStyleSheet(
