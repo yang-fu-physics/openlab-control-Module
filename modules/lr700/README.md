@@ -34,8 +34,27 @@ selects one physical LR-720-16 sensor from 1-16 and can independently select:
 - enabled/disabled;
 - range mode:
   - **Fixed**: resistance range (`2 mOhm`–`2 MOhm`), hardware-valid full-scale excitation voltage (`20 uV`–`20 mV`, restricted by the LR-700's `1 nA`–`30 mA` current-generator range per manual p. 4-12), and excitation percentage (`5%–100%`);
-  - **Autorange** (`LR-700-AR`): lower/upper range limits `AUTORANGE L=<min><max>` (`min < max`). The module does **not** send `AUTORANGE T=` or `AUTORANGE U=`, preserving whatever trace (including a front-panel `T=4` user-defined trace) is configured on the LR-700;
+  - **Autorange** (`LR-700-AR`): lower/upper range limits `AUTORANGE L=<min><max>` restricted to **`20 mOhm` (`1R`) and above** (`1 <= min < max <= 9`; `2 mOhm` / `0R` is excluded). **Note: Autorange uses this module's custom User Defined trace (`AUTORANGE U=0135666666`, `AUTORANGE T=4`), NOT the LR-700's standard/common factory traces (`T=1` Default, `T=2` Min Power, `T=3` Max Power)** — see the trace table below;
 - built-in fixed digital filter (`FILTER 0`: `1 s`, `FILTER 1`: `3 s`, `FILTER 2`: `10 s` — fixed digital filtering has no Off setting).
+
+### Custom Autorange Trace Table (`AUTORANGE T=4` — Non-Standard)
+
+> **Important**: This module does **not** use the LR-700's common factory autorange traces (`T=1` Default / `T=2` Minimum Power / `T=3` Maximum Power in manual p. 2-18). Whenever Autorange is started, the module explicitly programs and activates its own User Defined trace (`AUTORANGE U=0135666666`, `AUTORANGE T=4`) covering **`20 mOhm` and above** (`1R–9R`), capping full-scale current at `3 mA` on low ranges while maintaining `20 mV` excitation on `20 Ohm` and above for higher SNR:
+
+| Range index | Resistance range | Excitation (`V_fs`) | Excitation index | Full-scale current (`100%`) | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `0` | `2 mOhm` | `20 uV` *(placeholder)* | `0` | — | **Excluded from Autorange** (`L` lower limit `>= 1`); index `0` is filled only because `AUTORANGE U=` requires all 10 digits (manual p. 3-32). |
+| `1` | `20 mOhm` | `60 uV` | `1` | `3 mA` | Custom `T=4` active range |
+| `2` | `200 mOhm` | `600 uV` | `3` | `3 mA` | Custom `T=4` active range |
+| `3` | `2 Ohm` | `6 mV` | `5` | `3 mA` | Custom `T=4` active range |
+| `4` | `20 Ohm` | `20 mV` | `6` | `1 mA` | Custom `T=4` active range |
+| `5` | `200 Ohm` | `20 mV` | `6` | `100 uA` | Custom `T=4` active range |
+| `6` | `2 kOhm` | `20 mV` | `6` | `10 uA` | Custom `T=4` active range |
+| `7` | `20 kOhm` | `20 mV` | `6` | `1 uA` | Custom `T=4` active range |
+| `8` | `200 kOhm` | `20 mV` | `6` | `100 nA` | Custom `T=4` active range |
+| `9` | `2 MOhm` | `20 mV` | `6` | `10 nA` | Custom `T=4` active range |
+
+Because this custom trace applies up to `3 mA` (on `20 mOhm`–`2 Ohm`) and `20 mV` (on `20 Ohm`–`2 MOhm`) — higher than the factory `Default` (`T=1`) and `Min Power` (`T=2`) traces — sensitive low-temperature samples that require lower excitation should use **Fixed** range mode or raise `autorange_min_range` accordingly.
 
 The shared switch/filter settle time (`switch_settle_seconds`, default `9.0 s`)
 must be at least **3× the longest enabled digital filter** (`1 s → 3 s`,
@@ -57,8 +76,8 @@ For every enabled sensor:
   2. send `AUTORANGE 0`, `MODE 0`, `SELECT S=nn`, step through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from `200 kOhm` / `2 MOhm` to `< 20 kOhm`, then write `RANGE`, `EXCITATION`, `FILTER`, and ramp `VAREXC` last;
   3. verify sensor and settings through `GET 6`, wait `switch_settle_seconds`, take two fresh temperature/field snapshots across `dwell_seconds`, read `GET 0`/`GET 1`/`GET 7`, verify `GET 6` again, emit one sparse DAT row, and restore minimum 5% excitation.
 - **Autorange slots (continuous Run mode)**:
-  1. Apply (`configure`) leaves the bridge at minimum 5% excitation; when the Run starts (`run_start`), if the first enabled slot is Autorange, the module turns on `AUTORANGE 1` **once** (keeping the current range unless outside `[min, max]`, never jumping to `max_range` and never writing `AUTORANGE T=` or `AUTORANGE U=`);
-  2. while the Run stays in Autorange mode, each physical sensor caches its last normal settled `(range, excitation)` (cleared on re-Apply/Close). If the bridge's current range is already inside the next slot's `[min, max]` and matches that sensor's cached range (or on first visit), the module sends only `SELECT S=nn` (preceded by `AUTORANGE L=` only if limits changed, plus `FILTER` if changed) — no `RANGE` reset and no 5% drop. If the current range is outside the next slot's `[min, max]` or differs from its cached range, the module first restores 5% minimum excitation, switches `SELECT S=nn`, moves safely to the cached/clamped range at 5% (stepping via `RANGE 7` / `EXCITATION 0` when descending from `200 kOhm` / `2 MOhm`), and then re-enables `VAREXC 0`, `AUTORANGE L=`, and `AUTORANGE 1`;
+  1. Apply (`configure`) leaves the bridge at minimum 5% excitation; when the Run starts (`run_start`), if the first enabled slot is Autorange, the module programs the custom trace (`AUTORANGE U=0135666666`, `AUTORANGE T=4`), sets `EXCITATION` to match the active/clamped range's trace entry, and turns on `AUTORANGE 1` **once** (keeping the current range unless outside `[min, max]`, never jumping to `max_range`);
+  2. while the Run stays in Autorange mode, each physical sensor caches its last normal settled range index (cleared on re-Apply/Close). If the bridge's current range is already inside the next slot's `[min, max]`, matches that sensor's cached range (or on first visit), and has the matching custom-trace excitation, the module sends only `SELECT S=nn` (preceded by `AUTORANGE L=` only if limits changed, plus `FILTER` if changed) — no `RANGE` reset and no 5% drop. If the current range is outside `[min, max]`, differs from the cached range, or its excitation does not match the custom trace, the module first restores 5% minimum excitation, switches safely to the cached/clamped range (raising `RANGE` before `SELECT` when moving to higher resistance, or switching `SELECT` first and stepping via `RANGE 7` / `EXCITATION 0` when descending from `200 kOhm` / `2 MOhm`), **updates `EXCITATION` to the custom trace entry for that range** (so the excitation current matches the trace table), and then re-enables `AUTORANGE U=0135666666`, `AUTORANGE T=4`, `AUTORANGE L=`, `VAREXC 0`, and `AUTORANGE 1`;
   3. for each slot, the module checks `GET 6` at `1/4` and at the end of `switch_settle_seconds` (restarting the settle wait if range/excitation changed), takes two fresh temperature/field snapshots across `dwell_seconds`, reads `GET 0`/`GET 1`/`GET 7` with before/after `GET 6` verification, and emits one sparse DAT row;
   4. on Run end (`completed`/`stopped`/`error`), `Disable` (`close`), switching into a Fixed-range slot, or any error/cancellation during `Measure`, the module restores and readback-confirms `AUTORANGE 0` + minimum 5% excitation and refreshes the Status page's current range/excitation/current fields.
 

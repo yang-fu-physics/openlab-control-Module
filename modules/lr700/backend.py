@@ -29,6 +29,8 @@ from labcontrol.module_api import (
 )
 
 from .constants import (
+    AUTORANGE_MAX_RANGE_INDEX,
+    AUTORANGE_MIN_RANGE_INDEX,
     COMMON_MODE_OVERLOAD_HINT,
     COMMON_MODE_OVERLOAD_MASK,
     FILTERS,
@@ -39,6 +41,7 @@ from .constants import (
     STATUS_CODE_NORMAL,
     STATUS_CODE_OVERLOAD,
     STATUS_CODE_OVER_RANGE,
+    autorange_trace_excitation_index,
     default_settings,
     excitation_current_a,
     excitation_label,
@@ -113,7 +116,7 @@ class LR700Backend:
         self._autorange_running = False
         self._autorange_active_limits: tuple[int, int] | None = None
         self._autorange_active_filter: int | None = None
-        self._autorange_last_state: dict[int, tuple[int, int]] = {}
+        self._autorange_last_range: dict[int, int] = {}
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
         """Enable 只读取核心资源表，不连接、不写 LR-700。"""
@@ -216,7 +219,7 @@ class LR700Backend:
                 ) from failure
             raise
         self.applied_settings = deepcopy(desired)
-        self._autorange_last_state.clear()
+        self._autorange_last_range.clear()
         status = {
             "Connection": "Connected",
             "Resource": desired["resource"],
@@ -258,7 +261,7 @@ class LR700Backend:
                     first_channel,
                     api,
                     current_range_index=int(safe_bridge["range_index"]),
-                    target_state=self._autorange_last_state.get(first_input),
+                    target_range_index=self._autorange_last_range.get(first_input),
                 )
                 safety_text = (
                     f"Autorange active (R{first_slot} / S{first_input}); "
@@ -365,7 +368,7 @@ class LR700Backend:
                     channel,
                     api,
                     current_range_index=int(safe_bridge["range_index"]),
-                    target_state=self._autorange_last_state.get(input_channel),
+                    target_range_index=self._autorange_last_range.get(input_channel),
                 )
             else:
                 safe_bridge = self._set_safe_state(api)
@@ -570,9 +573,8 @@ class LR700Backend:
             # 为空，状态码和温场快照足以说明这次测量尝试。
             if status_code == STATUS_CODE_NORMAL:
                 if is_autorange:
-                    self._autorange_last_state[input_channel] = (
-                        int(settled_bridge["range_index"]),
-                        int(settled_bridge["excitation_index"]),
+                    self._autorange_last_range[input_channel] = int(
+                        settled_bridge["range_index"]
                     )
                 row.update({
                     f"R{slot}": resistance,
@@ -707,7 +709,7 @@ class LR700Backend:
         self._close_transport()
         self.sequence_active = False
         self.applied_settings = {}
-        self._autorange_last_state.clear()
+        self._autorange_last_range.clear()
         status = {
             "Connection": "Disconnected",
             "Applied Settings": "Not applied",
@@ -1063,15 +1065,15 @@ class LR700Backend:
         api: ModuleAPI,
         *,
         current_range_index: int | None = None,
-        target_state: tuple[int, int] | None = None,
+        target_range_index: int | None = None,
     ) -> dict[str, int]:
-        """在 5% 安全态下切至目标传感器与量程并开启 AUTORANGE 1。"""
+        """在 5% 安全态下切至目标传感器与量程、同步自定义 trace 激励并开启 AUTORANGE 1。"""
 
         commands = instrument.autorange_start_commands(
             input_channel,
             channel,
             current_range_index=current_range_index,
-            target_state=target_state,
+            target_range_index=target_range_index,
         )
         for command in commands:
             self._write_absolute(command, api)
@@ -1095,25 +1097,29 @@ class LR700Backend:
         channel: Mapping[str, Any],
         api: ModuleAPI,
     ) -> dict[str, int]:
-        """连续自动量程期间切换通道：同量程且在边界内仅切通道，否则先降 5% 再切目标量程。"""
+        """连续自动量程期间切换通道：同量程、激励符合 trace 表且在边界内仅切通道，否则先降 5% 再切目标量程与对应激励。"""
 
         min_range = int(channel["autorange_min_range"])
         max_range = int(channel["autorange_max_range"])
         new_limits = (min_range, max_range)
         current = self._query_bridge_settings(api)
         current_range = int(current["range_index"])
-        cached = self._autorange_last_state.get(input_channel)
+        current_exc = int(current["excitation_index"])
+        cached_range = self._autorange_last_range.get(input_channel)
         in_new_bounds = min_range <= current_range <= max_range
-        same_as_cached = cached is None or int(cached[0]) == current_range
+        same_as_cached = cached_range is None or cached_range == current_range
+        exc_matches_trace = (
+            current_exc == autorange_trace_excitation_index(current_range)
+        )
 
-        if not in_new_bounds or not same_as_cached:
+        if not in_new_bounds or not same_as_cached or not exc_matches_trace:
             safe_bridge = self._set_safe_state(api)
             return self._start_autorange_session(
                 input_channel,
                 channel,
                 api,
                 current_range_index=int(safe_bridge["range_index"]),
-                target_state=cached,
+                target_range_index=cached_range,
             )
 
         commands = instrument.autorange_switch_commands(
@@ -2011,14 +2017,18 @@ class LR700Backend:
             )
             channel["autorange_min_range"] = cls._integer(
                 channel["autorange_min_range"],
-                0,
-                8,
+                AUTORANGE_MIN_RANGE_INDEX if range_mode == "autorange" else 0,
+                AUTORANGE_MAX_RANGE_INDEX - 1,
                 f"{key}.autorange_min_range",
             )
             channel["autorange_max_range"] = cls._integer(
                 channel["autorange_max_range"],
-                1,
-                9,
+                (
+                    AUTORANGE_MIN_RANGE_INDEX + 1
+                    if range_mode == "autorange"
+                    else 1
+                ),
+                AUTORANGE_MAX_RANGE_INDEX,
                 f"{key}.autorange_max_range",
             )
             if (

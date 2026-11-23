@@ -15,9 +15,11 @@ from typing import Any, Protocol
 from labcontrol.measurement.visa import VisaSession
 
 from .constants import (
+    AUTORANGE_TRACE_INDEX,
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
-    is_valid_range_excitation,
+    autorange_trace_excitation_index,
+    autorange_user_trace_parameter,
     minimum_excitation_index,
 )
 
@@ -117,40 +119,35 @@ def autorange_start_commands(
     channel: Mapping[str, object],
     *,
     current_range_index: int | None = None,
-    target_state: tuple[int, int] | None = None,
+    target_range_index: int | None = None,
 ) -> tuple[str, ...]:
-    """在 5% 安全态下切传感器、切到目标量程（或仅越界钳位）并开启 AUTORANGE 1。
+    """在 5% 安全态下切传感器、切到目标量程并同步自定义 trace 激励后开启 AUTORANGE 1。
 
-    不强行跳到最高量程、不下发 ``AUTORANGE T=`` 以保留仪器预设跟踪表：
-    - 若传入该传感器上次稳定的 ``target_state = (range_index, excitation_index)``
-      且合法落在 ``[min_range, max_range]`` 内，则先在 5% 下安全切至该量程与激励；
-    - 否则保持当前量程，仅当当前量程落在 ``[min_range, max_range]`` 之外时钳位进边界。
+    - 若传入该传感器上次稳定的 ``target_range_index`` 且落在 ``[min_range, max_range]`` 内，
+      则先在 5% 下安全切至该缓存量程；
+    - 否则保持当前量程（若当前量程落在 ``[min_range, max_range]`` 之外则钳位进边界）；
+    - 无论是否改变电阻量程，都会把 ``EXCITATION`` 更新为自定义 trace 表中对应目标量程的
+      激发电压（即对应目标激发电流），再下发 ``AUTORANGE U=0135666666``、``AUTORANGE T=4``、
+      ``AUTORANGE L=``、``VAREXC 0`` 与 ``AUTORANGE 1``。
     """
 
     min_range = int(channel["autorange_min_range"])
     max_range = int(channel["autorange_max_range"])
     filter_index = int(channel["filter_index"])
     target_range: int | None = None
-    target_exc: int | None = None
     if (
-        target_state is not None
-        and min_range <= int(target_state[0]) <= max_range
-        and is_valid_range_excitation(int(target_state[0]), int(target_state[1]))
+        target_range_index is not None
+        and min_range <= int(target_range_index) <= max_range
     ):
-        target_range = int(target_state[0])
-        target_exc = int(target_state[1])
+        target_range = int(target_range_index)
     elif current_range_index is not None:
-        current = int(current_range_index)
-        clamped = max(min_range, min(max_range, current))
-        if clamped != current:
-            target_range = clamped
-            target_exc = minimum_excitation_index(clamped)
+        target_range = max(min_range, min(max_range, int(current_range_index)))
 
     select_cmd = f"SELECT S={int(input_channel):02d}"
     if target_range is None:
         switch_sequence: tuple[str, ...] = (select_cmd,)
     else:
-        assert target_exc is not None
+        target_exc = autorange_trace_excitation_index(target_range)
         move_commands: tuple[str, ...] = (
             ()
             if current_range_index is not None
@@ -158,7 +155,7 @@ def autorange_start_commands(
             else _range_transition_commands(target_range, current_range_index)
         )
         # 切向更高阻（更小电流）量程时先升量程再切传感器，保证新旧通道均不承受更高电流；
-        # 切向更低阻量程时先在高阻 5% 下切传感器，再安全降量程。
+        # 切向更低阻量程或保持同量程时先在 5% 下切传感器，再安全降量程并更新对应激励。
         if (
             current_range_index is not None
             and target_range > int(current_range_index)
@@ -180,8 +177,10 @@ def autorange_start_commands(
         "MODE 0",
         *switch_sequence,
         f"FILTER {filter_index}",
-        "VAREXC 0",
+        f"AUTORANGE U={autorange_user_trace_parameter()}",
+        f"AUTORANGE T={AUTORANGE_TRACE_INDEX}",
         f"AUTORANGE L={min_range}{max_range}",
+        "VAREXC 0",
         "AUTORANGE 1",
     )
 
@@ -217,7 +216,7 @@ def configuration_commands(
 
     调用前桥应处于最低激励 x 5%。固定量程模式先切传感器、量程、激励档和滤波，
     最后才抬升激励百分比；自动量程模式复用 ``autorange_start_commands``，
-    保持当前量程（仅越界时钳位）且不下发 ``AUTORANGE T=``。
+    按自定义 ``T=4`` 跟踪表同步目标量程激励并下发 ``AUTORANGE U=`` / ``T=4`` / ``L=``。
     """
 
     mode = str(channel.get("range_mode", "fixed")).strip().casefold()

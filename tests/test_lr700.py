@@ -108,6 +108,7 @@ class _FakeVisaState:
         self.autorange = 0
         self.autorange_limits: tuple[int, int] = (0, 9)
         self.autorange_trace = 1
+        self.autorange_user_trace: tuple[int, ...] = ()
         self.autorange_target_by_sensor: dict[int, tuple[int, int]] = {}
         self.autorange_mid_read_shift: tuple[int, int] | None = None
         self.autorange_get6_shifts: list[tuple[int, int] | None] = []
@@ -137,6 +138,15 @@ class _FakeTransport:
             self.state.autorange_limits = (int(limits[0]), int(limits[1]))
         elif upper.startswith("AUTORANGE T="):
             self.state.autorange_trace = int(upper.split("=", 1)[1].strip())
+        elif upper.startswith("AUTORANGE U="):
+            digits = "".join(upper.split("=", 1)[1].split())
+            assert len(digits) == 10, f"AUTORANGE U= requires 10 digits: {command}"
+            parsed = tuple(int(ch) for ch in digits)
+            for r_idx, e_idx in enumerate(parsed):
+                assert e_idx in valid_excitation_indices(r_idx), (
+                    f"Invalid AUTORANGE U= entry R={r_idx}, E={e_idx}"
+                )
+            self.state.autorange_user_trace = parsed
         elif upper.startswith("AUTORANGE "):
             self.state.autorange = int(command.split(" ", 1)[1])
             if (
@@ -541,11 +551,12 @@ class LR700BackendTests(unittest.TestCase):
                 self.assertEqual(closed["Connection"], "Disconnected")
                 self.assertEqual(closed["Current Excitation Current"], "-")
 
-    def test_autorange_mode_preserves_bridge_trace_handles_mid_read_step_and_restores_safe_state(
+    def test_autorange_mode_programs_custom_trace_handles_mid_read_step_and_restores_safe_state(
         self,
     ) -> None:
-        # 场景 A：四槽位中启用 R1/R2 共享自动量程（L=19, FILTER 1），Run 开始时只开启一次
-        # AUTORANGE 1，切通道只发 SELECT S=nn（不跳 max_range、不反复开关 AUTORANGE、不降 5%），
+        # 场景 A：四槽位中启用 R1/R2 共享自动量程（L=19, FILTER 1），Run 开始时下发自定义
+        # trace 表 AUTORANGE U=0135666666 与 AUTORANGE T=4、同步当前量程对应的激励档，并只开启一次
+        # AUTORANGE 1；同量程切通道只发 SELECT S=nn（不跳 max_range、不反复开关 AUTORANGE、不降 5%），
         # 1/4 到等待结束之间换挡会跳过 dwell 直接重等；Run 结束才恢复 AUTORANGE 0 + 5%。
         settings_two_ar = default_settings()
         settings_two_ar["resource"] = "GPIB0::18::INSTR"
@@ -562,22 +573,21 @@ class LR700BackendTests(unittest.TestCase):
         state_settle = _FakeVisaState()
         state_settle.range_index = 2  # 桥已在 200 mOhm，不得被强行拉到 2 MOhm (9R)
         state_settle.excitation_index = 0
-        state_settle.autorange_trace = 4
+        state_settle.autorange_trace = 1  # 模拟仪表原本停在出厂 Default T=1
         state_settle.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
         state_settle.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
         state_settle.resistance_reply_by_sensor[2] = "+19.626 M OHMR"
         state_settle.reactance_reply_by_sensor[2] = "+0.061 M OHMX"
-        state_settle.autorange_target_by_sensor[1] = (2, 3)
-        # GET 6 顺序（autorange=1 起）：run_start回读(不变)、
+        # GET 6 顺序（autorange=1 起）：run_start回读(不变，已在 2R/3E)、
         # R1 _switch前状态查询(不变)、R1 _switch后回读(不变)、
-        # R1 1/4 点(仍在 2R/3E)、R1 结束点(模拟跳到 3R/0E -> 触发重等)、
+        # R1 1/4 点(仍在 2R/3E)、R1 结束点(模拟跳到 3R/5E -> 触发重等)、
         # 重等 1/4 点(2R/3E)、重等结束点(不变)、R1 before/after(不变)。
         state_settle.autorange_get6_shifts = [
             None,
             None,
             None,
             None,
-            (3, 0),
+            (3, 5),
             (2, 3),
         ]
         waits_settle: list[float] = []
@@ -594,6 +604,16 @@ class LR700BackendTests(unittest.TestCase):
         run_start(backend_settle, context_settle)
         self.assertEqual(state_settle.autorange, 1)
         self.assertEqual(state_settle.range_index, 2)
+        # 200 mOhm (2R) 必须同步自定义 trace 表对应的 600 uV (3E -> 3 mA)，而不是停在安全态 0E。
+        self.assertEqual(state_settle.excitation_index, 3)
+        self.assertEqual(state_settle.autorange_trace, 4)
+        self.assertEqual(
+            state_settle.autorange_user_trace,
+            (0, 1, 3, 5, 6, 6, 6, 6, 6, 6),
+        )
+        self.assertIn(("write", "AUTORANGE U=0135666666"), state_settle.commands)
+        self.assertIn(("write", "AUTORANGE T=4"), state_settle.commands)
+        self.assertIn(("write", "EXCITATION 3"), state_settle.commands)
         self.assertNotIn(("write", "RANGE 9"), state_settle.commands)
 
         writes_before_measure = len(state_settle.commands)
@@ -615,7 +635,7 @@ class LR700BackendTests(unittest.TestCase):
             for action, cmd in state_settle.commands[writes_before_r2:]
             if action == "write"
         ]
-        # 共用 L=19 与 FILTER 1：切到 R2 只发一条 SELECT S=02。
+        # 共用 L=19 与 FILTER 1 且激励符合 trace 表：切到 R2 只发一条 SELECT S=02。
         self.assertEqual(writes_r2, ["SELECT S=02"])
         self.assertEqual(
             waits_settle,
@@ -636,17 +656,6 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(len(settle_rows), 2)
         self.assertAlmostEqual(settle_rows[0]["R1"], 0.015248, places=6)
         self.assertAlmostEqual(settle_rows[1]["R2"], 0.019626, places=6)
-        self.assertEqual(state_settle.autorange_trace, 4)
-        self.assertFalse(
-            any(
-                action == "write"
-                and (
-                    cmd.upper().startswith("AUTORANGE T=")
-                    or cmd.upper().startswith("AUTORANGE U=")
-                )
-                for action, cmd in state_settle.commands
-            )
-        )
         # Run 结束时恢复 AUTORANGE 0 + 5% 最低激励，并刷新状态页当前电流。
         ended = run_end(backend_settle, "completed", context_settle)
         self.assertEqual(state_settle.autorange, 0)
@@ -658,11 +667,10 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(ended["Current Excitation (%)"], 5)
         self.assertEqual(ended["Current Excitation Current"], "5 uA")
 
-        # 场景 B：读数瞬间从 3R 步进到 2R/3E（3 mA）：
+        # 场景 B：读数瞬间从 3R/5E 步进到 2R/3E（3 mA）：
         # 后端必须重新等待完整 1/4 + 3/4 switch_settle_seconds 与 dwell_seconds 并刷新温场快照后再重读。
         state = _FakeVisaState()
         state.range_index = 3
-        state.autorange_trace = 4
         state.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
         state.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
         waits: list[float] = []
@@ -687,7 +695,7 @@ class LR700BackendTests(unittest.TestCase):
         context = self._context(messages, samples)
         open_module(backend, context)
         backend.configure(settings, context)
-        state.autorange_target_by_sensor[1] = (3, 0)
+        state.autorange_target_by_sensor[1] = (3, 5)
         run_start(backend, context)
         state.autorange_mid_read_shift = (2, 3)
         measure_module(backend, context, 1)
@@ -723,15 +731,15 @@ class LR700BackendTests(unittest.TestCase):
         # 场景 C：连续两轮 1/4 与结束点都不一致（超过 retry_attempts=2），必须报不稳定并立即恢复安全状态。
         state_osc = _FakeVisaState()
         state_osc.range_index = 5
-        state_osc.autorange_target_by_sensor[1] = (5, 0)
+        state_osc.autorange_target_by_sensor[1] = (5, 6)
         state_osc.autorange_get6_shifts = [
             None,
             None,
             None,
             None,
-            (4, 0),
+            (4, 6),
             None,
-            (3, 0),
+            (3, 5),
         ]
         backend_osc = self._backend(state_osc, [])
         context_osc = self._context([], _samples(1))
@@ -744,15 +752,15 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(state_osc.autorange, 0)
         self.assertEqual(state_osc.excitation_percent, 5)
 
-        # 场景 D：S1 停在 0R（10 mA，L=09）切换到 S2（L=29，最大仅 100 uA），
-        # 必须先降 5% 并升量程至 2R 再发 SELECT S=02，接通 S2 后峰值电流不得超过 100 uA。
+        # 场景 D：S1 停在 1R（20 mOhm, 60 uV -> 3 mA，L=19）切换到 S2（L=49，20 Ohm 以上最大仅 1 mA），
+        # 必须先降 5% 并升量程至 4R 再发 SELECT S=02，然后同步 6E (20 mV)，接通 S2 后峰值电流不超过 1 mA。
         settings_limit = default_settings()
         settings_limit["resource"] = "GPIB0::18::INSTR"
         settings_limit["channels"]["r1"].update({
             "input_channel": 1,
             "enabled": True,
             "range_mode": "autorange",
-            "autorange_min_range": 0,
+            "autorange_min_range": 1,
             "autorange_max_range": 9,
             "filter_index": 1,
         })
@@ -760,19 +768,19 @@ class LR700BackendTests(unittest.TestCase):
             "input_channel": 2,
             "enabled": True,
             "range_mode": "autorange",
-            "autorange_min_range": 2,
+            "autorange_min_range": 4,
             "autorange_max_range": 9,
             "filter_index": 1,
         })
         state_lim = _FakeVisaState()
-        state_lim.range_index = 0
+        state_lim.range_index = 1
         state_lim.excitation_index = 0
-        state_lim.autorange_target_by_sensor[1] = (0, 0)  # 2 mOhm, 20 uV -> 10 mA
-        state_lim.autorange_target_by_sensor[2] = (2, 0)  # 200 mOhm, 20 uV -> 100 uA
-        state_lim.resistance_reply_by_sensor[1] = "+1.00000 M OHMR"
-        state_lim.reactance_reply_by_sensor[1] = "+0.01000 M OHMX"
-        state_lim.resistance_reply_by_sensor[2] = "+15.248 M OHMR"
-        state_lim.reactance_reply_by_sensor[2] = "+0.067 M OHMX"
+        state_lim.autorange_target_by_sensor[1] = (1, 1)  # 20 mOhm, 60 uV -> 3 mA
+        state_lim.autorange_target_by_sensor[2] = (4, 6)  # 20 Ohm, 20 mV -> 1 mA
+        state_lim.resistance_reply_by_sensor[1] = "+10.0000 M OHMR"
+        state_lim.reactance_reply_by_sensor[1] = "+0.0100 M OHMX"
+        state_lim.resistance_reply_by_sensor[2] = "+12.3450  OHMR"
+        state_lim.reactance_reply_by_sensor[2] = "+0.0200  OHMX"
         backend_lim = self._backend(state_lim, [])
         context_lim = self._context([], _samples(4))
         open_module(backend_lim, context_lim)
@@ -788,9 +796,10 @@ class LR700BackendTests(unittest.TestCase):
             for action, cmd in state_lim.commands[writes_before_s2:]
             if action == "write"
         ]
-        # 必须先降 5%、升到 RANGE 2，再发 SELECT S=02！
+        # 必须先降 5%、升到 RANGE 4，再发 SELECT S=02，并同步 4R 对应激励 EXCITATION 6！
         self.assertLess(writes_s2.index("VAREXC 1"), writes_s2.index("SELECT S=02"))
-        self.assertLess(writes_s2.index("RANGE 2"), writes_s2.index("SELECT S=02"))
+        self.assertLess(writes_s2.index("RANGE 4"), writes_s2.index("SELECT S=02"))
+        self.assertIn("EXCITATION 6", writes_s2)
         s2_select_idx = next(
             i
             for i, (cmd, _cur) in enumerate(state_lim.current_trace)
@@ -799,11 +808,13 @@ class LR700BackendTests(unittest.TestCase):
         peak_on_s2 = max(
             cur for _cmd, cur in state_lim.current_trace[s2_select_idx:]
         )
-        self.assertLessEqual(peak_on_s2, 100.0e-6 + 1e-12)
+        self.assertLessEqual(peak_on_s2, 1.0e-3 + 1e-12)
 
-        # 场景 E：缓存异阻值切换（S1=2R/3E，S2=8R/3E，共用 L=19）：
-        # 第一轮稳定后各自缓存；第二轮切回 S1 与切回 S2 均先降 5% 再直达各自缓存档位；
-        # 若连续测同一量程（S1->S1）则仍只发 SELECT S=01。
+        # 场景 E：缓存异阻值切换（S1=1R/20 mOhm，S2=8R/200 kOhm，共用 L=19）：
+        # 第一轮稳定后各自缓存量程；第二轮写回缓存量程时必须按自定义 trace 表更新对应激发电流：
+        # - 切回 S1 (1R) 须先降 5%、经 RANGE 7/EXCITATION 0 降到 RANGE 1，并写入 EXCITATION 1 (60 uV -> 3 mA)；
+        # - 切回 S2 (8R) 须先降 5%、先升 RANGE 8 再 SELECT S=02，并写入 EXCITATION 6 (20 mV -> 100 nA)；
+        # - 若连续测同一量程且激励匹配 trace（S1->S1）则仍只发 SELECT S=01。
         settings_mixed = default_settings()
         settings_mixed["resource"] = "GPIB0::18::INSTR"
         for key, sensor in (("r1", 1), ("r2", 2)):
@@ -816,9 +827,9 @@ class LR700BackendTests(unittest.TestCase):
                 "filter_index": 1,
             })
         state_mix = _FakeVisaState()
-        state_mix.range_index = 2
-        state_mix.autorange_target_by_sensor[1] = (2, 3)  # 200 mOhm, 3 mA
-        state_mix.autorange_target_by_sensor[2] = (8, 3)  # 200 kOhm, 3 nA
+        state_mix.range_index = 1
+        state_mix.autorange_target_by_sensor[1] = (1, 1)  # 20 mOhm, 60 uV -> 3 mA
+        state_mix.autorange_target_by_sensor[2] = (8, 6)  # 200 kOhm, 20 mV -> 100 nA
         state_mix.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
         state_mix.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
         state_mix.resistance_reply_by_sensor[2] = "+100.000 K OHMR"
@@ -828,15 +839,15 @@ class LR700BackendTests(unittest.TestCase):
         open_module(backend_mix, context_mix)
         backend_mix.configure(settings_mixed, context_mix)
         run_start(backend_mix, context_mix)
-        # 第 1 轮：S1 稳定在 2R/3E；S2 稳定在 8R/3E。
+        # 第 1 轮：S1 稳定在 1R/1E；S2 稳定在 8R/6E。
         measure_module(backend_mix, context_mix, 1)
         state_mix.range_index = 8
-        state_mix.excitation_index = 3
+        state_mix.excitation_index = 6
         measure_module(backend_mix, context_mix, 2)
-        self.assertEqual(backend_mix._autorange_last_state[1], (2, 3))
-        self.assertEqual(backend_mix._autorange_last_state[2], (8, 3))
+        self.assertEqual(backend_mix._autorange_last_range[1], 1)
+        self.assertEqual(backend_mix._autorange_last_range[2], 8)
 
-        # 第 2 轮从 S2 (8R) 切回 S1 (缓存 2R/3E)：先降 5%，切 SELECT S=01，经 RANGE 7/EXCITATION 0 降到 RANGE 2 + EXCITATION 3。
+        # 第 2 轮从 S2 (8R) 切回 S1 (缓存 1R)：写回 RANGE 1 时同步写入 EXCITATION 1 (60 uV -> 3 mA)。
         state_mix.autorange_target_by_sensor.clear()
         writes_before_back_s1 = len(state_mix.commands)
         measure_module(backend_mix, context_mix, 1)
@@ -847,14 +858,30 @@ class LR700BackendTests(unittest.TestCase):
         ]
         self.assertIn("VAREXC 1", writes_back_s1)
         self.assertIn("RANGE 7", writes_back_s1)
-        self.assertIn("RANGE 2", writes_back_s1)
-        self.assertIn("EXCITATION 3", writes_back_s1)
+        self.assertIn("RANGE 1", writes_back_s1)
+        self.assertIn("EXCITATION 1", writes_back_s1)
+        self.assertIn("AUTORANGE U=0135666666", writes_back_s1)
+        self.assertIn("AUTORANGE T=4", writes_back_s1)
         self.assertLess(
             writes_back_s1.index("SELECT S=01"),
-            writes_back_s1.index("RANGE 2"),
+            writes_back_s1.index("RANGE 1"),
+        )
+        self.assertLess(
+            writes_back_s1.index("RANGE 1"),
+            writes_back_s1.index("EXCITATION 1"),
+        )
+        self.assertEqual(state_mix.range_index, 1)
+        self.assertEqual(state_mix.excitation_index, 1)
+        self.assertAlmostEqual(
+            excitation_current_a(
+                state_mix.range_index,
+                state_mix.excitation_index,
+                state_mix.excitation_percent,
+            ),
+            3.0e-3,
         )
 
-        # 再测 S1（当前已在 2R 且与 S1 缓存 2R 一致）：仅发 SELECT S=01！
+        # 再测 S1（当前已在 1R/1E 且与 S1 缓存量程一致）：仅发 SELECT S=01！
         writes_before_same = len(state_mix.commands)
         measure_module(backend_mix, context_mix, 1)
         writes_same = [
@@ -864,7 +891,8 @@ class LR700BackendTests(unittest.TestCase):
         ]
         self.assertEqual(writes_same, ["SELECT S=01"])
 
-        # 再从 S1 (2R) 切回 S2 (缓存 8R/3E)：先降 5%，先升 RANGE 8 再发 SELECT S=02！
+        # 再从 S1 (1R) 切回 S2 (缓存 8R)：先降 5%、先升 RANGE 8 再发 SELECT S=02，并同步 EXCITATION 6 (20 mV -> 100 nA)！
+        state_mix.current_trace.clear()
         writes_before_back_s2 = len(state_mix.commands)
         measure_module(backend_mix, context_mix, 2)
         writes_back_s2 = [
@@ -874,9 +902,21 @@ class LR700BackendTests(unittest.TestCase):
         ]
         self.assertIn("VAREXC 1", writes_back_s2)
         self.assertIn("RANGE 8", writes_back_s2)
+        self.assertIn("EXCITATION 6", writes_back_s2)
         self.assertLess(
             writes_back_s2.index("RANGE 8"),
             writes_back_s2.index("SELECT S=02"),
+        )
+        self.assertEqual(state_mix.range_index, 8)
+        self.assertEqual(state_mix.excitation_index, 6)
+        s2_back_idx = next(
+            i
+            for i, (cmd, _cur) in enumerate(state_mix.current_trace)
+            if cmd == "SELECT S=02"
+        )
+        self.assertLessEqual(
+            max(cur for _cmd, cur in state_mix.current_trace[s2_back_idx:]),
+            100.0e-9 + 1e-15,
         )
 
         # 自动量程多次重试重等稳定也必须纳入单次 Measure 超时预算。
@@ -1318,17 +1358,19 @@ class LR700BackendTests(unittest.TestCase):
                 )
         self.assertEqual(state.opened, [])
 
-        # 自动量程要求上限严格大于下限；固定量程模式下停用的自动量程上下限不阻断 Apply。
-        bad_ar = default_settings()
-        bad_ar["resource"] = "GPIB0::18::INSTR"
-        bad_ar["channels"]["r1"].update({
-            "range_mode": "autorange",
-            "autorange_min_range": 5,
-            "autorange_max_range": 5,
-        })
-        with self.assertRaises(ModuleError) as ar_err:
-            backend.configure(bad_ar, context)
-        self.assertEqual(ar_err.exception.code, "LR700_INVALID_SETTINGS")
+        # 自动量程要求上限严格大于下限且下限不得低于 20 mOhm (1)；固定量程模式下停用的自动量程上下限不阻断 Apply。
+        for bad_min, bad_max in ((5, 5), (0, 9)):
+            with self.subTest(bad_min=bad_min, bad_max=bad_max):
+                bad_ar = default_settings()
+                bad_ar["resource"] = "GPIB0::18::INSTR"
+                bad_ar["channels"]["r1"].update({
+                    "range_mode": "autorange",
+                    "autorange_min_range": bad_min,
+                    "autorange_max_range": bad_max,
+                })
+                with self.assertRaises(ModuleError) as ar_err:
+                    backend.configure(bad_ar, context)
+                self.assertEqual(ar_err.exception.code, "LR700_INVALID_SETTINGS")
         self.assertEqual(state.opened, [])
 
         fixed_with_stale_ar = default_settings()
@@ -1535,11 +1577,21 @@ class LR700FrontendTests(unittest.TestCase):
         frontend.show_status({"Connection": "Disconnected"})
 
         self.assertEqual(frontend.dump(), settings)
-        # r3 为自动量程：固定量程控件禁用、自动量程控件启用。
+        # r3 为自动量程：固定量程控件禁用、自动量程控件启用，且自动量程下拉仅含 20 mOhm (1) 及以上量程。
         self.assertFalse(frontend.channel_widgets["r3"]["range_index"].isEnabled())
-        self.assertTrue(
-            frontend.channel_widgets["r3"]["autorange_min_range"].isEnabled()
+        ar_min_widget = frontend.channel_widgets["r3"]["autorange_min_range"]
+        ar_max_widget = frontend.channel_widgets["r3"]["autorange_max_range"]
+        self.assertTrue(ar_min_widget.isEnabled())
+        self.assertEqual(
+            [ar_min_widget.itemData(i) for i in range(ar_min_widget.count())],
+            list(range(1, 9)),
         )
+        self.assertEqual(
+            [ar_max_widget.itemData(i) for i in range(ar_max_widget.count())],
+            list(range(2, 10)),
+        )
+        self.assertIn("T=4", frontend._current_previews["r3"].text())
+        self.assertIn("3 mA", frontend._current_previews["r3"].text())
         # 切换 r1 到 2 MOhm (9) 时，激励下拉只保留 2 mV / 6 mV / 20 mV (4, 5, 6)。
         r1_range = frontend.channel_widgets["r1"]["range_index"]
         r1_exc = frontend.channel_widgets["r1"]["excitation_index"]

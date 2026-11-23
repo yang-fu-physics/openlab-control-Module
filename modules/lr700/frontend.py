@@ -32,10 +32,13 @@ from labcontrol.measurement.frontend_api import ModuleUIAPI
 from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
+    AUTORANGE_MAX_RANGE_INDEX,
+    AUTORANGE_MIN_RANGE_INDEX,
     EXCITATIONS,
     FILTERS,
     RANGE_MODES,
     RESISTANCE_RANGES,
+    autorange_trace_excitation_index,
     default_settings,
     excitation_current_a,
     excitation_label,
@@ -218,10 +221,14 @@ class LR700Frontend(QWidget):
             excitation_percent.setSuffix(" %")
             excitation_percent.setSingleStep(5)
             autorange_min_range = QComboBox()
-            for index, label, _value in RESISTANCE_RANGES[:-1]:
+            for index, label, _value in RESISTANCE_RANGES[
+                AUTORANGE_MIN_RANGE_INDEX:AUTORANGE_MAX_RANGE_INDEX
+            ]:
                 autorange_min_range.addItem(label, index)
             autorange_max_range = QComboBox()
-            for index, label, _value in RESISTANCE_RANGES[1:]:
+            for index, label, _value in RESISTANCE_RANGES[
+                AUTORANGE_MIN_RANGE_INDEX + 1 : AUTORANGE_MAX_RANGE_INDEX + 1
+            ]:
                 autorange_max_range.addItem(label, index)
             digital_filter = QComboBox()
             for index, label, _seconds in FILTERS:
@@ -292,9 +299,10 @@ class LR700Frontend(QWidget):
             "Apply, Fixed-range switches, and every Run end/Stop/Error/"
             "Disable confirm the minimum available excitation for the "
             "current resistance range at 5% (20 uV on 2 mOhm-20 kOhm, "
-            "200 uV on 200 kOhm, 2 mV on 2 MOhm). Continuous Autorange "
-            "runs enable AUTORANGE 1 once at Run start and only send "
-            "SELECT (plus changed L=/FILTER) between Autorange slots. "
+            "200 uV on 200 kOhm, 2 mV on 2 MOhm). Autorange programs a "
+            "custom T=4 trace (20 mOhm-2 MOhm only: 60 uV @ 20 mOhm, "
+            "600 uV @ 200 mOhm, 6 mV @ 2 Ohm, 20 mV @ 20 Ohm-2 MOhm; "
+            "up to 3 mA) — not the factory Default/Min/Max Power trace. "
             "Enable only discovers resources. Test Connection is read-only. "
             "Apply Settings is always required."
         )
@@ -638,8 +646,24 @@ class LR700Frontend(QWidget):
             if lo >= hi:
                 label.setText("Invalid: Autorange max must exceed min")
                 return
+            i_low = excitation_current_a(
+                hi,
+                autorange_trace_excitation_index(hi),
+                100,
+            )
+            i_high = excitation_current_a(
+                lo,
+                autorange_trace_excitation_index(lo),
+                100,
+            )
+            current_span = (
+                format_current(i_high)
+                if abs(i_high - i_low) <= 1e-15
+                else f"{format_current(i_low)} - {format_current(i_high)}"
+            )
             label.setText(
-                f"Uses bridge trace ({range_label(lo)} - {range_label(hi)}, 100%)"
+                f"Custom trace T=4 ({range_label(lo)} - {range_label(hi)}, "
+                f"{current_span})"
             )
             return
         range_combo = widgets["range_index"]
