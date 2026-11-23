@@ -1,6 +1,7 @@
 """LR-700/LR-720-16 的底层 VISA、命令构造与响应解析。
 
-这里集中保存手册协议细节。模块生命周期、通道轮转、查询重试、数据异常降级和
+这里集中保存手册协议细节与 LR-700 所需的 GPIB 终止符/查询延迟配置，不修改主框架
+通用 ``VisaSession`` 的默认值。模块生命周期、通道轮转、查询重试、数据异常降级和
 最低激励恢复仍由 ``backend.py`` 决定。
 """
 
@@ -9,11 +10,52 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Any, Protocol
 
-from labcontrol.measurement.visa import VisaSession as PyVisaTransport
+from labcontrol.measurement.visa import VisaSession
 
-from .constants import SAFE_EXCITATION_INDEX, SAFE_EXCITATION_PERCENT
+from .constants import (
+    SAFE_EXCITATION_INDEX,
+    SAFE_EXCITATION_PERCENT,
+    minimum_excitation_index,
+)
+
+
+# 实机 GPIB（NI GPIB-USB-HS）验证可稳定连续写入/回读的 LR-700 适配参数：
+# 读取依赖 EOI（read_termination=None），写入以 "\n" 结尾，查询预留 0.2 s 仪表处理时间。
+LR700_READ_TERMINATION: str | None = None
+LR700_WRITE_TERMINATION = "\n"
+LR700_QUERY_DELAY_SECONDS = 0.2
+
+# 下降换挡中转量程：20 kOhm（编码 7）既支持 EXCITATION 0（20 uV），
+# 从 200 kOhm / 2 MOhm（2E / 4E）切到 20 kOhm 时在 5% 下激励电流不超过 5 nA。
+_SAFE_STEP_DOWN_RANGE_INDEX = 7
+
+
+class LR700VisaTransport(VisaSession):
+    """带 LR-700 专用 EOI 读取与查询延迟的 VISA 会话包装。"""
+
+    def __init__(
+        self,
+        address: str,
+        timeout_seconds: float,
+        *,
+        read_termination: str | None = LR700_READ_TERMINATION,
+        write_termination: str = LR700_WRITE_TERMINATION,
+        query_delay: float = LR700_QUERY_DELAY_SECONDS,
+        **attributes: Any,
+    ) -> None:
+        super().__init__(
+            address,
+            timeout_seconds,
+            read_termination=read_termination,
+            write_termination=write_termination,
+            query_delay=query_delay,
+            **attributes,
+        )
+
+
+PyVisaTransport = LR700VisaTransport
 
 
 class Transport(Protocol):
@@ -50,31 +92,87 @@ def variable_excitation_commands(percent: object) -> tuple[str, ...]:
     return (f"VAREXC ={value:02d}", "VAREXC 1")
 
 
+def _range_transition_commands(
+    target_range: int,
+    current_range_index: int | None,
+) -> tuple[str, ...]:
+    """从高阻量程（8/9，最低激励 2E/4E）向低阻量程切换时先经 20 kOhm 降至 0E。"""
+
+    if (
+        current_range_index is not None
+        and int(current_range_index) >= 8
+        and int(target_range) < _SAFE_STEP_DOWN_RANGE_INDEX
+    ):
+        return (
+            f"RANGE {_SAFE_STEP_DOWN_RANGE_INDEX}",
+            f"EXCITATION {SAFE_EXCITATION_INDEX}",
+            f"RANGE {int(target_range)}",
+        )
+    return (f"RANGE {int(target_range)}",)
+
+
 def configuration_commands(
     input_channel: object,
     channel: Mapping[str, object],
+    *,
+    current_range_index: int | None = None,
 ) -> tuple[str, ...]:
-    """生成当前传感器的完整绝对配置，不依赖桥内旧状态。"""
+    """生成当前传感器的完整绝对配置，并保证切换中间态不提前抬高激励。
 
+    调用前桥应处于最低激励 x 5%。固定量程模式先切传感器、量程、激励档和滤波，
+    最后才抬升激励百分比；自动量程模式先切传感器并置于最高允许电阻量程（电流最小）
+    与最低激励，再写入 ``AUTORANGE L=`` 并开启 ``AUTORANGE 1``，不下发
+    ``AUTORANGE T=`` 以保留仪器上预先配置的跟踪曲线。
+    """
+
+    mode = str(channel.get("range_mode", "fixed")).strip().casefold()
+    filter_index = int(channel["filter_index"])
+    if mode == "autorange":
+        min_range = int(channel["autorange_min_range"])
+        max_range = int(channel["autorange_max_range"])
+        start_excitation = minimum_excitation_index(max_range)
+        return (
+            "AUTORANGE 0",
+            "MODE 0",
+            f"SELECT S={int(input_channel):02d}",
+            *_range_transition_commands(max_range, current_range_index),
+            f"EXCITATION {start_excitation}",
+            f"FILTER {filter_index}",
+            "VAREXC 0",
+            f"AUTORANGE L={min_range}{max_range}",
+            "AUTORANGE 1",
+        )
+
+    target_range = int(channel["range_index"])
+    target_excitation = int(channel["excitation_index"])
     return (
         "AUTORANGE 0",
         "MODE 0",
         f"SELECT S={int(input_channel):02d}",
-        f"RANGE {int(channel['range_index'])}",
-        f"EXCITATION {int(channel['excitation_index'])}",
+        *_range_transition_commands(target_range, current_range_index),
+        f"EXCITATION {target_excitation}",
+        f"FILTER {filter_index}",
         *variable_excitation_commands(channel["excitation_percent"]),
-        f"FILTER {int(channel['filter_index'])}",
     )
 
 
-def safe_state_commands() -> tuple[str, ...]:
-    """LR-700 没有 Off；返回可读回确认的最低激励绝对命令。"""
+def safe_state_commands(range_index: int | None = None) -> tuple[str, ...]:
+    """LR-700 没有 Off；返回当前量程可读回确认的最低激励绝对命令。
 
+    先退出自动量程并将激励百分比降至 5%，再把激励档降到当前量程允许的最低档
+    （0-7 -> 0；8 -> 2；9 -> 4），避免高阻档下发送 EXCITATION 0 被仪表静默拒绝。
+    """
+
+    excitation_index = (
+        minimum_excitation_index(range_index)
+        if range_index is not None
+        else SAFE_EXCITATION_INDEX
+    )
     return (
         "AUTORANGE 0",
-        f"EXCITATION {SAFE_EXCITATION_INDEX}",
         f"VAREXC ={SAFE_EXCITATION_PERCENT:02d}",
         "VAREXC 1",
+        f"EXCITATION {excitation_index}",
     )
 
 
@@ -163,6 +261,10 @@ def parse_overloads(reply: str) -> int:
 
 
 __all__ = [
+    "LR700_QUERY_DELAY_SECONDS",
+    "LR700_READ_TERMINATION",
+    "LR700_WRITE_TERMINATION",
+    "LR700VisaTransport",
     "Transport",
     "PyVisaTransport",
     "GET_RESISTANCE",
