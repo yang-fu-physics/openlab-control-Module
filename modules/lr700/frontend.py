@@ -1,8 +1,9 @@
 """LR-700 + LR-720-16 Measurement Module 的 PySide6 前端。
 
-前端只编辑 desired settings、显示只读状态并发送手动动作请求。所有边界、总超时、
-仪表协议、写入读回和最低激励确认都由独立 worker 中的后端重新验证；Load Settings
-或 Load SEQ 只填充控件，不会自动连接或 Apply。
+前端只编辑 desired settings、按手册约束动态同步合法量程/激励选项、显示只读状态并发送
+手动动作请求。所有边界、3 倍滤波等待、总超时、仪表协议、写入读回和按量程最低激励
+确认都由独立 worker 中的后端重新验证；Load Settings 或 Load SEQ 只填充控件，不会
+自动连接或 Apply。
 """
 
 from __future__ import annotations
@@ -31,10 +32,18 @@ from labcontrol.measurement.frontend_api import ModuleUIAPI
 from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
+    AUTORANGE_TRACES,
     EXCITATIONS,
     FILTERS,
+    RANGE_MODES,
     RESISTANCE_RANGES,
+    autorange_peak_current_a,
     default_settings,
+    excitation_current_a,
+    excitation_label,
+    format_current,
+    range_label,
+    valid_excitation_indices,
 )
 
 
@@ -44,7 +53,7 @@ class _SettingsPage(QWidget):
     def sizeHint(self) -> QSize:  # noqa: N802
         # 四个逻辑槽位按 2×2 排列；1180 宽可完整展示两列参数，更小屏幕或 4K
         # 高缩放仍可使用内部横向、纵向滚动条访问全部控件。
-        return QSize(1180, 700)
+        return QSize(1180, 760)
 
 
 class LR700Frontend(QWidget):
@@ -57,6 +66,7 @@ class LR700Frontend(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._build_settings(self))
         self.status_widget = self._build_status_widget()
+        self.load(default_settings())
 
     def _build_settings(
         self,
@@ -153,9 +163,10 @@ class LR700Frontend(QWidget):
             3,
         )
         timing_note = QLabel(
-            "Settle must be at least the longest enabled "
-            "digital filter. One Measure scans every enabled "
-            "R slot and writes one sparse DAT row per slot."
+            "Settle must be at least 3x the longest enabled "
+            "digital filter (1 s -> 3 s, 3 s -> 9 s, 10 s -> 30 s). "
+            "One Measure scans every enabled R slot and writes "
+            "one sparse DAT row per slot."
         )
         timing_note.setWordWrap(True)
         timing_layout.addWidget(
@@ -178,6 +189,7 @@ class LR700Frontend(QWidget):
             str,
             dict[str, QWidget],
         ] = {}
+        self._current_previews: dict[str, QLabel] = {}
         for slot in range(1, 5):
             key = f"r{slot}"
             group = QGroupBox(f"R{slot}")
@@ -189,6 +201,9 @@ class LR700Frontend(QWidget):
             )
             enabled = QCheckBox("Enable channel")
             enabled.setAccessibleName(f"Enable R{slot}")
+            range_mode = QComboBox()
+            for mode_value, mode_label in RANGE_MODES:
+                range_mode.addItem(mode_label, mode_value)
             resistance_range = QComboBox()
             for index, label, _value in (
                 RESISTANCE_RANGES
@@ -204,15 +219,30 @@ class LR700Frontend(QWidget):
             excitation_percent.setRange(5, 100)
             excitation_percent.setSuffix(" %")
             excitation_percent.setSingleStep(5)
+            autorange_min_range = QComboBox()
+            for index, label, _value in RESISTANCE_RANGES[:-1]:
+                autorange_min_range.addItem(label, index)
+            autorange_max_range = QComboBox()
+            for index, label, _value in RESISTANCE_RANGES[1:]:
+                autorange_max_range.addItem(label, index)
+            autorange_trace = QComboBox()
+            for trace_index, trace_label in AUTORANGE_TRACES:
+                autorange_trace.addItem(trace_label, trace_index)
             digital_filter = QComboBox()
             for index, label, _seconds in FILTERS:
                 digital_filter.addItem(label, index)
+            current_preview = QLabel("-")
+            current_preview.setWordWrap(True)
 
             form.addRow(
                 "Physical sensor (1-16)",
                 input_channel,
             )
             form.addRow("", enabled)
+            form.addRow(
+                "Range mode",
+                range_mode,
+            )
             form.addRow(
                 "Resistance range",
                 resistance_range,
@@ -226,19 +256,40 @@ class LR700Frontend(QWidget):
                 excitation_percent,
             )
             form.addRow(
+                "Autorange min (L low)",
+                autorange_min_range,
+            )
+            form.addRow(
+                "Autorange max (L high)",
+                autorange_max_range,
+            )
+            form.addRow(
+                "Autorange trace (T)",
+                autorange_trace,
+            )
+            form.addRow(
                 "Digital filter",
                 digital_filter,
+            )
+            form.addRow(
+                "Calculated current",
+                current_preview,
             )
             self.channel_widgets[key] = {
                 "input_channel": input_channel,
                 "enabled": enabled,
+                "range_mode": range_mode,
                 "range_index": resistance_range,
                 "excitation_index": excitation,
                 "excitation_percent": (
                     excitation_percent
                 ),
+                "autorange_min_range": autorange_min_range,
+                "autorange_max_range": autorange_max_range,
+                "autorange_trace": autorange_trace,
                 "filter_index": digital_filter,
             }
+            self._current_previews[key] = current_preview
             channels_layout.addWidget(
                 group,
                 (slot - 1) // 2,
@@ -250,9 +301,10 @@ class LR700Frontend(QWidget):
             "Important: LR-700 has no excitation-off command. "
             "Before switching sensors and after Measure/Stop/"
             "Error/Disable, the module confirms the minimum "
-            "available state: 20 uV x 5% = 1 uV full scale. "
-            "Enable only discovers resources. Test Connection "
-            "is read-only. Apply Settings is always required."
+            "available excitation for the current resistance range "
+            "at 5% (20 uV on 2 mOhm-20 kOhm, 200 uV on 200 kOhm, "
+            "2 mV on 2 MOhm). Enable only discovers resources. "
+            "Test Connection is read-only. Apply Settings is always required."
         )
         safety_note.setWordWrap(True)
         safety_note.setStyleSheet(
@@ -271,6 +323,43 @@ class LR700Frontend(QWidget):
         layout.addStretch(1)
         scroll.setWidget(content)
         outer.addWidget(scroll)
+
+        for key, widgets in self.channel_widgets.items():
+            range_mode_combo = widgets["range_mode"]
+            range_combo = widgets["range_index"]
+            excitation_combo = widgets["excitation_index"]
+            percent_spin = widgets["excitation_percent"]
+            ar_min_combo = widgets["autorange_min_range"]
+            ar_max_combo = widgets["autorange_max_range"]
+            ar_trace_combo = widgets["autorange_trace"]
+            assert isinstance(range_mode_combo, QComboBox)
+            assert isinstance(range_combo, QComboBox)
+            assert isinstance(excitation_combo, QComboBox)
+            assert isinstance(percent_spin, QSpinBox)
+            assert isinstance(ar_min_combo, QComboBox)
+            assert isinstance(ar_max_combo, QComboBox)
+            assert isinstance(ar_trace_combo, QComboBox)
+            range_mode_combo.currentIndexChanged.connect(
+                lambda _idx, ch=key: self._sync_channel_controls(ch)
+            )
+            range_combo.currentIndexChanged.connect(
+                lambda _idx, ch=key: self._on_range_changed(ch)
+            )
+            excitation_combo.currentIndexChanged.connect(
+                lambda _idx, ch=key: self._update_current_preview(ch)
+            )
+            percent_spin.valueChanged.connect(
+                lambda _val, ch=key: self._update_current_preview(ch)
+            )
+            ar_min_combo.currentIndexChanged.connect(
+                lambda _idx, ch=key: self._update_current_preview(ch)
+            )
+            ar_max_combo.currentIndexChanged.connect(
+                lambda _idx, ch=key: self._update_current_preview(ch)
+            )
+            ar_trace_combo.currentIndexChanged.connect(
+                lambda _idx, ch=key: self._update_current_preview(ch)
+            )
 
         return page
 
@@ -295,6 +384,7 @@ class LR700Frontend(QWidget):
             "Current Range Index",
             "Current Excitation Index",
             "Current Excitation (%)",
+            "Current Excitation Current",
             "Current Filter Index",
             "Last Slot / Sensor",
             "Last Resistance (Ohm)",
@@ -338,52 +428,37 @@ class LR700Frontend(QWidget):
 
         channels: dict[str, dict[str, Any]] = {}
         for key, widgets in self.channel_widgets.items():
-            input_channel = widgets[
-                "input_channel"
-            ]
+            input_channel = widgets["input_channel"]
             enabled = widgets["enabled"]
-            resistance_range = widgets[
-                "range_index"
-            ]
-            excitation = widgets[
-                "excitation_index"
-            ]
-            percent = widgets[
-                "excitation_percent"
-            ]
-            digital_filter = widgets[
-                "filter_index"
-            ]
+            range_mode = widgets["range_mode"]
+            resistance_range = widgets["range_index"]
+            excitation = widgets["excitation_index"]
+            percent = widgets["excitation_percent"]
+            ar_min = widgets["autorange_min_range"]
+            ar_max = widgets["autorange_max_range"]
+            ar_trace = widgets["autorange_trace"]
+            digital_filter = widgets["filter_index"]
             assert isinstance(input_channel, QSpinBox)
             assert isinstance(enabled, QCheckBox)
-            assert isinstance(
-                resistance_range,
-                QComboBox,
-            )
-            assert isinstance(
-                excitation,
-                QComboBox,
-            )
+            assert isinstance(range_mode, QComboBox)
+            assert isinstance(resistance_range, QComboBox)
+            assert isinstance(excitation, QComboBox)
             assert isinstance(percent, QSpinBox)
-            assert isinstance(
-                digital_filter,
-                QComboBox,
-            )
+            assert isinstance(ar_min, QComboBox)
+            assert isinstance(ar_max, QComboBox)
+            assert isinstance(ar_trace, QComboBox)
+            assert isinstance(digital_filter, QComboBox)
             channels[key] = {
                 "input_channel": input_channel.value(),
                 "enabled": enabled.isChecked(),
-                "range_index": int(
-                    resistance_range.currentData()
-                ),
-                "excitation_index": int(
-                    excitation.currentData()
-                ),
-                "excitation_percent": (
-                    percent.value()
-                ),
-                "filter_index": int(
-                    digital_filter.currentData()
-                ),
+                "range_mode": str(range_mode.currentData() or "fixed"),
+                "range_index": int(resistance_range.currentData()),
+                "excitation_index": int(excitation.currentData()),
+                "excitation_percent": percent.value(),
+                "autorange_min_range": int(ar_min.currentData()),
+                "autorange_max_range": int(ar_max.currentData()),
+                "autorange_trace": int(ar_trace.currentData()),
+                "filter_index": int(digital_filter.currentData()),
             }
         return {
             "resource": str(self.resource.currentData() or ""),
@@ -447,66 +522,46 @@ class LR700Frontend(QWidget):
                 **dict(supplied),
             }
             widgets = self.channel_widgets[key]
-            input_channel = widgets[
-                "input_channel"
-            ]
+            input_channel = widgets["input_channel"]
             enabled = widgets["enabled"]
-            resistance_range = widgets[
-                "range_index"
-            ]
-            excitation = widgets[
-                "excitation_index"
-            ]
-            percent = widgets[
-                "excitation_percent"
-            ]
-            digital_filter = widgets[
-                "filter_index"
-            ]
+            range_mode = widgets["range_mode"]
+            resistance_range = widgets["range_index"]
+            excitation = widgets["excitation_index"]
+            percent = widgets["excitation_percent"]
+            ar_min = widgets["autorange_min_range"]
+            ar_max = widgets["autorange_max_range"]
+            ar_trace = widgets["autorange_trace"]
+            digital_filter = widgets["filter_index"]
             assert isinstance(input_channel, QSpinBox)
             assert isinstance(enabled, QCheckBox)
-            assert isinstance(
-                resistance_range,
-                QComboBox,
-            )
-            assert isinstance(
-                excitation,
-                QComboBox,
-            )
+            assert isinstance(range_mode, QComboBox)
+            assert isinstance(resistance_range, QComboBox)
+            assert isinstance(excitation, QComboBox)
             assert isinstance(percent, QSpinBox)
-            assert isinstance(
-                digital_filter,
-                QComboBox,
-            )
-            input_channel.setValue(
-                int(channel["input_channel"])
-            )
-            enabled.setChecked(
-                bool(channel["enabled"])
-            )
+            assert isinstance(ar_min, QComboBox)
+            assert isinstance(ar_max, QComboBox)
+            assert isinstance(ar_trace, QComboBox)
+            assert isinstance(digital_filter, QComboBox)
+            input_channel.setValue(int(channel["input_channel"]))
+            enabled.setChecked(bool(channel["enabled"]))
             self._select_data(
-                resistance_range,
-                int(channel["range_index"]),
+                range_mode,
+                str(channel.get("range_mode", "fixed")).strip().casefold(),
             )
-            self._select_data(
-                excitation,
-                int(
-                    channel[
-                        "excitation_index"
-                    ]
-                ),
+            range_index = int(channel["range_index"])
+            self._select_data(resistance_range, range_index)
+            self._populate_excitation_options(
+                key,
+                range_index,
+                preferred=int(channel["excitation_index"]),
+                keep_invalid=True,
             )
-            percent.setValue(
-                int(
-                    channel[
-                        "excitation_percent"
-                    ]
-                )
-            )
-            self._select_data(
-                digital_filter,
-                int(channel["filter_index"]),
-            )
+            percent.setValue(int(channel["excitation_percent"]))
+            self._select_data(ar_min, int(channel["autorange_min_range"]))
+            self._select_data(ar_max, int(channel["autorange_max_range"]))
+            self._select_data(ar_trace, int(channel["autorange_trace"]))
+            self._select_data(digital_filter, int(channel["filter_index"]))
+            self._sync_channel_controls(key)
         del blockers
 
     def show_status(
@@ -526,6 +581,112 @@ class LR700Frontend(QWidget):
                 )
             else:
                 label.setText(str(value))
+
+    def _on_range_changed(self, key: str) -> None:
+        widgets = self.channel_widgets[key]
+        range_combo = widgets["range_index"]
+        excitation_combo = widgets["excitation_index"]
+        assert isinstance(range_combo, QComboBox)
+        assert isinstance(excitation_combo, QComboBox)
+        range_index = int(range_combo.currentData())
+        previous = excitation_combo.currentData()
+        preferred = int(previous) if isinstance(previous, int) else None
+        self._populate_excitation_options(
+            key,
+            range_index,
+            preferred=preferred,
+            keep_invalid=False,
+        )
+        self._update_current_preview(key)
+
+    def _populate_excitation_options(
+        self,
+        key: str,
+        range_index: int,
+        *,
+        preferred: int | None,
+        keep_invalid: bool,
+    ) -> None:
+        excitation_combo = self.channel_widgets[key]["excitation_index"]
+        assert isinstance(excitation_combo, QComboBox)
+        allowed = valid_excitation_indices(range_index)
+        blocker = QSignalBlocker(excitation_combo)
+        excitation_combo.clear()
+        for idx in allowed:
+            excitation_combo.addItem(excitation_label(idx), idx)
+        if preferred is not None and preferred in allowed:
+            self._select_data(excitation_combo, preferred)
+        elif preferred is not None and keep_invalid and 0 <= preferred < len(EXCITATIONS):
+            excitation_combo.addItem(
+                f"{excitation_label(preferred)} (invalid on {range_label(range_index)})",
+                preferred,
+            )
+            self._select_data(excitation_combo, preferred)
+        elif allowed:
+            if preferred is not None:
+                nearest = min(allowed, key=lambda candidate: abs(candidate - preferred))
+                self._select_data(excitation_combo, nearest)
+            else:
+                excitation_combo.setCurrentIndex(0)
+        del blocker
+
+    def _sync_channel_controls(self, key: str) -> None:
+        widgets = self.channel_widgets[key]
+        range_mode_combo = widgets["range_mode"]
+        assert isinstance(range_mode_combo, QComboBox)
+        is_autorange = str(range_mode_combo.currentData() or "fixed") == "autorange"
+        for name in ("range_index", "excitation_index", "excitation_percent"):
+            widgets[name].setEnabled(not is_autorange)
+        for name in ("autorange_min_range", "autorange_max_range", "autorange_trace"):
+            widgets[name].setEnabled(is_autorange)
+        self._update_current_preview(key)
+
+    def _update_current_preview(self, key: str) -> None:
+        label = self._current_previews[key]
+        widgets = self.channel_widgets[key]
+        range_mode_combo = widgets["range_mode"]
+        assert isinstance(range_mode_combo, QComboBox)
+        mode = str(range_mode_combo.currentData() or "fixed")
+        if mode == "autorange":
+            ar_min = widgets["autorange_min_range"]
+            ar_max = widgets["autorange_max_range"]
+            ar_trace = widgets["autorange_trace"]
+            assert isinstance(ar_min, QComboBox)
+            assert isinstance(ar_max, QComboBox)
+            assert isinstance(ar_trace, QComboBox)
+            lo = int(ar_min.currentData())
+            hi = int(ar_max.currentData())
+            trace = int(ar_trace.currentData())
+            if lo >= hi:
+                label.setText("Invalid: Autorange max must exceed min")
+                return
+            peak = autorange_peak_current_a(lo, hi, trace)
+            label.setText(
+                f"<= {format_current(peak)} (at {range_label(lo)}, 100%)"
+            )
+            return
+        range_combo = widgets["range_index"]
+        excitation_combo = widgets["excitation_index"]
+        percent_spin = widgets["excitation_percent"]
+        assert isinstance(range_combo, QComboBox)
+        assert isinstance(excitation_combo, QComboBox)
+        assert isinstance(percent_spin, QSpinBox)
+        range_index = int(range_combo.currentData())
+        exc_data = excitation_combo.currentData()
+        if not isinstance(exc_data, int):
+            label.setText("-")
+            return
+        current = excitation_current_a(
+            range_index,
+            exc_data,
+            percent_spin.value(),
+        )
+        if exc_data not in valid_excitation_indices(range_index):
+            label.setText(
+                f"{format_current(current)} (unsupported on {range_label(range_index)})"
+            )
+            return
+        label.setText(format_current(current))
 
     def _load_resources(self) -> None:
         """从核心资源快照创建不可编辑下拉框，不在模块内扫描 VISA。"""

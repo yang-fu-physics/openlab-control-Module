@@ -1,8 +1,8 @@
-"""Linear Research LR-700 与 LR-720-16 的协议枚举和默认设置。
+"""Linear Research LR-700 与 LR-720-16 的协议枚举、合法组合与默认设置。
 
-这里的整数不是界面列表位置，而是 LR-700 手册规定的命令参数。协议表一旦写错，
-界面仍可能看似正常但会把错误量程或激励发给真实仪表，因此后端和测试都直接复用
-这些元组，不在其他文件重新维护第二份映射。
+这里的整数不是界面列表位置，而是 LR-700 v1.3 手册规定的命令参数。协议表一旦写错，
+界面仍可能看似正常但会把错误量程或激励发给真实仪表，因此后端、前端和测试都直接复用
+这些常量与辅助函数，不在其他文件重新维护第二份映射。
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 
-# RANGE <0-9>：索引、界面文字、对应满量程电阻（Ohm）。
+# RANGE <0-9>：索引、界面文字、对应满量程电阻（Ohm）。（手册 p. 3-46 / p. 4-12）
 RESISTANCE_RANGES: tuple[
     tuple[int, str, float],
     ...,
@@ -27,7 +27,7 @@ RESISTANCE_RANGES: tuple[
     (9, "2 MOhm", 2.0e6),
 )
 
-# EXCITATION <0-6>：索引、界面文字、100% 时的满量程激励电压（V）。
+# EXCITATION <0-6>：索引、界面文字、100% 时的满量程激励电压（V）。（手册 p. 3-34 / p. 4-12）
 EXCITATIONS: tuple[
     tuple[int, str, float],
     ...,
@@ -41,16 +41,56 @@ EXCITATIONS: tuple[
     (6, "20 mV", 20.0e-3),
 )
 
-# 只开放手册内置的三种数字滤波器。用户自定义 FILTER 3 还带第二个时间索引，
-# 其 GET 6 回读是可变字符串；首个真机版本先不引入这一额外歧义。
+# 手册 p. 4-4 / p. 4-12：电流源 100% 满量程范围为 1 nA 至 30 mA，
+# 因此不同电阻量程各自仅允许满足 1 nA <= V_fs / R_fs <= 30 mA 的激励档。
+# 200 kOhm 最低为 2 (200 uV)，2 MOhm 最低为 4 (2 mV)，已与实机逐档探测核对一致。
+VALID_EXCITATION_INDICES_BY_RANGE: dict[int, tuple[int, ...]] = {
+    0: (0, 1),
+    1: (0, 1, 2, 3),
+    2: (0, 1, 2, 3, 4, 5),
+    3: (0, 1, 2, 3, 4, 5, 6),
+    4: (0, 1, 2, 3, 4, 5, 6),
+    5: (0, 1, 2, 3, 4, 5, 6),
+    6: (0, 1, 2, 3, 4, 5, 6),
+    7: (0, 1, 2, 3, 4, 5, 6),
+    8: (2, 3, 4, 5, 6),
+    9: (4, 5, 6),
+}
+
+# 手册 p. 2-6 / p. 3-35：固定数字滤波编码 0/1/2 对应 1 s / 3 s / 10 s，不存在 Off 档。
+# 用户可变滤波 FILTER 3 带第二参数且 GET 6 回读附带括号时长文本，当前仅开放三个固定档。
 FILTERS: tuple[
     tuple[int, str, float],
     ...,
 ] = (
-    (0, "Off", 0.0),
-    (1, "1 s", 1.0),
+    (0, "1 s", 1.0),
+    (1, "3 s", 3.0),
     (2, "10 s", 10.0),
 )
+
+# 切换等待下限：所有已启用通道中最长固定数字滤波时长的 3 倍（1 s -> 3 s，3 s -> 9 s，10 s -> 30 s）。
+FILTER_SETTLE_MULTIPLIER = 3.0
+
+# 通道量程模式：固定量程与仪表自动量程（LR-700-AR）。
+RANGE_MODES: tuple[tuple[str, str], ...] = (
+    ("fixed", "Fixed"),
+    ("autorange", "Autorange"),
+)
+
+# AUTORANGE T=<1-3>：内置激励跟踪曲线（手册 p. 2-18 / p. 3-32）。
+AUTORANGE_TRACES: tuple[tuple[int, str], ...] = (
+    (2, "Minimum excitation (T=2)"),
+    (1, "Default (T=1)"),
+    (3, "Maximum excitation (T=3)"),
+)
+
+# 各内置自动量程 Trace 在 0..9（2 mOhm..2 MOhm）十个量程上对应的激励档编码。
+# 依据手册 p. 2-18（修正印刷中将 uV 误印为 mV 的明显笔误，并与实机 T=2 / 200 mOhm -> 0E 核对）。
+AUTORANGE_TRACE_EXCITATIONS: dict[int, tuple[int, ...]] = {
+    1: (1, 2, 3, 3, 3, 3, 3, 4, 5, 6),  # Default
+    2: (0, 0, 0, 0, 0, 0, 1, 2, 3, 4),  # Minimum excitation
+    3: (1, 3, 5, 6, 6, 6, 6, 6, 6, 6),  # Maximum excitation
+}
 
 # DAT 的 StatusCode 是本模块自有整数枚举。LR-700 没有 372A 的 current-source
 # compliance 状态，因此代码 2 在本模块表示 overload，而不是跨模块统一含义。
@@ -59,8 +99,8 @@ STATUS_CODE_OVER_RANGE = 1
 STATUS_CODE_OVERLOAD = 2
 STATUS_CODE_INVALID_READING = 3
 
-# GET 7 的 8 位 OVERLOADS 状态字。名称保留手册语义，完整位名称显示在 Warning 和
-# 状态页中；DAT 只写上面的整数状态码。
+# GET 7 的 8 位 OVERLOADS 状态字（手册 p. 2-23 / p. 3-51）。名称保留手册语义，
+# 完整位名称显示在 Warning 和状态页中；DAT 只写上面的整数状态码。
 OVERLOAD_BITS: tuple[tuple[int, str], ...] = (
     (1, "+dX overrange"),
     (2, "-dX overrange"),
@@ -72,9 +112,119 @@ OVERLOAD_BITS: tuple[tuple[int, str], ...] = (
     (128, "dR overrange"),
 )
 
-# LR-700 没有 excitation-off 命令。手册允许的最低可确认状态是 20 uV 的 5%。
+COMMON_MODE_OVERLOAD_MASK = 4 | 8
+COMMON_MODE_OVERLOAD_HINT = (
+    "电流端接触电阻可能过大，请检查 I-LOW 回路及接线。"
+)
+
+# LR-700 没有 excitation-off 命令。最低可确认状态为“当前电阻量程允许的最低激励档 x 5%”。
+# 编码 0-7 对应 0 (20 uV)，编码 8 (200 kOhm) 对应 2 (200 uV)，编码 9 (2 MOhm) 对应 4 (2 mV)。
 SAFE_EXCITATION_INDEX = 0
 SAFE_EXCITATION_PERCENT = 5
+
+_RANGE_BY_INDEX: dict[int, tuple[str, float]] = {
+    index: (label, ohms)
+    for index, label, ohms in RESISTANCE_RANGES
+}
+_EXCITATION_BY_INDEX: dict[int, tuple[str, float]] = {
+    index: (label, volts)
+    for index, label, volts in EXCITATIONS
+}
+_FILTER_BY_INDEX: dict[int, tuple[str, float]] = {
+    index: (label, seconds)
+    for index, label, seconds in FILTERS
+}
+
+
+def range_label(range_index: int) -> str:
+    return _RANGE_BY_INDEX[int(range_index)][0]
+
+
+def range_ohms(range_index: int) -> float:
+    return _RANGE_BY_INDEX[int(range_index)][1]
+
+
+def excitation_label(excitation_index: int) -> str:
+    return _EXCITATION_BY_INDEX[int(excitation_index)][0]
+
+
+def excitation_volts(excitation_index: int) -> float:
+    return _EXCITATION_BY_INDEX[int(excitation_index)][1]
+
+
+def filter_label(filter_index: int) -> str:
+    return _FILTER_BY_INDEX[int(filter_index)][0]
+
+
+def filter_seconds(filter_index: int) -> float:
+    return _FILTER_BY_INDEX[int(filter_index)][1]
+
+
+def valid_excitation_indices(range_index: int) -> tuple[int, ...]:
+    """返回指定电阻量程索引（0-9）硬件允许的激励档编码元组。"""
+
+    return VALID_EXCITATION_INDICES_BY_RANGE.get(int(range_index), ())
+
+
+def minimum_excitation_index(range_index: int) -> int:
+    """返回指定电阻量程索引允许的最低激励档编码（0-7 -> 0，8 -> 2，9 -> 4）。"""
+
+    valid = valid_excitation_indices(range_index)
+    if not valid:
+        raise ValueError(f"invalid LR-700 range index: {range_index!r}")
+    return valid[0]
+
+
+def is_valid_range_excitation(
+    range_index: int,
+    excitation_index: int,
+) -> bool:
+    return int(excitation_index) in valid_excitation_indices(range_index)
+
+
+def excitation_current_a(
+    range_index: int,
+    excitation_index: int,
+    excitation_percent: int = 100,
+) -> float:
+    """计算配置对应的满量程激励电流 I = V_fs / R_fs * (percent / 100)（单位 A）。"""
+
+    return (
+        excitation_volts(excitation_index)
+        / range_ohms(range_index)
+        * (float(excitation_percent) / 100.0)
+    )
+
+
+def autorange_peak_current_a(
+    min_range_index: int,
+    max_range_index: int,
+    trace_index: int,
+) -> float:
+    """估算指定自动量程范围与跟踪曲线在 100% 激励下的最大可能电流（单位 A）。"""
+
+    excitations = AUTORANGE_TRACE_EXCITATIONS.get(int(trace_index))
+    if excitations is None:
+        raise ValueError(f"unsupported LR-700 autorange trace: {trace_index!r}")
+    return max(
+        excitation_current_a(range_index, excitations[range_index], 100)
+        for range_index in range(int(min_range_index), int(max_range_index) + 1)
+    )
+
+
+def format_current(amperes: float) -> str:
+    """把激励电流格式化为易读的 SI 文本（pA / nA / uA / mA / A）。"""
+
+    magnitude = abs(amperes)
+    for threshold, scale, unit in (
+        (1.0, 1.0, "A"),
+        (1.0e-3, 1.0e3, "mA"),
+        (1.0e-6, 1.0e6, "uA"),
+        (1.0e-9, 1.0e9, "nA"),
+    ):
+        if magnitude >= threshold:
+            return f"{amperes * scale:.4g} {unit}"
+    return f"{amperes * 1.0e12:.4g} pA"
 
 
 def default_channel(slot: int) -> dict[str, Any]:
@@ -87,9 +237,13 @@ def default_channel(slot: int) -> dict[str, Any]:
     return {
         "input_channel": slot,
         "enabled": slot == 1,
+        "range_mode": "fixed",
         "range_index": 5,
         "excitation_index": SAFE_EXCITATION_INDEX,
         "excitation_percent": SAFE_EXCITATION_PERCENT,
+        "autorange_min_range": 1,
+        "autorange_max_range": 9,
+        "autorange_trace": 2,
         "filter_index": 1,
     }
 
@@ -97,14 +251,13 @@ def default_channel(slot: int) -> dict[str, Any]:
 def default_settings() -> dict[str, Any]:
     """返回新安装模块的初始设置。
 
-    Enable 只加载这份 desired settings 并发现 GPIB 资源，不会连接或发命令。真正
-    Apply 后也只把桥置于最低激励；每个通道的量程、滤波和激励在 Measure 中切换并
-    逐次读回确认。
+    默认固定滤波为 FILTER 1（3 s），默认切换等待取其 3 倍（9.0 s）。
+    Enable 只加载这份 desired settings 并发现 GPIB 资源，不会连接或发命令。
     """
 
     return {
         "resource": "",
-        "switch_settle_seconds": 2.0,
+        "switch_settle_seconds": 9.0,
         "dwell_seconds": 1.0,
         "io_timeout_seconds": 3.0,
         "retry_attempts": 2,
@@ -116,9 +269,15 @@ def default_settings() -> dict[str, Any]:
 
 
 __all__ = [
+    "AUTORANGE_TRACES",
+    "AUTORANGE_TRACE_EXCITATIONS",
+    "COMMON_MODE_OVERLOAD_HINT",
+    "COMMON_MODE_OVERLOAD_MASK",
     "EXCITATIONS",
     "FILTERS",
+    "FILTER_SETTLE_MULTIPLIER",
     "OVERLOAD_BITS",
+    "RANGE_MODES",
     "RESISTANCE_RANGES",
     "SAFE_EXCITATION_INDEX",
     "SAFE_EXCITATION_PERCENT",
@@ -126,6 +285,19 @@ __all__ = [
     "STATUS_CODE_NORMAL",
     "STATUS_CODE_OVERLOAD",
     "STATUS_CODE_OVER_RANGE",
+    "VALID_EXCITATION_INDICES_BY_RANGE",
+    "autorange_peak_current_a",
     "default_channel",
     "default_settings",
+    "excitation_current_a",
+    "excitation_label",
+    "excitation_volts",
+    "filter_label",
+    "filter_seconds",
+    "format_current",
+    "is_valid_range_excitation",
+    "minimum_excitation_index",
+    "range_label",
+    "range_ohms",
+    "valid_excitation_indices",
 ]
