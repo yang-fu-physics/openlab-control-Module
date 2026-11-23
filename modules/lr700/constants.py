@@ -196,6 +196,21 @@ def excitation_current_a(
     )
 
 
+def autorange_trace_excitation(
+    trace_index: int,
+    range_index: int,
+) -> int:
+    """返回内置自动量程跟踪曲线在指定电阻量程（0-9）上应使用的激励档编码。"""
+
+    excitations = AUTORANGE_TRACE_EXCITATIONS.get(int(trace_index))
+    if excitations is None:
+        raise ValueError(f"unsupported LR-700 autorange trace: {trace_index!r}")
+    index = int(range_index)
+    if not 0 <= index < len(excitations):
+        raise ValueError(f"invalid LR-700 range index: {range_index!r}")
+    return excitations[index]
+
+
 def autorange_peak_current_a(
     min_range_index: int,
     max_range_index: int,
@@ -203,11 +218,12 @@ def autorange_peak_current_a(
 ) -> float:
     """估算指定自动量程范围与跟踪曲线在 100% 激励下的最大可能电流（单位 A）。"""
 
-    excitations = AUTORANGE_TRACE_EXCITATIONS.get(int(trace_index))
-    if excitations is None:
-        raise ValueError(f"unsupported LR-700 autorange trace: {trace_index!r}")
     return max(
-        excitation_current_a(range_index, excitations[range_index], 100)
+        excitation_current_a(
+            range_index,
+            autorange_trace_excitation(trace_index, range_index),
+            100,
+        )
         for range_index in range(int(min_range_index), int(max_range_index) + 1)
     )
 
@@ -287,6 +303,7 @@ __all__ = [
     "STATUS_CODE_OVER_RANGE",
     "VALID_EXCITATION_INDICES_BY_RANGE",
     "autorange_peak_current_a",
+    "autorange_trace_excitation",
     "default_channel",
     "default_settings",
     "excitation_current_a",

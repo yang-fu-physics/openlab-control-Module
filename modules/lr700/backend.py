@@ -40,6 +40,7 @@ from .constants import (
     STATUS_CODE_NORMAL,
     STATUS_CODE_OVERLOAD,
     STATUS_CODE_OVER_RANGE,
+    autorange_trace_excitation,
     default_settings,
     excitation_current_a,
     excitation_label,
@@ -136,6 +137,7 @@ class LR700Backend:
             "Excitation Safety": (
                 "Not connected; instrument state unknown"
             ),
+            **self._cleared_bridge_status_fields("-"),
             "Last Slot / Sensor": "-",
             "Last Resistance (Ohm)": "-",
             "Last Reactance (Ohm)": "-",
@@ -221,6 +223,7 @@ class LR700Backend:
                 "during Measure"
             ),
             "Excitation Safety": self._safe_state_text(safe_bridge),
+            **self._bridge_status_fields(safe_bridge),
             "Estimated Measure Time (s)": (
                 self._estimated_measure_seconds(desired)
             ),
@@ -253,6 +256,7 @@ class LR700Backend:
         status = {
             "Sequence": "Running",
             "Excitation Safety": self._safe_state_text(safe_bridge),
+            **self._bridge_status_fields(safe_bridge),
         }
         api.status(status)
         return status
@@ -314,13 +318,14 @@ class LR700Backend:
         failure: Exception | None = None
         try:
             safe_bridge = self._set_safe_state(api)
-            self._configure_sensor(
+            configured_bridge = self._configure_sensor(
                 input_channel,
                 channel,
                 api,
                 current_range_index=int(safe_bridge["range_index"]),
             )
             api.status({
+                **self._bridge_status_fields(configured_bridge),
                 "Excitation Safety": (
                     "Measurement excitation active on "
                     f"R{slot} / sensor {input_channel}"
@@ -329,43 +334,43 @@ class LR700Backend:
                     f"R{slot} / S{input_channel}"
                 ),
             })
-            self._waiter(
-                api,
-                float(
-                    settings["switch_settle_seconds"]
-                ),
-            )
-            first = api.instruments()
-            self._waiter(
-                api,
-                float(settings["dwell_seconds"]),
-            )
-            second = api.instruments()
-            temperature, field = (
-                self._averaged_system_values(
-                    first,
-                    second,
-                )
-            )
 
             # 在读取数值前后都核对当前传感器和设置。LR-700 未被 LocalLockout，
             # 操作者仍可使用前面板；两次读回可避免把中途改变后的值写入错误通道。
-            # 自动量程模式下若读数瞬间发生换挡，有限重试以保证 R/X 来自同一已稳定量程。
+            # 自动量程模式下若读数瞬间发生换挡，下一轮必须重新等待完整稳定时间与
+            # dwell 并刷新温场快照，确保 R/X 与滤波状态和温场时间窗一致。
             is_autorange = (
                 str(channel.get("range_mode", "fixed")).strip().casefold()
                 == "autorange"
             )
-            read_attempts = (
-                int(settings.get("retry_attempts", 2))
-                if is_autorange
-                else 1
-            )
+            read_attempts = self._slot_measure_attempts(channel, settings)
+            temperature: float | None = None
+            field: float | None = None
             resistance = 0.0
             reactance = 0.0
             overload_bits = 0
             data_failure: ModuleError | None = None
             settled_bridge: dict[str, int] | None = None
-            for read_attempt in range(1, read_attempts + 1):
+            for _read_attempt in range(1, read_attempts + 1):
+                self._waiter(
+                    api,
+                    float(
+                        settings["switch_settle_seconds"]
+                    ),
+                )
+                first = api.instruments()
+                self._waiter(
+                    api,
+                    float(settings["dwell_seconds"]),
+                )
+                second = api.instruments()
+                temperature, field = (
+                    self._averaged_system_values(
+                        first,
+                        second,
+                    )
+                )
+
                 before = self._query_bridge_settings(api)
                 self._verify_channel_readback(
                     input_channel,
@@ -409,8 +414,6 @@ class LR700Backend:
                 ):
                     settled_bridge = after
                     break
-                if read_attempt < read_attempts:
-                    self._waiter(api, 0.2)
             if settled_bridge is None:
                 raise ModuleError(
                     "LR-700 autorange range or excitation kept changing "
@@ -421,27 +424,7 @@ class LR700Backend:
                     f"sensor {input_channel}",
                 )
 
-            current_text = format_current(
-                excitation_current_a(
-                    int(settled_bridge["range_index"]),
-                    int(settled_bridge["excitation_index"]),
-                    int(settled_bridge["excitation_percent"]),
-                )
-            )
-            bridge_status = {
-                "Current Sensor": f"S{settled_bridge['sensor']}",
-                "Current Range Index": (
-                    f"{settled_bridge['range_index']} "
-                    f"({range_label(settled_bridge['range_index'])})"
-                ),
-                "Current Excitation Index": (
-                    f"{settled_bridge['excitation_index']} "
-                    f"({excitation_label(settled_bridge['excitation_index'])})"
-                ),
-                "Current Excitation (%)": settled_bridge["excitation_percent"],
-                "Current Filter Index": settled_bridge["filter_index"],
-                "Current Excitation Current": current_text,
-            }
+            bridge_status = self._bridge_status_fields(settled_bridge)
 
             warning_context = (
                 f"R{slot} / sensor {input_channel}"
@@ -552,13 +535,18 @@ class LR700Backend:
             cleanup_error = (
                 self._best_effort_safe_state(api)
             )
-            api.status({
-                "Excitation Safety": (
-                    self._safe_state_text(self._last_safe_bridge)
-                    if cleanup_error is None
-                    else "Minimum excitation unconfirmed"
-                ),
-            })
+            if cleanup_error is None and self._last_safe_bridge is not None:
+                api.status({
+                    **self._bridge_status_fields(self._last_safe_bridge),
+                    "Excitation Safety": self._safe_state_text(
+                        self._last_safe_bridge
+                    ),
+                })
+            else:
+                api.status({
+                    **self._cleared_bridge_status_fields("Unknown"),
+                    "Excitation Safety": "Minimum excitation unconfirmed",
+                })
             if cleanup_error is not None:
                 raise ModuleError(
                     "Could not confirm LR-700 minimum "
@@ -589,6 +577,7 @@ class LR700Backend:
         if error is not None:
             api.status({
                 "Sequence": reason.title(),
+                **self._cleared_bridge_status_fields("Unknown"),
                 "Excitation Safety": (
                     "Minimum excitation unconfirmed"
                 ),
@@ -601,6 +590,11 @@ class LR700Backend:
         status = {
             "Sequence": reason.title(),
             "Excitation Safety": self._safe_state_text(self._last_safe_bridge),
+            **(
+                self._bridge_status_fields(self._last_safe_bridge)
+                if self._last_safe_bridge is not None
+                else {}
+            ),
         }
         api.status(status)
         return status
@@ -626,6 +620,7 @@ class LR700Backend:
             "Connection": "Disconnected",
             "Applied Settings": "Not applied",
             "Sequence": "Idle",
+            **self._cleared_bridge_status_fields("-"),
             "Excitation Safety": (
                 (
                     "Minimum excitation was confirmed "
@@ -663,6 +658,7 @@ class LR700Backend:
                     or "Not selected"
                 ),
                 "Protocol": "Not queried",
+                **self._cleared_bridge_status_fields("-"),
                 "Excitation Safety": (
                     "Instrument state unknown"
                 ),
@@ -670,13 +666,6 @@ class LR700Backend:
         bridge = self._query_bridge_settings(api)
         bits = self._query_overloads(api)
         status, details = self._status(bits)
-        current_text = format_current(
-            excitation_current_a(
-                int(bridge["range_index"]),
-                int(bridge["excitation_index"]),
-                int(bridge["excitation_percent"]),
-            )
-        )
         result = {
             "Connection": "Connected",
             "Resource": (
@@ -684,24 +673,7 @@ class LR700Backend:
                 or self.desired_settings
             )["resource"],
             "Protocol": self.protocol_signature,
-            "Current Sensor": (
-                f"S{bridge['sensor']}"
-                if bridge["sensor"]
-                else "Direct / sensor 0"
-            ),
-            "Current Range Index": (
-                f"{bridge['range_index']} ({range_label(bridge['range_index'])})"
-            ),
-            "Current Excitation Index": (
-                f"{bridge['excitation_index']} ({excitation_label(bridge['excitation_index'])})"
-            ),
-            "Current Excitation (%)": (
-                bridge["excitation_percent"]
-            ),
-            "Current Excitation Current": current_text,
-            "Current Filter Index": (
-                bridge["filter_index"]
-            ),
+            **self._bridge_status_fields(bridge),
             "Last Status": (
                 status
                 if not details
@@ -1036,6 +1008,7 @@ class LR700Backend:
         self._verify_safe_state(bridge)
         self._last_safe_bridge = dict(bridge)
         api.status({
+            **self._bridge_status_fields(bridge),
             "Excitation Safety": self._safe_state_text(bridge),
         })
         return bridge
@@ -1141,6 +1114,45 @@ class LR700Backend:
         )
 
     @staticmethod
+    def _bridge_status_fields(
+        bridge: Mapping[str, int],
+    ) -> dict[str, Any]:
+        range_index = int(bridge["range_index"])
+        excitation_index = int(bridge["excitation_index"])
+        percent = int(bridge["excitation_percent"])
+        sensor = int(bridge["sensor"])
+        current_text = format_current(
+            excitation_current_a(range_index, excitation_index, percent)
+        )
+        return {
+            "Current Sensor": (
+                f"S{sensor}" if sensor else "Direct / sensor 0"
+            ),
+            "Current Range Index": (
+                f"{range_index} ({range_label(range_index)})"
+            ),
+            "Current Excitation Index": (
+                f"{excitation_index} ({excitation_label(excitation_index)})"
+            ),
+            "Current Excitation (%)": percent,
+            "Current Excitation Current": current_text,
+            "Current Filter Index": int(bridge["filter_index"]),
+        }
+
+    @staticmethod
+    def _cleared_bridge_status_fields(
+        placeholder: str = "-",
+    ) -> dict[str, Any]:
+        return {
+            "Current Sensor": placeholder,
+            "Current Range Index": placeholder,
+            "Current Excitation Index": placeholder,
+            "Current Excitation (%)": placeholder,
+            "Current Excitation Current": placeholder,
+            "Current Filter Index": placeholder,
+        }
+
+    @staticmethod
     def _safe_state_text(
         bridge: Mapping[str, int] | None = None,
     ) -> str:
@@ -1218,20 +1230,29 @@ class LR700Backend:
             actual_excitation = int(bridge["excitation_index"])
             min_range = int(channel["autorange_min_range"])
             max_range = int(channel["autorange_max_range"])
+            trace = int(channel["autorange_trace"])
+            in_bounds = min_range <= actual_range <= max_range
+            expected_excitation = (
+                autorange_trace_excitation(trace, actual_range)
+                if in_bounds
+                else None
+            )
             if (
                 actual_common != expected_common
-                or not min_range <= actual_range <= max_range
+                or not in_bounds
                 or not is_valid_range_excitation(
                     actual_range,
                     actual_excitation,
                 )
+                or actual_excitation != expected_excitation
             ):
                 raise ModuleError(
                     "LR-700 autorange readback mismatch for "
                     f"sensor {input_channel}: expected "
                     f"{expected_common} with range in "
-                    f"[{min_range}, {max_range}], read back "
-                    f"{dict(bridge)}",
+                    f"[{min_range}, {max_range}] and trace T={trace} "
+                    f"(excitation {expected_excitation} for range "
+                    f"{actual_range}), read back {dict(bridge)}",
                     "LR700_SETTINGS_VERIFY_FAILED",
                     f"sensor {input_channel}",
                 )
@@ -1920,19 +1941,28 @@ class LR700Backend:
         return result
 
     @staticmethod
+    def _slot_measure_attempts(
+        channel: Mapping[str, Any],
+        settings: Mapping[str, Any],
+    ) -> int:
+        if str(channel.get("range_mode", "fixed")).strip().casefold() == "autorange":
+            return int(settings.get("retry_attempts", 2))
+        return 1
+
+    @classmethod
     def _estimated_measure_seconds(
+        cls,
         settings: Mapping[str, Any],
     ) -> float:
         """给每通道等待和多条 GPIB 命令留出保守预算，不作为精确进度条。"""
 
-        enabled = sum(
-            bool(channel["enabled"])
-            for channel in settings[
-                "channels"
-            ].values()
+        total_attempts = sum(
+            cls._slot_measure_attempts(channel, settings)
+            for channel in settings["channels"].values()
+            if channel["enabled"]
         )
         return (
-            enabled
+            total_attempts
             * (
                 float(
                     settings[
@@ -1953,10 +1983,21 @@ class LR700Backend:
         settings: Mapping[str, Any],
         operation_timeout_seconds: float,
     ) -> None:
+        max_attempts = max(
+            (
+                cls._slot_measure_attempts(channel, settings)
+                for channel in settings["channels"].values()
+                if channel["enabled"]
+            ),
+            default=1,
+        )
         estimate = (
-            float(settings["switch_settle_seconds"])
-            + float(settings["dwell_seconds"])
-            + 2.0
+            max_attempts
+            * (
+                float(settings["switch_settle_seconds"])
+                + float(settings["dwell_seconds"])
+                + 2.0
+            )
             + float(settings["io_timeout_seconds"])
             * int(settings["retry_attempts"])
             + 5.0

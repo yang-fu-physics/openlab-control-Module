@@ -17,6 +17,7 @@ from labcontrol.measurement.visa import VisaSession
 from .constants import (
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
+    autorange_trace_excitation,
     minimum_excitation_index,
 )
 
@@ -130,7 +131,7 @@ def configuration_commands(
         min_range = int(channel["autorange_min_range"])
         max_range = int(channel["autorange_max_range"])
         trace = int(channel["autorange_trace"])
-        start_excitation = minimum_excitation_index(max_range)
+        start_excitation = autorange_trace_excitation(trace, max_range)
         return (
             "AUTORANGE 0",
             "MODE 0",

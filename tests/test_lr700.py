@@ -508,6 +508,14 @@ class LR700BackendTests(unittest.TestCase):
                 self.assertEqual(state.range_index, 2)
                 self.assertEqual(state.excitation_index, 0)
                 self.assertEqual(state.excitation_percent, 5)
+                merged_status: dict[str, object] = {}
+                for kind, payload in messages:
+                    if kind == "status":
+                        merged_status.update(payload["values"])
+                self.assertEqual(merged_status["Current Range Index"], "2 (200 mOhm)")
+                self.assertEqual(merged_status["Current Excitation Index"], "0 (20 uV)")
+                self.assertEqual(merged_status["Current Excitation (%)"], 5)
+                self.assertEqual(merged_status["Current Excitation Current"], "5 uA")
 
                 # 再切回高阻态并测试 Stop / Close 恢复路径。
                 state.range_index = high_range
@@ -517,6 +525,8 @@ class LR700BackendTests(unittest.TestCase):
                 self.assertEqual(state.excitation_index, expected_min_exc)
                 self.assertEqual(state.excitation_percent, 5)
                 self.assertIn(expected_label, ended["Excitation Safety"])
+                self.assertEqual(ended["Current Excitation (%)"], 5)
+                self.assertEqual(ended["Current Excitation Current"], "50 pA")
 
                 state.excitation_index = 6
                 state.excitation_percent = 100
@@ -524,13 +534,12 @@ class LR700BackendTests(unittest.TestCase):
                 self.assertEqual(state.excitation_index, expected_min_exc)
                 self.assertEqual(state.excitation_percent, 5)
                 self.assertEqual(closed["Connection"], "Disconnected")
+                self.assertEqual(closed["Current Excitation Current"], "-")
 
     def test_autorange_mode_configures_limits_trace_handles_mid_read_step_and_restores_safe_state(
         self,
     ) -> None:
         state = _FakeVisaState()
-        state.autorange_target_by_sensor[1] = (2, 0)  # 200 mOhm, 20 uV -> 100 uA
-        state.autorange_mid_read_shift = (2, 0)  # 首次 GET 0 时触发模拟量程步进
         state.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
         state.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
         waits: list[float] = []
@@ -547,12 +556,20 @@ class LR700BackendTests(unittest.TestCase):
             "filter_index": 1,
         })
         backend = self._backend(state, waits)
-        context = self._context(messages, _samples(1))
+        # 两组温场快照：第一组在换挡前采集（~10.5 K），第二组在换挡重等稳定后采集（~20.5 K）。
+        samples = [
+            _system_sample(1.0, 10.0, 100.0),
+            _system_sample(2.0, 11.0, 120.0),
+            _system_sample(11.0, 20.0, 200.0),
+            _system_sample(12.0, 21.0, 220.0),
+        ]
+        context = self._context(messages, samples)
         open_module(backend, context)
         backend.configure(settings, context)
         run_start(backend, context)
 
-        # 模拟第一次读数时从 3R 步进到 2R，后端应识别前后 GET 6 变化并自动重读一次。
+        # 模拟第一次读数时从 3R 步进到 2R：后端必须重新等待完整 switch_settle_seconds
+        # 与 dwell_seconds 并刷新温场快照后再重读。
         state.autorange_target_by_sensor[1] = (3, 0)
         state.autorange_mid_read_shift = (2, 0)
         measure_module(backend, context, 1)
@@ -566,13 +583,38 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(rows[0]["StatusCode"], 0)
         self.assertAlmostEqual(rows[0]["R1"], 0.015248, places=6)
         self.assertAlmostEqual(rows[0]["X1"], 0.000067, places=6)
+        self.assertAlmostEqual(rows[0]["TemperatureAverage"], 20.5, places=6)
+        self.assertAlmostEqual(rows[0]["FieldAverage"], 210.0, places=6)
         self.assertIn(("write", "AUTORANGE L=19"), state.commands)
         self.assertIn(("write", "AUTORANGE T=2"), state.commands)
         self.assertIn(("write", "AUTORANGE 1"), state.commands)
-        self.assertIn(0.2, waits)
-        # 测量结束后必须关闭自动量程并恢复当前量程（2R）的最低激励 0E x 5%。
+        self.assertEqual(waits, [9.0, 1.0, 9.0, 1.0])
+        # 测量结束后必须关闭自动量程、恢复当前量程（2R）最低激励 0E x 5%，并刷新状态页当前电流。
         self.assertEqual(state.autorange, 0)
         self.assertEqual(state.range_index, 2)
+        self.assertEqual(state.excitation_index, 0)
+        self.assertEqual(state.excitation_percent, 5)
+        merged_status: dict[str, object] = {}
+        for kind, payload in messages:
+            if kind == "status":
+                merged_status.update(payload["values"])
+        self.assertEqual(merged_status["Current Range Index"], "2 (200 mOhm)")
+        self.assertEqual(merged_status["Current Excitation Index"], "0 (20 uV)")
+        self.assertEqual(merged_status["Current Excitation (%)"], 5)
+        self.assertEqual(merged_status["Current Excitation Current"], "5 uA")
+
+        # 若自动量程回读激励虽在硬件合法范围内但不符合所选跟踪表（T=2 在 2R 必须为 0E，
+        # 返回 3E/600 uV 相当于 3 mA 而非 100 uA），必须判为校验失败并恢复安全状态。
+        state.autorange_target_by_sensor[1] = (2, 3)
+        state.autorange_mid_read_shift = None
+        context_trace = self._context([], _samples(1))
+        with self.assertRaises(ModuleError) as wrong_trace:
+            measure_module(backend, context_trace, 1)
+        self.assertEqual(
+            wrong_trace.exception.code,
+            "LR700_SETTINGS_VERIFY_FAILED",
+        )
+        self.assertEqual(state.autorange, 0)
         self.assertEqual(state.excitation_index, 0)
         self.assertEqual(state.excitation_percent, 5)
 
@@ -588,6 +630,50 @@ class LR700BackendTests(unittest.TestCase):
         )
         self.assertEqual(state.autorange, 0)
         self.assertEqual(state.excitation_percent, 5)
+
+        # 验证 T=1（Default）在起始 max_range=9 未换挡时也能与跟踪表（6E）一致通过回读。
+        state_t1 = _FakeVisaState()
+        state_t1.resistance_reply_by_sensor[1] = "+1.00000 M OHMR"
+        state_t1.reactance_reply_by_sensor[1] = "+0.01000 M OHMX"
+        settings_t1 = default_settings()
+        settings_t1["resource"] = "GPIB0::18::INSTR"
+        settings_t1["channels"]["r1"].update({
+            "input_channel": 1,
+            "enabled": True,
+            "range_mode": "autorange",
+            "autorange_min_range": 1,
+            "autorange_max_range": 9,
+            "autorange_trace": 1,
+            "filter_index": 1,
+        })
+        waits_t1: list[float] = []
+        messages_t1: list[tuple[str, dict]] = []
+        backend_t1 = self._backend(state_t1, waits_t1)
+        context_t1 = self._context(messages_t1, _samples(1))
+        open_module(backend_t1, context_t1)
+        backend_t1.configure(settings_t1, context_t1)
+        run_start(backend_t1, context_t1)
+        measure_module(backend_t1, context_t1, 1)
+        self.assertEqual(waits_t1, [9.0, 1.0])
+        self.assertEqual(state_t1.range_index, 9)
+        self.assertEqual(state_t1.excitation_index, 4)
+        self.assertEqual(state_t1.excitation_percent, 5)
+
+        # 自动量程多次重试重等稳定也必须纳入单次 Measure 超时预算。
+        timeout_bad = default_settings()
+        timeout_bad["resource"] = "GPIB0::18::INSTR"
+        timeout_bad["switch_settle_seconds"] = 30.0
+        timeout_bad["retry_attempts"] = 4
+        timeout_bad["channels"]["r1"].update({
+            "range_mode": "autorange",
+            "filter_index": 2,
+        })
+        with self.assertRaises(ModuleError) as ar_timeout:
+            backend_t1.configure(timeout_bad, context_t1)
+        self.assertEqual(
+            ar_timeout.exception.code,
+            "LR700_MEASURE_TIMEOUT_UNSAFE",
+        )
 
     def test_transient_read_failure_reopens_and_resolves_warning(
         self,
@@ -712,6 +798,18 @@ class LR700BackendTests(unittest.TestCase):
         self.assertIn(
             "after sensor 1",
             str(captured.exception),
+        )
+        merged_status: dict[str, object] = {}
+        for kind, payload in messages:
+            if kind == "status":
+                merged_status.update(payload["values"])
+        self.assertEqual(
+            merged_status["Excitation Safety"],
+            "Minimum excitation unconfirmed",
+        )
+        self.assertEqual(
+            merged_status["Current Excitation Current"],
+            "Unknown",
         )
 
     def test_uncertain_write_is_not_replayed_and_cleanup_reopens(

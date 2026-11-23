@@ -53,14 +53,14 @@ verifies only that corresponding sensor.
 For every enabled sensor, the module:
 
 1. confirms minimum excitation (at 5%) for the current resistance range before switching;
-2. sends `SELECT S=nn`, selects R/X mode (`MODE 0`), steps through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from high-resistance ranges (`200 kOhm` / `2 MOhm`) to lower ranges so excitation is not left elevated during range transitions, writes either fixed `RANGE`/`EXCITATION`/`FILTER`/`VAREXC` (ramping percentage last) or autorange starting at the upper range limit with `AUTORANGE L=` / `AUTORANGE T=` / `AUTORANGE 1`;
-3. verifies sensor and settings through `GET 6`;
+2. sends `SELECT S=nn`, selects R/X mode (`MODE 0`), steps through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from high-resistance ranges (`200 kOhm` / `2 MOhm`) to lower ranges so excitation is not left elevated during range transitions, writes either fixed `RANGE`/`EXCITATION`/`FILTER`/`VAREXC` (ramping percentage last) or autorange starting at the upper range limit with that trace's excitation followed by `AUTORANGE L=` / `AUTORANGE T=` / `AUTORANGE 1`;
+3. verifies sensor and settings through `GET 6` (in Autorange mode, confirming range is within `[min, max]` and excitation matches the selected trace table);
 4. waits the configured switch/filter settle time;
 5. requests a fresh primary temperature/field snapshot from OpenLab Control;
 6. waits the configured dwell time and requests a second fresh snapshot;
 7. reads R with `GET 0`, X with `GET 1`, and overload state with `GET 7`;
-8. verifies `GET 6` again so a front-panel change or mid-read autorange step cannot silently mix or relabel data (in Autorange mode, bounded retries re-read if range/excitation shifted between the before/after checks);
-9. emits one sparse DAT row for that sensor and restores minimum excitation.
+8. verifies `GET 6` again so a front-panel change or mid-read autorange step cannot silently mix or relabel data (in Autorange mode, if range/excitation shifted during the read, the bounded retry re-waits the full switch/filter settle time and dwell and takes fresh temperature/field snapshots before re-reading);
+9. emits one sparse DAT row for that sensor, restores minimum excitation, and refreshes the Status page's current range/excitation/current fields to the confirmed safe state.
 
 The fixed output columns are `TemperatureAverage`, `FieldAverage`, `R1/X1`
 through `R4/X4`, and one common integer `StatusCode` column. Only the current
