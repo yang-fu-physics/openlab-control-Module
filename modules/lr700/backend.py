@@ -113,6 +113,7 @@ class LR700Backend:
         self._autorange_running = False
         self._autorange_active_limits: tuple[int, int] | None = None
         self._autorange_active_filter: int | None = None
+        self._autorange_last_state: dict[int, tuple[int, int]] = {}
 
     def open(self, api: ModuleAPI) -> Mapping[str, Any]:
         """Enable 只读取核心资源表，不连接、不写 LR-700。"""
@@ -215,6 +216,7 @@ class LR700Backend:
                 ) from failure
             raise
         self.applied_settings = deepcopy(desired)
+        self._autorange_last_state.clear()
         status = {
             "Connection": "Connected",
             "Resource": desired["resource"],
@@ -256,6 +258,7 @@ class LR700Backend:
                     first_channel,
                     api,
                     current_range_index=int(safe_bridge["range_index"]),
+                    target_state=self._autorange_last_state.get(first_input),
                 )
                 safety_text = (
                     f"Autorange active (R{first_slot} / S{first_input}); "
@@ -362,6 +365,7 @@ class LR700Backend:
                     channel,
                     api,
                     current_range_index=int(safe_bridge["range_index"]),
+                    target_state=self._autorange_last_state.get(input_channel),
                 )
             else:
                 safe_bridge = self._set_safe_state(api)
@@ -565,6 +569,11 @@ class LR700Backend:
             # OVER_RANGE/OVERLOAD 下桥读数不可信；保持当前 Rn/Xn 以及所有未测槽位
             # 为空，状态码和温场快照足以说明这次测量尝试。
             if status_code == STATUS_CODE_NORMAL:
+                if is_autorange:
+                    self._autorange_last_state[input_channel] = (
+                        int(settled_bridge["range_index"]),
+                        int(settled_bridge["excitation_index"]),
+                    )
                 row.update({
                     f"R{slot}": resistance,
                     f"X{slot}": reactance,
@@ -698,6 +707,7 @@ class LR700Backend:
         self._close_transport()
         self.sequence_active = False
         self.applied_settings = {}
+        self._autorange_last_state.clear()
         status = {
             "Connection": "Disconnected",
             "Applied Settings": "Not applied",
@@ -1053,13 +1063,15 @@ class LR700Backend:
         api: ModuleAPI,
         *,
         current_range_index: int | None = None,
+        target_state: tuple[int, int] | None = None,
     ) -> dict[str, int]:
-        """一次性写入 AUTORANGE L= 与 AUTORANGE 1 并建立连续自动量程会话。"""
+        """在 5% 安全态下切至目标传感器与量程并开启 AUTORANGE 1。"""
 
         commands = instrument.autorange_start_commands(
             input_channel,
             channel,
             current_range_index=current_range_index,
+            target_state=target_state,
         )
         for command in commands:
             self._write_absolute(command, api)
@@ -1083,13 +1095,27 @@ class LR700Backend:
         channel: Mapping[str, Any],
         api: ModuleAPI,
     ) -> dict[str, int]:
-        """连续自动量程期间切换通道：只发 SELECT（及变化的 L= / FILTER）。"""
+        """连续自动量程期间切换通道：同量程且在边界内仅切通道，否则先降 5% 再切目标量程。"""
 
-        new_limits = (
-            int(channel["autorange_min_range"]),
-            int(channel["autorange_max_range"]),
-        )
-        limits_changed = new_limits != self._autorange_active_limits
+        min_range = int(channel["autorange_min_range"])
+        max_range = int(channel["autorange_max_range"])
+        new_limits = (min_range, max_range)
+        current = self._query_bridge_settings(api)
+        current_range = int(current["range_index"])
+        cached = self._autorange_last_state.get(input_channel)
+        in_new_bounds = min_range <= current_range <= max_range
+        same_as_cached = cached is None or int(cached[0]) == current_range
+
+        if not in_new_bounds or not same_as_cached:
+            safe_bridge = self._set_safe_state(api)
+            return self._start_autorange_session(
+                input_channel,
+                channel,
+                api,
+                current_range_index=int(safe_bridge["range_index"]),
+                target_state=cached,
+            )
+
         commands = instrument.autorange_switch_commands(
             input_channel,
             channel,
@@ -1099,13 +1125,10 @@ class LR700Backend:
         for command in commands:
             self._write_absolute(command, api)
         bridge = self._query_bridge_settings(api)
-        # 若跨槽位更改了 L= 边界，允许仪表在随后的 switch_settle_seconds 内步进到新边界，
-        # 此处先核对传感器、滤波、模式、100% 和硬件合法性；1/4 稳定点起强制检查新边界。
         self._verify_channel_readback(
             input_channel,
             channel,
             bridge,
-            check_autorange_bounds=not limits_changed,
         )
         self._autorange_active_limits = new_limits
         self._autorange_active_filter = int(channel["filter_index"])

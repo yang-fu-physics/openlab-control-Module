@@ -568,10 +568,12 @@ class LR700BackendTests(unittest.TestCase):
         state_settle.resistance_reply_by_sensor[2] = "+19.626 M OHMR"
         state_settle.reactance_reply_by_sensor[2] = "+0.061 M OHMX"
         state_settle.autorange_target_by_sensor[1] = (2, 3)
-        # GET 6 顺序（autorange=1 起）：run_start回读(不变)、R1 _switch回读(不变)、
+        # GET 6 顺序（autorange=1 起）：run_start回读(不变)、
+        # R1 _switch前状态查询(不变)、R1 _switch后回读(不变)、
         # R1 1/4 点(仍在 2R/3E)、R1 结束点(模拟跳到 3R/0E -> 触发重等)、
         # 重等 1/4 点(2R/3E)、重等结束点(不变)、R1 before/after(不变)。
         state_settle.autorange_get6_shifts = [
+            None,
             None,
             None,
             None,
@@ -704,9 +706,9 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(waits, [2.25, 6.75, 1.0, 2.25, 6.75, 1.0])
         self.assertEqual(state.autorange, 1)
 
-        # 若自动量程回读超出 L= 范围（例如 0R < min=1），必须判为设置校验失败并立即恢复 5%。
-        state.range_index = 0
-        state.excitation_index = 0
+        # 若自动量程激活期间硬件回读超出 L= 范围（例如在 1/4 稳定点读回 0R < min=1），
+        # 必须判为设置校验失败并立即恢复 5%。
+        state.autorange_get6_shifts = [None, None, (0, 0)]
         state.autorange_mid_read_shift = None
         context2 = self._context([], _samples(1))
         with self.assertRaises(ModuleError) as out_of_bounds:
@@ -722,7 +724,15 @@ class LR700BackendTests(unittest.TestCase):
         state_osc = _FakeVisaState()
         state_osc.range_index = 5
         state_osc.autorange_target_by_sensor[1] = (5, 0)
-        state_osc.autorange_get6_shifts = [None, None, None, (4, 0), None, (3, 0)]
+        state_osc.autorange_get6_shifts = [
+            None,
+            None,
+            None,
+            None,
+            (4, 0),
+            None,
+            (3, 0),
+        ]
         backend_osc = self._backend(state_osc, [])
         context_osc = self._context([], _samples(1))
         open_module(backend_osc, context_osc)
@@ -733,6 +743,141 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(unstable.exception.code, "LR700_AUTORANGE_UNSTABLE")
         self.assertEqual(state_osc.autorange, 0)
         self.assertEqual(state_osc.excitation_percent, 5)
+
+        # 场景 D：S1 停在 0R（10 mA，L=09）切换到 S2（L=29，最大仅 100 uA），
+        # 必须先降 5% 并升量程至 2R 再发 SELECT S=02，接通 S2 后峰值电流不得超过 100 uA。
+        settings_limit = default_settings()
+        settings_limit["resource"] = "GPIB0::18::INSTR"
+        settings_limit["channels"]["r1"].update({
+            "input_channel": 1,
+            "enabled": True,
+            "range_mode": "autorange",
+            "autorange_min_range": 0,
+            "autorange_max_range": 9,
+            "filter_index": 1,
+        })
+        settings_limit["channels"]["r2"].update({
+            "input_channel": 2,
+            "enabled": True,
+            "range_mode": "autorange",
+            "autorange_min_range": 2,
+            "autorange_max_range": 9,
+            "filter_index": 1,
+        })
+        state_lim = _FakeVisaState()
+        state_lim.range_index = 0
+        state_lim.excitation_index = 0
+        state_lim.autorange_target_by_sensor[1] = (0, 0)  # 2 mOhm, 20 uV -> 10 mA
+        state_lim.autorange_target_by_sensor[2] = (2, 0)  # 200 mOhm, 20 uV -> 100 uA
+        state_lim.resistance_reply_by_sensor[1] = "+1.00000 M OHMR"
+        state_lim.reactance_reply_by_sensor[1] = "+0.01000 M OHMX"
+        state_lim.resistance_reply_by_sensor[2] = "+15.248 M OHMR"
+        state_lim.reactance_reply_by_sensor[2] = "+0.067 M OHMX"
+        backend_lim = self._backend(state_lim, [])
+        context_lim = self._context([], _samples(4))
+        open_module(backend_lim, context_lim)
+        backend_lim.configure(settings_limit, context_lim)
+        run_start(backend_lim, context_lim)
+        measure_module(backend_lim, context_lim, 1)
+
+        state_lim.current_trace.clear()
+        writes_before_s2 = len(state_lim.commands)
+        measure_module(backend_lim, context_lim, 2)
+        writes_s2 = [
+            cmd
+            for action, cmd in state_lim.commands[writes_before_s2:]
+            if action == "write"
+        ]
+        # 必须先降 5%、升到 RANGE 2，再发 SELECT S=02！
+        self.assertLess(writes_s2.index("VAREXC 1"), writes_s2.index("SELECT S=02"))
+        self.assertLess(writes_s2.index("RANGE 2"), writes_s2.index("SELECT S=02"))
+        s2_select_idx = next(
+            i
+            for i, (cmd, _cur) in enumerate(state_lim.current_trace)
+            if cmd == "SELECT S=02"
+        )
+        peak_on_s2 = max(
+            cur for _cmd, cur in state_lim.current_trace[s2_select_idx:]
+        )
+        self.assertLessEqual(peak_on_s2, 100.0e-6 + 1e-12)
+
+        # 场景 E：缓存异阻值切换（S1=2R/3E，S2=8R/3E，共用 L=19）：
+        # 第一轮稳定后各自缓存；第二轮切回 S1 与切回 S2 均先降 5% 再直达各自缓存档位；
+        # 若连续测同一量程（S1->S1）则仍只发 SELECT S=01。
+        settings_mixed = default_settings()
+        settings_mixed["resource"] = "GPIB0::18::INSTR"
+        for key, sensor in (("r1", 1), ("r2", 2)):
+            settings_mixed["channels"][key].update({
+                "input_channel": sensor,
+                "enabled": True,
+                "range_mode": "autorange",
+                "autorange_min_range": 1,
+                "autorange_max_range": 9,
+                "filter_index": 1,
+            })
+        state_mix = _FakeVisaState()
+        state_mix.range_index = 2
+        state_mix.autorange_target_by_sensor[1] = (2, 3)  # 200 mOhm, 3 mA
+        state_mix.autorange_target_by_sensor[2] = (8, 3)  # 200 kOhm, 3 nA
+        state_mix.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
+        state_mix.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
+        state_mix.resistance_reply_by_sensor[2] = "+100.000 K OHMR"
+        state_mix.reactance_reply_by_sensor[2] = "+0.100 K OHMX"
+        backend_mix = self._backend(state_mix, [])
+        context_mix = self._context([], _samples(5))
+        open_module(backend_mix, context_mix)
+        backend_mix.configure(settings_mixed, context_mix)
+        run_start(backend_mix, context_mix)
+        # 第 1 轮：S1 稳定在 2R/3E；S2 稳定在 8R/3E。
+        measure_module(backend_mix, context_mix, 1)
+        state_mix.range_index = 8
+        state_mix.excitation_index = 3
+        measure_module(backend_mix, context_mix, 2)
+        self.assertEqual(backend_mix._autorange_last_state[1], (2, 3))
+        self.assertEqual(backend_mix._autorange_last_state[2], (8, 3))
+
+        # 第 2 轮从 S2 (8R) 切回 S1 (缓存 2R/3E)：先降 5%，切 SELECT S=01，经 RANGE 7/EXCITATION 0 降到 RANGE 2 + EXCITATION 3。
+        state_mix.autorange_target_by_sensor.clear()
+        writes_before_back_s1 = len(state_mix.commands)
+        measure_module(backend_mix, context_mix, 1)
+        writes_back_s1 = [
+            cmd
+            for action, cmd in state_mix.commands[writes_before_back_s1:]
+            if action == "write"
+        ]
+        self.assertIn("VAREXC 1", writes_back_s1)
+        self.assertIn("RANGE 7", writes_back_s1)
+        self.assertIn("RANGE 2", writes_back_s1)
+        self.assertIn("EXCITATION 3", writes_back_s1)
+        self.assertLess(
+            writes_back_s1.index("SELECT S=01"),
+            writes_back_s1.index("RANGE 2"),
+        )
+
+        # 再测 S1（当前已在 2R 且与 S1 缓存 2R 一致）：仅发 SELECT S=01！
+        writes_before_same = len(state_mix.commands)
+        measure_module(backend_mix, context_mix, 1)
+        writes_same = [
+            cmd
+            for action, cmd in state_mix.commands[writes_before_same:]
+            if action == "write"
+        ]
+        self.assertEqual(writes_same, ["SELECT S=01"])
+
+        # 再从 S1 (2R) 切回 S2 (缓存 8R/3E)：先降 5%，先升 RANGE 8 再发 SELECT S=02！
+        writes_before_back_s2 = len(state_mix.commands)
+        measure_module(backend_mix, context_mix, 2)
+        writes_back_s2 = [
+            cmd
+            for action, cmd in state_mix.commands[writes_before_back_s2:]
+            if action == "write"
+        ]
+        self.assertIn("VAREXC 1", writes_back_s2)
+        self.assertIn("RANGE 8", writes_back_s2)
+        self.assertLess(
+            writes_back_s2.index("RANGE 8"),
+            writes_back_s2.index("SELECT S=02"),
+        )
 
         # 自动量程多次重试重等稳定也必须纳入单次 Measure 超时预算。
         timeout_bad = default_settings()

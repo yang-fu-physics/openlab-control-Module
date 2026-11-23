@@ -17,6 +17,7 @@ from labcontrol.measurement.visa import VisaSession
 from .constants import (
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
+    is_valid_range_excitation,
     minimum_excitation_index,
 )
 
@@ -116,30 +117,68 @@ def autorange_start_commands(
     channel: Mapping[str, object],
     *,
     current_range_index: int | None = None,
+    target_state: tuple[int, int] | None = None,
 ) -> tuple[str, ...]:
-    """在 Run 开始（或首次进入自动量程）时一次性开启 AUTORANGE 1。
+    """在 5% 安全态下切传感器、切到目标量程（或仅越界钳位）并开启 AUTORANGE 1。
 
-    不强行跳到最高量程、不下发 ``AUTORANGE T=`` 以保留仪器预设跟踪表；仅当当前
-    量程落在 ``[min_range, max_range]`` 之外时才钳位进边界。
+    不强行跳到最高量程、不下发 ``AUTORANGE T=`` 以保留仪器预设跟踪表：
+    - 若传入该传感器上次稳定的 ``target_state = (range_index, excitation_index)``
+      且合法落在 ``[min_range, max_range]`` 内，则先在 5% 下安全切至该量程与激励；
+    - 否则保持当前量程，仅当当前量程落在 ``[min_range, max_range]`` 之外时钳位进边界。
     """
 
     min_range = int(channel["autorange_min_range"])
     max_range = int(channel["autorange_max_range"])
     filter_index = int(channel["filter_index"])
-    range_commands: tuple[str, ...] = ()
-    if current_range_index is not None:
+    target_range: int | None = None
+    target_exc: int | None = None
+    if (
+        target_state is not None
+        and min_range <= int(target_state[0]) <= max_range
+        and is_valid_range_excitation(int(target_state[0]), int(target_state[1]))
+    ):
+        target_range = int(target_state[0])
+        target_exc = int(target_state[1])
+    elif current_range_index is not None:
         current = int(current_range_index)
         clamped = max(min_range, min(max_range, current))
         if clamped != current:
-            range_commands = (
-                *_range_transition_commands(clamped, current),
-                f"EXCITATION {minimum_excitation_index(clamped)}",
+            target_range = clamped
+            target_exc = minimum_excitation_index(clamped)
+
+    select_cmd = f"SELECT S={int(input_channel):02d}"
+    if target_range is None:
+        switch_sequence: tuple[str, ...] = (select_cmd,)
+    else:
+        assert target_exc is not None
+        move_commands: tuple[str, ...] = (
+            ()
+            if current_range_index is not None
+            and int(current_range_index) == target_range
+            else _range_transition_commands(target_range, current_range_index)
+        )
+        # 切向更高阻（更小电流）量程时先升量程再切传感器，保证新旧通道均不承受更高电流；
+        # 切向更低阻量程时先在高阻 5% 下切传感器，再安全降量程。
+        if (
+            current_range_index is not None
+            and target_range > int(current_range_index)
+        ):
+            switch_sequence = (
+                *move_commands,
+                select_cmd,
+                f"EXCITATION {target_exc}",
             )
+        else:
+            switch_sequence = (
+                select_cmd,
+                *move_commands,
+                f"EXCITATION {target_exc}",
+            )
+
     return (
         "AUTORANGE 0",
         "MODE 0",
-        f"SELECT S={int(input_channel):02d}",
-        *range_commands,
+        *switch_sequence,
         f"FILTER {filter_index}",
         "VAREXC 0",
         f"AUTORANGE L={min_range}{max_range}",
@@ -154,14 +193,15 @@ def autorange_switch_commands(
     active_limits: tuple[int, int] | None = None,
     active_filter: int | None = None,
 ) -> tuple[str, ...]:
-    """连续自动量程 Run 期间切换通道：只发 SELECT（及发生变化的 L=/FILTER）。"""
+    """同量程且在边界内的连续自动量程切通道：若 L= 变化先更新 L=，再发 SELECT。"""
 
     min_range = int(channel["autorange_min_range"])
     max_range = int(channel["autorange_max_range"])
     filter_index = int(channel["filter_index"])
-    commands: list[str] = [f"SELECT S={int(input_channel):02d}"]
+    commands: list[str] = []
     if active_limits != (min_range, max_range):
         commands.append(f"AUTORANGE L={min_range}{max_range}")
+    commands.append(f"SELECT S={int(input_channel):02d}")
     if active_filter != filter_index:
         commands.append(f"FILTER {filter_index}")
     return tuple(commands)
