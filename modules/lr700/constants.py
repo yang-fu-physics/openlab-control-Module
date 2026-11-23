@@ -72,25 +72,12 @@ FILTERS: tuple[
 FILTER_SETTLE_MULTIPLIER = 3.0
 
 # 通道量程模式：固定量程与仪表自动量程（LR-700-AR）。
+# 自动量程只发送 AUTORANGE L=<min><max> 与 AUTORANGE 1/0，不下发 AUTORANGE T=，
+# 以保留操作者在仪器上预先设定好的跟踪曲线（含自定义 T=4 激励表）。
 RANGE_MODES: tuple[tuple[str, str], ...] = (
     ("fixed", "Fixed"),
     ("autorange", "Autorange"),
 )
-
-# AUTORANGE T=<1-3>：内置激励跟踪曲线（手册 p. 2-18 / p. 3-32）。
-AUTORANGE_TRACES: tuple[tuple[int, str], ...] = (
-    (2, "Minimum excitation (T=2)"),
-    (1, "Default (T=1)"),
-    (3, "Maximum excitation (T=3)"),
-)
-
-# 各内置自动量程 Trace 在 0..9（2 mOhm..2 MOhm）十个量程上对应的激励档编码。
-# 依据手册 p. 2-18（修正印刷中将 uV 误印为 mV 的明显笔误，并与实机 T=2 / 200 mOhm -> 0E 核对）。
-AUTORANGE_TRACE_EXCITATIONS: dict[int, tuple[int, ...]] = {
-    1: (1, 2, 3, 3, 3, 3, 3, 4, 5, 6),  # Default
-    2: (0, 0, 0, 0, 0, 0, 1, 2, 3, 4),  # Minimum excitation
-    3: (1, 3, 5, 6, 6, 6, 6, 6, 6, 6),  # Maximum excitation
-}
 
 # DAT 的 StatusCode 是本模块自有整数枚举。LR-700 没有 372A 的 current-source
 # compliance 状态，因此代码 2 在本模块表示 overload，而不是跨模块统一含义。
@@ -196,38 +183,6 @@ def excitation_current_a(
     )
 
 
-def autorange_trace_excitation(
-    trace_index: int,
-    range_index: int,
-) -> int:
-    """返回内置自动量程跟踪曲线在指定电阻量程（0-9）上应使用的激励档编码。"""
-
-    excitations = AUTORANGE_TRACE_EXCITATIONS.get(int(trace_index))
-    if excitations is None:
-        raise ValueError(f"unsupported LR-700 autorange trace: {trace_index!r}")
-    index = int(range_index)
-    if not 0 <= index < len(excitations):
-        raise ValueError(f"invalid LR-700 range index: {range_index!r}")
-    return excitations[index]
-
-
-def autorange_peak_current_a(
-    min_range_index: int,
-    max_range_index: int,
-    trace_index: int,
-) -> float:
-    """估算指定自动量程范围与跟踪曲线在 100% 激励下的最大可能电流（单位 A）。"""
-
-    return max(
-        excitation_current_a(
-            range_index,
-            autorange_trace_excitation(trace_index, range_index),
-            100,
-        )
-        for range_index in range(int(min_range_index), int(max_range_index) + 1)
-    )
-
-
 def format_current(amperes: float) -> str:
     """把激励电流格式化为易读的 SI 文本（pA / nA / uA / mA / A）。"""
 
@@ -259,7 +214,6 @@ def default_channel(slot: int) -> dict[str, Any]:
         "excitation_percent": SAFE_EXCITATION_PERCENT,
         "autorange_min_range": 1,
         "autorange_max_range": 9,
-        "autorange_trace": 2,
         "filter_index": 1,
     }
 
@@ -285,8 +239,6 @@ def default_settings() -> dict[str, Any]:
 
 
 __all__ = [
-    "AUTORANGE_TRACES",
-    "AUTORANGE_TRACE_EXCITATIONS",
     "COMMON_MODE_OVERLOAD_HINT",
     "COMMON_MODE_OVERLOAD_MASK",
     "EXCITATIONS",
@@ -302,8 +254,6 @@ __all__ = [
     "STATUS_CODE_OVERLOAD",
     "STATUS_CODE_OVER_RANGE",
     "VALID_EXCITATION_INDICES_BY_RANGE",
-    "autorange_peak_current_a",
-    "autorange_trace_excitation",
     "default_channel",
     "default_settings",
     "excitation_current_a",

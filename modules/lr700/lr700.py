@@ -17,7 +17,6 @@ from labcontrol.measurement.visa import VisaSession
 from .constants import (
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
-    autorange_trace_excitation,
     minimum_excitation_index,
 )
 
@@ -122,7 +121,8 @@ def configuration_commands(
 
     调用前桥应处于最低激励 x 5%。固定量程模式先切传感器、量程、激励档和滤波，
     最后才抬升激励百分比；自动量程模式先切传感器并置于最高允许电阻量程（电流最小）
-    与最低激励，再写入 ``AUTORANGE L=``、``AUTORANGE T=`` 并开启 ``AUTORANGE 1``。
+    与最低激励，再写入 ``AUTORANGE L=`` 并开启 ``AUTORANGE 1``，不下发
+    ``AUTORANGE T=`` 以保留仪器上预先配置的跟踪曲线。
     """
 
     mode = str(channel.get("range_mode", "fixed")).strip().casefold()
@@ -130,8 +130,7 @@ def configuration_commands(
     if mode == "autorange":
         min_range = int(channel["autorange_min_range"])
         max_range = int(channel["autorange_max_range"])
-        trace = int(channel["autorange_trace"])
-        start_excitation = autorange_trace_excitation(trace, max_range)
+        start_excitation = minimum_excitation_index(max_range)
         return (
             "AUTORANGE 0",
             "MODE 0",
@@ -141,7 +140,6 @@ def configuration_commands(
             f"FILTER {filter_index}",
             "VAREXC 0",
             f"AUTORANGE L={min_range}{max_range}",
-            f"AUTORANGE T={trace}",
             "AUTORANGE 1",
         )
 

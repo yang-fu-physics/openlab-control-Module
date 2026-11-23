@@ -32,12 +32,10 @@ from labcontrol.measurement.frontend_api import ModuleUIAPI
 from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 
 from .constants import (
-    AUTORANGE_TRACES,
     EXCITATIONS,
     FILTERS,
     RANGE_MODES,
     RESISTANCE_RANGES,
-    autorange_peak_current_a,
     default_settings,
     excitation_current_a,
     excitation_label,
@@ -225,9 +223,6 @@ class LR700Frontend(QWidget):
             autorange_max_range = QComboBox()
             for index, label, _value in RESISTANCE_RANGES[1:]:
                 autorange_max_range.addItem(label, index)
-            autorange_trace = QComboBox()
-            for trace_index, trace_label in AUTORANGE_TRACES:
-                autorange_trace.addItem(trace_label, trace_index)
             digital_filter = QComboBox()
             for index, label, _seconds in FILTERS:
                 digital_filter.addItem(label, index)
@@ -264,10 +259,6 @@ class LR700Frontend(QWidget):
                 autorange_max_range,
             )
             form.addRow(
-                "Autorange trace (T)",
-                autorange_trace,
-            )
-            form.addRow(
                 "Digital filter",
                 digital_filter,
             )
@@ -286,7 +277,6 @@ class LR700Frontend(QWidget):
                 ),
                 "autorange_min_range": autorange_min_range,
                 "autorange_max_range": autorange_max_range,
-                "autorange_trace": autorange_trace,
                 "filter_index": digital_filter,
             }
             self._current_previews[key] = current_preview
@@ -331,14 +321,12 @@ class LR700Frontend(QWidget):
             percent_spin = widgets["excitation_percent"]
             ar_min_combo = widgets["autorange_min_range"]
             ar_max_combo = widgets["autorange_max_range"]
-            ar_trace_combo = widgets["autorange_trace"]
             assert isinstance(range_mode_combo, QComboBox)
             assert isinstance(range_combo, QComboBox)
             assert isinstance(excitation_combo, QComboBox)
             assert isinstance(percent_spin, QSpinBox)
             assert isinstance(ar_min_combo, QComboBox)
             assert isinstance(ar_max_combo, QComboBox)
-            assert isinstance(ar_trace_combo, QComboBox)
             range_mode_combo.currentIndexChanged.connect(
                 lambda _idx, ch=key: self._sync_channel_controls(ch)
             )
@@ -355,9 +343,6 @@ class LR700Frontend(QWidget):
                 lambda _idx, ch=key: self._update_current_preview(ch)
             )
             ar_max_combo.currentIndexChanged.connect(
-                lambda _idx, ch=key: self._update_current_preview(ch)
-            )
-            ar_trace_combo.currentIndexChanged.connect(
                 lambda _idx, ch=key: self._update_current_preview(ch)
             )
 
@@ -436,7 +421,6 @@ class LR700Frontend(QWidget):
             percent = widgets["excitation_percent"]
             ar_min = widgets["autorange_min_range"]
             ar_max = widgets["autorange_max_range"]
-            ar_trace = widgets["autorange_trace"]
             digital_filter = widgets["filter_index"]
             assert isinstance(input_channel, QSpinBox)
             assert isinstance(enabled, QCheckBox)
@@ -446,7 +430,6 @@ class LR700Frontend(QWidget):
             assert isinstance(percent, QSpinBox)
             assert isinstance(ar_min, QComboBox)
             assert isinstance(ar_max, QComboBox)
-            assert isinstance(ar_trace, QComboBox)
             assert isinstance(digital_filter, QComboBox)
             channels[key] = {
                 "input_channel": input_channel.value(),
@@ -457,7 +440,6 @@ class LR700Frontend(QWidget):
                 "excitation_percent": percent.value(),
                 "autorange_min_range": int(ar_min.currentData()),
                 "autorange_max_range": int(ar_max.currentData()),
-                "autorange_trace": int(ar_trace.currentData()),
                 "filter_index": int(digital_filter.currentData()),
             }
         return {
@@ -530,7 +512,6 @@ class LR700Frontend(QWidget):
             percent = widgets["excitation_percent"]
             ar_min = widgets["autorange_min_range"]
             ar_max = widgets["autorange_max_range"]
-            ar_trace = widgets["autorange_trace"]
             digital_filter = widgets["filter_index"]
             assert isinstance(input_channel, QSpinBox)
             assert isinstance(enabled, QCheckBox)
@@ -540,7 +521,6 @@ class LR700Frontend(QWidget):
             assert isinstance(percent, QSpinBox)
             assert isinstance(ar_min, QComboBox)
             assert isinstance(ar_max, QComboBox)
-            assert isinstance(ar_trace, QComboBox)
             assert isinstance(digital_filter, QComboBox)
             input_channel.setValue(int(channel["input_channel"]))
             enabled.setChecked(bool(channel["enabled"]))
@@ -559,7 +539,6 @@ class LR700Frontend(QWidget):
             percent.setValue(int(channel["excitation_percent"]))
             self._select_data(ar_min, int(channel["autorange_min_range"]))
             self._select_data(ar_max, int(channel["autorange_max_range"]))
-            self._select_data(ar_trace, int(channel["autorange_trace"]))
             self._select_data(digital_filter, int(channel["filter_index"]))
             self._sync_channel_controls(key)
         del blockers
@@ -637,7 +616,7 @@ class LR700Frontend(QWidget):
         is_autorange = str(range_mode_combo.currentData() or "fixed") == "autorange"
         for name in ("range_index", "excitation_index", "excitation_percent"):
             widgets[name].setEnabled(not is_autorange)
-        for name in ("autorange_min_range", "autorange_max_range", "autorange_trace"):
+        for name in ("autorange_min_range", "autorange_max_range"):
             widgets[name].setEnabled(is_autorange)
         self._update_current_preview(key)
 
@@ -650,19 +629,15 @@ class LR700Frontend(QWidget):
         if mode == "autorange":
             ar_min = widgets["autorange_min_range"]
             ar_max = widgets["autorange_max_range"]
-            ar_trace = widgets["autorange_trace"]
             assert isinstance(ar_min, QComboBox)
             assert isinstance(ar_max, QComboBox)
-            assert isinstance(ar_trace, QComboBox)
             lo = int(ar_min.currentData())
             hi = int(ar_max.currentData())
-            trace = int(ar_trace.currentData())
             if lo >= hi:
                 label.setText("Invalid: Autorange max must exceed min")
                 return
-            peak = autorange_peak_current_a(lo, hi, trace)
             label.setText(
-                f"<= {format_current(peak)} (at {range_label(lo)}, 100%)"
+                f"Uses bridge trace ({range_label(lo)} - {range_label(hi)}, 100%)"
             )
             return
         range_combo = widgets["range_index"]

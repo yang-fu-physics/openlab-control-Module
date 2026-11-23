@@ -34,7 +34,7 @@ selects one physical LR-720-16 sensor from 1-16 and can independently select:
 - enabled/disabled;
 - range mode:
   - **Fixed**: resistance range (`2 mOhm`–`2 MOhm`), hardware-valid full-scale excitation voltage (`20 uV`–`20 mV`, restricted by the LR-700's `1 nA`–`30 mA` current-generator range per manual p. 4-12), and excitation percentage (`5%–100%`);
-  - **Autorange** (`LR-700-AR`): lower/upper range limits `AUTORANGE L=<min><max>` (`min < max`) and excitation trace `AUTORANGE T=<1|2|3>` (Default, Minimum excitation, or Maximum excitation);
+  - **Autorange** (`LR-700-AR`): lower/upper range limits `AUTORANGE L=<min><max>` (`min < max`). The module does **not** send `AUTORANGE T=` or `AUTORANGE U=`, preserving whatever trace (including a front-panel `T=4` user-defined trace) is configured on the LR-700;
 - built-in fixed digital filter (`FILTER 0`: `1 s`, `FILTER 1`: `3 s`, `FILTER 2`: `10 s` — fixed digital filtering has no Off setting).
 
 The shared switch/filter settle time (`switch_settle_seconds`, default `9.0 s`)
@@ -53,8 +53,8 @@ verifies only that corresponding sensor.
 For every enabled sensor, the module:
 
 1. confirms minimum excitation (at 5%) for the current resistance range before switching;
-2. sends `SELECT S=nn`, selects R/X mode (`MODE 0`), steps through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from high-resistance ranges (`200 kOhm` / `2 MOhm`) to lower ranges so excitation is not left elevated during range transitions, writes either fixed `RANGE`/`EXCITATION`/`FILTER`/`VAREXC` (ramping percentage last) or autorange starting at the upper range limit with that trace's excitation followed by `AUTORANGE L=` / `AUTORANGE T=` / `AUTORANGE 1`;
-3. verifies sensor and settings through `GET 6` (in Autorange mode, confirming range is within `[min, max]` and excitation matches the selected trace table);
+2. sends `SELECT S=nn`, selects R/X mode (`MODE 0`), steps through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from high-resistance ranges (`200 kOhm` / `2 MOhm`) to lower ranges so excitation is not left elevated during range transitions, writes either fixed `RANGE`/`EXCITATION`/`FILTER`/`VAREXC` (ramping percentage last) or autorange starting at the upper range limit with its minimum allowable excitation followed by `AUTORANGE L=` / `AUTORANGE 1` (leaving the bridge's pre-configured trace untouched);
+3. verifies sensor and settings through `GET 6` (in Autorange mode, confirming range is within `[min, max]` and the `(range, excitation)` pair is hardware-valid);
 4. waits the configured switch/filter settle time;
 5. requests a fresh primary temperature/field snapshot from OpenLab Control;
 6. waits the configured dwell time and requests a second fresh snapshot;

@@ -29,7 +29,6 @@ from labcontrol.module_api import (
 )
 
 from .constants import (
-    AUTORANGE_TRACES,
     COMMON_MODE_OVERLOAD_HINT,
     COMMON_MODE_OVERLOAD_MASK,
     FILTERS,
@@ -40,7 +39,6 @@ from .constants import (
     STATUS_CODE_NORMAL,
     STATUS_CODE_OVERLOAD,
     STATUS_CODE_OVER_RANGE,
-    autorange_trace_excitation,
     default_settings,
     excitation_current_a,
     excitation_label,
@@ -1230,29 +1228,20 @@ class LR700Backend:
             actual_excitation = int(bridge["excitation_index"])
             min_range = int(channel["autorange_min_range"])
             max_range = int(channel["autorange_max_range"])
-            trace = int(channel["autorange_trace"])
-            in_bounds = min_range <= actual_range <= max_range
-            expected_excitation = (
-                autorange_trace_excitation(trace, actual_range)
-                if in_bounds
-                else None
-            )
             if (
                 actual_common != expected_common
-                or not in_bounds
+                or not min_range <= actual_range <= max_range
                 or not is_valid_range_excitation(
                     actual_range,
                     actual_excitation,
                 )
-                or actual_excitation != expected_excitation
             ):
                 raise ModuleError(
                     "LR-700 autorange readback mismatch for "
                     f"sensor {input_channel}: expected "
                     f"{expected_common} with range in "
-                    f"[{min_range}, {max_range}] and trace T={trace} "
-                    f"(excitation {expected_excitation} for range "
-                    f"{actual_range}), read back {dict(bridge)}",
+                    f"[{min_range}, {max_range}], read back "
+                    f"{dict(bridge)}",
                     "LR700_SETTINGS_VERIFY_FAILED",
                     f"sensor {input_channel}",
                 )
@@ -1846,20 +1835,6 @@ class LR700Backend:
                     f"({range_label(channel['autorange_min_range'])})",
                     "LR700_INVALID_SETTINGS",
                     f"{key}.autorange_max_range",
-                )
-            valid_traces = {trace for trace, _label in AUTORANGE_TRACES}
-            channel["autorange_trace"] = cls._integer(
-                channel["autorange_trace"],
-                min(valid_traces),
-                max(valid_traces),
-                f"{key}.autorange_trace",
-            )
-            if channel["autorange_trace"] not in valid_traces:
-                raise ModuleError(
-                    f"{key}.autorange_trace must be one of "
-                    f"{sorted(valid_traces)}",
-                    "LR700_INVALID_SETTINGS",
-                    f"{key}.autorange_trace",
                 )
             if range_mode == "fixed" and not is_valid_range_excitation(
                 channel["range_index"],
