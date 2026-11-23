@@ -335,8 +335,8 @@ class LR700Backend:
 
             # 在读取数值前后都核对当前传感器和设置。LR-700 未被 LocalLockout，
             # 操作者仍可使用前面板；两次读回可避免把中途改变后的值写入错误通道。
-            # 自动量程模式下若读数瞬间发生换挡，下一轮必须重新等待完整稳定时间与
-            # dwell 并刷新温场快照，确保 R/X 与滤波状态和温场时间窗一致。
+            # 自动量程模式下把等待拆为 1/4 与结束两次 GET 6 核对：不一致则直接
+            # 重等一整轮；若进入 dwell 或读数瞬间又发生换挡，同样重等并刷新温场快照。
             is_autorange = (
                 str(channel.get("range_mode", "fixed")).strip().casefold()
                 == "autorange"
@@ -350,12 +350,30 @@ class LR700Backend:
             data_failure: ModuleError | None = None
             settled_bridge: dict[str, int] | None = None
             for _read_attempt in range(1, read_attempts + 1):
-                self._waiter(
-                    api,
-                    float(
-                        settings["switch_settle_seconds"]
-                    ),
-                )
+                settle_seconds = float(settings["switch_settle_seconds"])
+                settle_bridge: dict[str, int] | None = None
+                if is_autorange:
+                    first_quarter = settle_seconds / 4.0
+                    self._waiter(api, first_quarter)
+                    mid = self._query_bridge_settings(api)
+                    self._verify_channel_readback(
+                        input_channel,
+                        channel,
+                        mid,
+                    )
+                    self._waiter(api, settle_seconds - first_quarter)
+                    end_settle = self._query_bridge_settings(api)
+                    self._verify_channel_readback(
+                        input_channel,
+                        channel,
+                        end_settle,
+                    )
+                    if not self._same_bridge_range_state(mid, end_settle):
+                        continue
+                    settle_bridge = end_settle
+                else:
+                    self._waiter(api, settle_seconds)
+
                 first = api.instruments()
                 self._waiter(
                     api,
@@ -375,6 +393,15 @@ class LR700Backend:
                     channel,
                     before,
                 )
+                if (
+                    is_autorange
+                    and settle_bridge is not None
+                    and not self._same_bridge_range_state(
+                        settle_bridge,
+                        before,
+                    )
+                ):
+                    continue
                 range_index = int(before["range_index"])
                 data_failure = None
                 try:
@@ -403,12 +430,9 @@ class LR700Backend:
                     channel,
                     after,
                 )
-                if not is_autorange or (
-                    int(after["range_index"]) == int(before["range_index"])
-                    and int(after["excitation_index"])
-                    == int(before["excitation_index"])
-                    and int(after["excitation_percent"])
-                    == int(before["excitation_percent"])
+                if not is_autorange or self._same_bridge_range_state(
+                    before,
+                    after,
                 ):
                     settled_bridge = after
                     break
@@ -1202,6 +1226,18 @@ class LR700Backend:
         return (
             "LR-700-compatible GET 6; "
             f"sensor {bridge['sensor']}"
+        )
+
+    @staticmethod
+    def _same_bridge_range_state(
+        left: Mapping[str, int],
+        right: Mapping[str, int],
+    ) -> bool:
+        return (
+            int(left["range_index"]) == int(right["range_index"])
+            and int(left["excitation_index"]) == int(right["excitation_index"])
+            and int(left["excitation_percent"])
+            == int(right["excitation_percent"])
         )
 
     @staticmethod

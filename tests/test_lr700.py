@@ -110,6 +110,7 @@ class _FakeVisaState:
         self.autorange_trace = 1
         self.autorange_target_by_sensor: dict[int, tuple[int, int]] = {}
         self.autorange_mid_read_shift: tuple[int, int] | None = None
+        self.autorange_get6_shifts: list[tuple[int, int] | None] = []
         self.overloads: dict[int, int] = {}
         self.resistance_reply_by_sensor: dict[int, str] = {}
         self.reactance_reply_by_sensor: dict[int, str] = {}
@@ -196,6 +197,10 @@ class _FakeTransport:
         if command in self.state.query_overrides:
             return self.state.query_overrides[command]
         if command == "GET 6":
+            if self.state.autorange == 1 and self.state.autorange_get6_shifts:
+                shift = self.state.autorange_get6_shifts.pop(0)
+                if shift is not None:
+                    self.state.range_index, self.state.excitation_index = shift
             return (
                 f"{self.state.range_index}R,"
                 f"{self.state.excitation_index}E,"
@@ -569,8 +574,42 @@ class LR700BackendTests(unittest.TestCase):
         backend.configure(settings, context)
         run_start(backend, context)
 
-        # 模拟仪器自定义 Trace 在第一次读数时从 3R 步进到 2R/3E（3 mA）：
-        # 后端必须重新等待完整 switch_settle_seconds 与 dwell_seconds 并刷新温场快照后再重读，
+        # 场景 A：自动量程在 1/4 等待点（5R）与等待结束点（2R/3E）之间换挡，
+        # 应跳过 dwell 与采数，直接重等一整轮 [2.25, 6.75]，稳定后再进 dwell [1.0] 并读数。
+        state_settle = _FakeVisaState()
+        state_settle.autorange_trace = 4
+        state_settle.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
+        state_settle.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
+        state_settle.autorange_target_by_sensor[1] = (5, 0)
+        # GET 6 顺序：_configure_sensor 回读(不变)、1/4 点(不变仍 5R)、结束点(跳到 2R/3E)。
+        state_settle.autorange_get6_shifts = [None, None, (2, 3)]
+        waits_settle: list[float] = []
+        messages_settle: list[tuple[str, dict]] = []
+        backend_settle = self._backend(state_settle, waits_settle)
+        context_settle = self._context(messages_settle, _samples(1))
+        open_module(backend_settle, context_settle)
+        backend_settle.configure(settings, context_settle)
+        run_start(backend_settle, context_settle)
+        measure_module(backend_settle, context_settle, 1)
+        self.assertEqual(waits_settle, [2.25, 6.75, 2.25, 6.75, 1.0])
+        self.assertEqual(
+            sum(
+                action == "query" and cmd == "GET 0"
+                for action, cmd in state_settle.commands
+            ),
+            1,
+        )
+        settle_rows = [
+            payload["values"]
+            for kind, payload in messages_settle
+            if kind == "row"
+        ]
+        self.assertEqual(len(settle_rows), 1)
+        self.assertAlmostEqual(settle_rows[0]["R1"], 0.015248, places=6)
+        self.assertEqual(state_settle.autorange_trace, 4)
+
+        # 场景 B：模拟仪器自定义 Trace 在第一次读数瞬间从 3R 步进到 2R/3E（3 mA）：
+        # 后端必须重新等待完整 1/4 + 3/4 switch_settle_seconds 与 dwell_seconds 并刷新温场快照后再重读，
         # 且绝不发送 AUTORANGE T= 或 AUTORANGE U= 覆盖仪器既有 Trace。
         state.autorange_target_by_sensor[1] = (3, 0)
         state.autorange_mid_read_shift = (2, 3)
@@ -600,7 +639,7 @@ class LR700BackendTests(unittest.TestCase):
             )
         )
         self.assertEqual(state.autorange_trace, 4)
-        self.assertEqual(waits, [9.0, 1.0, 9.0, 1.0])
+        self.assertEqual(waits, [2.25, 6.75, 1.0, 2.25, 6.75, 1.0])
         # 测量结束后必须关闭自动量程、恢复当前量程（2R）最低激励 0E x 5%，并刷新状态页当前电流。
         self.assertEqual(state.autorange, 0)
         self.assertEqual(state.range_index, 2)
@@ -614,6 +653,21 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(merged_status["Current Excitation Index"], "0 (20 uV)")
         self.assertEqual(merged_status["Current Excitation (%)"], 5)
         self.assertEqual(merged_status["Current Excitation Current"], "5 uA")
+
+        # 场景 C：连续两轮 1/4 与结束点都不一致（超过 retry_attempts=2），必须报不稳定并恢复安全状态。
+        state_osc = _FakeVisaState()
+        state_osc.autorange_target_by_sensor[1] = (5, 0)
+        state_osc.autorange_get6_shifts = [None, None, (4, 0), None, (3, 0)]
+        backend_osc = self._backend(state_osc, [])
+        context_osc = self._context([], _samples(1))
+        open_module(backend_osc, context_osc)
+        backend_osc.configure(settings, context_osc)
+        run_start(backend_osc, context_osc)
+        with self.assertRaises(ModuleError) as unstable:
+            measure_module(backend_osc, context_osc, 1)
+        self.assertEqual(unstable.exception.code, "LR700_AUTORANGE_UNSTABLE")
+        self.assertEqual(state_osc.autorange, 0)
+        self.assertEqual(state_osc.excitation_percent, 5)
 
         # 若自动量程回读超出 L= 范围（例如 0R < min=1），必须判为设置校验失败。
         state.autorange_target_by_sensor[1] = (0, 0)
