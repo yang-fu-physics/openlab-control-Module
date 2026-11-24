@@ -24,62 +24,67 @@ framework's global defaults:
 - `write_termination = "\n"`;
 - `query_delay = 0.2 s`.
 
-## Settings and measurement order
+## Common configuration and channel table
 
-The Settings page provides four logical measurement slots, R1-R4, matching
-the four-channel workflow used by the Lake Shore 372A module. Every slot
-selects one physical LR-720-16 sensor from 1-16 and can independently select:
+Four logical slots R1–R4 each select one LR720 physical input S1–S16. The common
+configuration selects fixed/autorange, digital filter, fixed range/current,
+autorange bounds and maximum excitation current. A row may override only the
+fixed range and current. All rows use the common filter and current limit.
 
-- physical sensor number (`1–16`);
-- enabled/disabled;
-- range mode:
-  - **Fixed**: resistance range (`2 mOhm`–`2 MOhm`), hardware-valid full-scale excitation voltage (`20 uV`–`20 mV`, restricted by the LR-700's `1 nA`–`30 mA` current-generator range per manual p. 4-12), and excitation percentage (`5%–100%`);
-  - **Autorange** (`LR-700-AR`): lower/upper range limits `AUTORANGE L=<min><max>` restricted to **`20 mOhm` (`1R`) and above** (`1 <= min < max <= 9`; `2 mOhm` / `0R` is excluded). **Note: Autorange uses this module's custom User Defined trace (`AUTORANGE U=0135666666`, `AUTORANGE T=4`), NOT the LR-700's standard/common factory traces (`T=1` Default, `T=2` Min Power, `T=3` Max Power)** — see the trace table below;
-- built-in fixed digital filter (`FILTER 0`: `1 s`, `FILTER 1`: `3 s`, `FILTER 2`: `10 s` — fixed digital filtering has no Off setting).
+Currents in settings files are amperes; the UI uses mA. A fixed current is converted
+to a hardware-valid EXCITATION and integer VAREXC percentage (5–100%). The closest
+value at or below the requested current is used and displayed. An unrepresentable
+current or a requested current above the common limit rejects Apply before connecting.
 
-### Custom Autorange Trace Table (`AUTORANGE T=4` — Non-Standard)
+### Generated autorange Trace
 
-> **Important**: This module does **not** use the LR-700's common factory autorange traces (`T=1` Default / `T=2` Minimum Power / `T=3` Maximum Power in manual p. 2-18). Whenever Autorange is started, the module explicitly programs and activates its own User Defined trace (`AUTORANGE U=0135666666`, `AUTORANGE T=4`) covering **`20 mOhm` and above** (`1R–9R`), capping full-scale current at `3 mA` on low ranges while maintaining `20 mV` excitation on `20 Ohm` and above for higher SNR:
+Apply computes a ten-entry custom trace from the common current limit. For each
+range, it selects the largest legal excitation whose full-scale current at 100%
+does not exceed the limit. Ranges whose minimum full-scale excitation exceeds
+the limit are excluded by the effective AUTORANGE L bounds. At least two usable
+ranges are required. The UI displays effective bounds and each active range's
+current. The supported autorange range indices are 1–9 (20 mOhm–2 MOhm).
 
-| Range index | Resistance range | Excitation (`V_fs`) | Excitation index | Full-scale current (`100%`) | Notes |
-| --- | --- | --- | --- | --- | --- |
-| `0` | `2 mOhm` | `20 uV` *(placeholder)* | `0` | — | **Excluded from Autorange** (`L` lower limit `>= 1`); index `0` is filled only because `AUTORANGE U=` requires all 10 digits (manual p. 3-32). |
-| `1` | `20 mOhm` | `60 uV` | `1` | `3 mA` | Custom `T=4` active range |
-| `2` | `200 mOhm` | `600 uV` | `3` | `3 mA` | Custom `T=4` active range |
-| `3` | `2 Ohm` | `6 mV` | `5` | `3 mA` | Custom `T=4` active range |
-| `4` | `20 Ohm` | `20 mV` | `6` | `1 mA` | Custom `T=4` active range |
-| `5` | `200 Ohm` | `20 mV` | `6` | `100 uA` | Custom `T=4` active range |
-| `6` | `2 kOhm` | `20 mV` | `6` | `10 uA` | Custom `T=4` active range |
-| `7` | `20 kOhm` | `20 mV` | `6` | `1 uA` | Custom `T=4` active range |
-| `8` | `200 kOhm` | `20 mV` | `6` | `100 nA` | Custom `T=4` active range |
-| `9` | `2 MOhm` | `20 mV` | `6` | `10 nA` | Custom `T=4` active range |
+For the default 3 mA limit, U=0135666666 and L=19: 20 mOhm/60 uV,
+200 mOhm/600 uV and 2 Ohm/6 mV give 3 mA; higher ranges use 20 mV and
+progressively smaller currents. The excluded 2 mOhm entry is not active.
 
-Because this custom trace applies up to `3 mA` (on `20 mOhm`–`2 Ohm`) and `20 mV` (on `20 Ohm`–`2 MOhm`) — higher than the factory `Default` (`T=1`) and `Min Power` (`T=2`) traces — sensitive low-temperature samples that require lower excitation should use **Fixed** range mode or raise `autorange_min_range` accordingly.
+After lowering excitation, Apply writes AUTORANGE U=<generated digits> and
+AUTORANGE T=4 if an enabled channel uses autorange. It leaves AUTORANGE off at
+minimum excitation. The applied settings retain the trace, effective bounds,
+resolved channel configurations and original overrides. Re-Apply regenerates
+the trace and clears cached ranges. GET 6 does not report the trace table;
+there is no invented trace query. Range, excitation, percentage, filter and
+sensor are checked through documented GET 6 readbacks during operation.
 
-The shared switch/filter settle time (`switch_settle_seconds`, default `9.0 s`)
-must be at least **3× the longest enabled digital filter** (`1 s → 3 s`,
-`3 s → 9 s`, `10 s → 30 s`).
+### Channel switching
 
-The LR-700 settings are global rather than stored independently for all
-multiplexer channels. Therefore Apply Settings validates the complete desired
-scan configuration (including range/excitation compatibility before opening
-VISA), connects through GPIB, verifies the documented `GET 6` protocol
-response, and leaves the bridge at the minimum allowable excitation for the
-current resistance range. During Measure, this module's dynamic `slots`
-property makes it run once for the current enabled logical slot and applies and
-verifies only that corresponding sensor.
+During Run, autorange remains active between autorange channels. Each physical
+sensor remembers its last normally settled range. If the next sensor uses the
+current range (or has no cached range) and the current configuration matches,
+only SELECT is written: no RANGE or EXCITATION reset. A required range change
+first lowers excitation, restores the cached/clamped range and the corresponding
+entry from the applied trace, then restores 100% and autorange. The trace itself
+is not rewritten during scanning.
 
-For every enabled sensor:
+For fixed channels with the same range, actual current and common filter,
+switching also writes SELECT only. Independently configured different currents
+or a change between fixed/autorange require lowering excitation and applying
+the target configuration, even when the resistance range is unchanged.
 
-- **Fixed-range slots**:
-  1. confirm minimum excitation (at 5%) for the current resistance range before switching;
-  2. send `AUTORANGE 0`, `MODE 0`, `SELECT S=nn`, step through `RANGE 7` (`20 kOhm`) / `EXCITATION 0` if descending from `200 kOhm` / `2 MOhm` to `< 20 kOhm`, then write `RANGE`, `EXCITATION`, `FILTER`, and ramp `VAREXC` last;
-  3. verify sensor and settings through `GET 6`, wait `switch_settle_seconds`, take two fresh temperature/field snapshots across `dwell_seconds`, read `GET 0`/`GET 1`/`GET 7`, verify `GET 6` again, emit one sparse DAT row, and restore minimum 5% excitation.
-- **Autorange slots (continuous Run mode)**:
-  1. Apply (`configure`) leaves the bridge at minimum 5% excitation; when the Run starts (`run_start`), if the first enabled slot is Autorange, the module programs the custom trace (`AUTORANGE U=0135666666`, `AUTORANGE T=4`), sets `EXCITATION` to match the active/clamped range's trace entry, and turns on `AUTORANGE 1` **once** (keeping the current range unless outside `[min, max]`, never jumping to `max_range`);
-  2. while the Run stays in Autorange mode, each physical sensor caches its last normal settled range index (cleared on re-Apply/Close). If the bridge's current range is already inside the next slot's `[min, max]`, matches that sensor's cached range (or on first visit), and has the matching custom-trace excitation, the module sends only `SELECT S=nn` (preceded by `AUTORANGE L=` only if limits changed, plus `FILTER` if changed) — no `RANGE` reset and no 5% drop. If the current range is outside `[min, max]`, differs from the cached range, or its excitation does not match the custom trace, the module first restores 5% minimum excitation, switches safely to the cached/clamped range (raising `RANGE` before `SELECT` when moving to higher resistance, or switching `SELECT` first and stepping via `RANGE 7` / `EXCITATION 0` when descending from `200 kOhm` / `2 MOhm`), **updates `EXCITATION` to the custom trace entry for that range** (so the excitation current matches the trace table), and then re-enables `AUTORANGE U=0135666666`, `AUTORANGE T=4`, `AUTORANGE L=`, `VAREXC 0`, and `AUTORANGE 1`;
-  3. for each slot, the module checks `GET 6` at `1/4` and at the end of `switch_settle_seconds` (restarting the settle wait if range/excitation changed), takes two fresh temperature/field snapshots across `dwell_seconds`, reads `GET 0`/`GET 1`/`GET 7` with before/after `GET 6` verification, and emits one sparse DAT row;
-  4. on Run end (`completed`/`stopped`/`error`), `Disable` (`close`), switching into a Fixed-range slot, or any error/cancellation during `Measure`, the module restores and readback-confirms `AUTORANGE 0` + minimum 5% excitation and refreshes the Status page's current range/excitation/current fields.
+FILTER 0/1/2 mean 1/3/10 seconds; there is no digital-filter Off value.
+Switch settle must be at least 3x the filter time (default 9 s for FILTER 1).
+Measurements check range settling and read R, X and overload status using
+GET 0/1/7. Run end, Stop, Error and Disable restore and readback-confirm
+AUTORANGE 0 and the minimum legal excitation at 5%. LR700 has no excitation-off
+command. A standalone measurement also restores this minimum state afterwards.
+During Run the application owns instrument settings; manual/other-program
+changes are not supported. The current limit is implemented by programmed
+settings, not an independent hardware protection circuit.
+
+Legacy per-channel files can be loaded into the new UI when their enabled
+channels share a filter and autorange bounds. Fixed rows become independent
+overrides. Files with conflicting common fields require explicit reconfiguration.
 
 The fixed output columns are `TemperatureAverage`, `FieldAverage`, `R1/X1`
 through `R4/X4`, and one common integer `StatusCode` column. Only the current
@@ -103,32 +108,37 @@ Non-zero status is a recoverable Warning and does not stop the SEQ. Every
 nonzero row retains the temperature/field averages and `StatusCode`, but leaves
 the current slot's R/X fields empty; all unmeasured slots are empty as well.
 
-## Excitation safety boundary
+## Verification
 
-The LR-700 command set does not provide a true excitation-off command. The
-lowest software-confirmable state depends on the active resistance range
-(LR-700 v1.3 manual p. 4-12 and hardware-verified):
+The refactor is verified offline with protocol simulation, settings round trips,
+generated trace limits, cached range restoration, fixed/auto mixed scans and
+SELECT-only switching. Previous real-instrument protocol tests remain the basis
+for the LR700 VISA session and command encoding. This refactor has not yet been
+retested with connected samples.
 
-| Resistance range | Minimum allowable excitation | Confirmed safe state (`5%`) |
-| --- | --- | --- |
-| `0–7` (`2 mOhm`–`20 kOhm`) | `EXCITATION 0` (`20 uV`) | `20 uV × 5%` |
-| `8` (`200 kOhm`) | `EXCITATION 2` (`200 uV`) | `200 uV × 5%` (`50 pA`) |
-| `9` (`2 MOhm`) | `EXCITATION 4` (`2 mV`) | `2 mV × 5%` (`50 pA`) |
+## Fixed-reference 10x SEQ commands (0.1.0b9)
 
-The module reads `GET 6`, sets `AUTORANGE 0`, lowers `VAREXC` to `5%`, selects
-the minimum allowable `EXCITATION` for the active range, and confirms the
-result via `GET 6` during Apply, before sensor changes, after every sensor, on
-every completed/Stop/Error `run_end`, and in `close(api)`. If it cannot read
-the state back, it reports an Error instead of claiming the excitation is safe.
-Hardware interlocks and the laboratory's manual emergency procedure remain
-necessary.
+**10x Delta R On** captures the settled absolute R of every enabled sensor in 1x.
+Each reference is written as OFFSET R=<counts>, checked with GET 4, and retained
+with that sensor's settled range, excitation percentage and filter. Capture uses
+the normal applied range strategy; autorange is then disabled for the 10x session.
+Only after all captures succeed is the reference set activated. No reference is
+entered manually. The status page lists the references and their resistance ranges.
 
-## Verification boundaries
+During a field sweep, selecting another sensor first writes MODE 0, applies its
+frozen channel configuration, restores its saved R Set, then writes MODE 1. The
+normal configured settle/dwell precedes the formal reading. References are never
+recaptured during the sweep. The hardware 10x mode also affects Delta X; this
+feature writes only R Set, not X Set. DAT absolute R/X columns are unchanged.
 
-Protocol details were checked against the LR-700 v1.3 manual (pages 2-3 to 2-6,
-2-18 to 2-24, 3-25 to 3-56, 4-4 to 4-16) and against real LR-700/LR-720 bench
-tests (no-load command checks, S1–S4 loaded fixed-range reads, and S1
-`AUTORANGE L=19 / T=2` check). Full OpenLab loaded end-to-end sequences
-(including all autorange traces/boundaries, 1 s and 10 s filter settling, and
-Stop/Error/reconnect recovery under load) should still be verified on hardware
-with a noncritical load before connecting sensitive samples.
+**10x Delta R Off** writes MODE 0 and leaves the current physical R Set unchanged.
+The internal active references are released; subsequent Measure uses the original
+applied automatic/fixed range configuration. Run end/Stop/Error/Disable also return
+to 1x and confirm minimum excitation. A new On captures new references for the next
+temperature point. Unstable ranging/capture or capture overload is a Warning,
+not a fatal SEQ error; communication and write/readback failures remain errors.
+
+Capture timeout is checked before writes. With four channels, 3 s filters and
+9 s settle, normal capture waits total 45 s (4x9 s plus final 10x settle), excluding
+communication. Scanning then waits once per sensor, not two new baseline waits.
+The new OFFSET/GET 4 sequence has offline verification only, not a new bench test.

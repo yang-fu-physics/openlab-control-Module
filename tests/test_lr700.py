@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 from labcontrol.package_support.loading import load_source_object  # noqa: E402
 from labcontrol.module_api import (  # noqa: E402
     ModuleError,
+    ModuleWarning,
 )
 from labcontrol.measurement.frontend_api import (  # noqa: E402
     ModuleUIAPI,
@@ -103,6 +104,9 @@ class _FakeVisaState:
         self.pending_excitation_percent = 5
         self.filter_index = 1
         self.mode = 0
+        self.rset = 0.0
+        self.xset = 0.0
+        self.ignore_mode_one = False
         self.local_lockout = 0
         self.sensor = 0
         self.autorange = 0
@@ -159,11 +163,19 @@ class _FakeTransport:
                 self.state.range_index = target_r
                 self.state.excitation_index = target_e
         elif upper.startswith("MODE "):
-            self.state.mode = int(command.split(" ", 1)[1])
+            requested = int(command.split(" ", 1)[1])
+            if not (requested == 1 and self.state.ignore_mode_one):
+                self.state.mode = requested
+        elif upper.startswith("OFFSET R="):
+            counts = int(command.split("=", 1)[1])
+            self.state.rset = counts / 200000 * (0.002 * 10**self.state.range_index)
         elif upper.startswith("SELECT S="):
             self.state.sensor = int(command.rsplit("=", 1)[1])
         elif upper.startswith("RANGE "):
             target = int(command.split(" ", 1)[1])
+            if self.state.range_index != target:
+                self.state.rset = 0.0
+                self.state.xset = 0.0
             self.state.range_index = target
             allowed = valid_excitation_indices(target)
             if self.state.excitation_index < allowed[0]:
@@ -220,6 +232,8 @@ class _FakeTransport:
                 f"{self.state.local_lockout}L,"
                 f"{self.state.sensor:02d}S"
             )
+        if command == "GET 4":
+            return f"{self.state.rset:+.12f} OHMRSET"
         if command == "GET 0":
             if (
                 self.state.autorange == 1
@@ -371,6 +385,286 @@ class LR700BackendTests(unittest.TestCase):
     ) -> None:
         for logical_slot in module_slots(backend):
             measure_module(backend, context, logical_slot)
+
+    def _common_settings(self, mode="autorange", limit=0.003):
+        return {"resource": "GPIB0::18::INSTR", "common": {
+            "range_mode": mode, "range_index": 2, "current_a": 0.003,
+            "current_limit_a": limit, "autorange_min_range": 1,
+            "autorange_max_range": 9, "filter_index": 1},
+            "channels": {f"r{i}": {"enabled": i <= 2, "input_channel": i,
+                "independent": False, "range_index": 2, "current_a": 0.003} for i in range(1, 5)}}
+
+    def test_apply_generates_trace_once_and_switch_same_range_only_selects(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        backend = self._backend(state, [])
+        context = self._context([], _samples(3))
+        settings = self._common_settings()
+        open_module(backend, context)
+        backend.configure(settings, context)
+        self.assertEqual(state.autorange_user_trace, (0, 1, 3, 5, 6, 6, 6, 6, 6, 6))
+        self.assertEqual(state.autorange_trace, 4)
+        self.assertEqual(state.autorange, 0)
+        self.assertEqual(state.excitation_percent, 5)
+        self.assertEqual(backend.applied_settings["autorange_trace"], list(state.autorange_user_trace))
+        run_start(backend, context)
+        measure_module(backend, context, 1)
+        start = len(state.commands)
+        measure_module(backend, context, 2)
+        self.assertEqual([c for a, c in state.commands[start:] if a == "write"], ["SELECT S=02"])
+        measure_module(backend, context, 1)
+        self.assertEqual(sum(c.startswith("AUTORANGE U=") for a, c in state.commands if a == "write"), 1)
+        run_end(backend, "completed", context)
+        self.assertEqual((state.autorange, state.excitation_percent), (0, 5))
+        backend.close(context)
+
+    def test_generated_trace_limits_and_reapply_replaces_saved_map(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        backend = self._backend(state, [])
+        context = self._context([], _samples(1))
+        settings = self._common_settings(limit=0.0003)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        self.assertEqual(backend.applied_settings["effective_autorange_min_range"], 2)
+        for r in range(2, 10):
+            self.assertLessEqual(excitation_current_a(r, state.autorange_user_trace[r]), 0.0003 * (1 + 1e-12))
+        run_start(backend, context)
+        self.assertEqual(state.autorange_limits, (2, 9))
+        self.assertEqual(state.excitation_index, 1)
+        run_end(backend, "completed", context)
+        settings["common"]["current_limit_a"] = 0.003
+        backend.configure(settings, context)
+        self.assertEqual(backend.applied_settings["effective_autorange_min_range"], 1)
+        self.assertEqual(state.autorange_user_trace[2], 3)
+        self.assertEqual(backend._autorange_last_range, {})
+        backend.close(context)
+
+    def test_fixed_common_same_range_select_only_and_independent_current_restores(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        backend = self._backend(state, [])
+        context = self._context([], _samples(3))
+        settings = self._common_settings(mode="fixed")
+        settings["channels"]["r3"].update(enabled=True, independent=True, current_a=0.00123)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        self.assertFalse(any(c.startswith("AUTORANGE U=") for a, c in state.commands if a == "write"))
+        run_start(backend, context)
+        measure_module(backend, context, 1)
+        start = len(state.commands)
+        measure_module(backend, context, 2)
+        self.assertEqual([c for a, c in state.commands[start:] if a == "write"], ["SELECT S=02"])
+        start = len(state.commands)
+        measure_module(backend, context, 3)
+        writes = [c for a, c in state.commands[start:] if a == "write"]
+        self.assertLess(writes.index("VAREXC =05"), writes.index("SELECT S=03"))
+        self.assertAlmostEqual(excitation_current_a(state.range_index, state.excitation_index, state.excitation_percent), 0.00123)
+        run_end(backend, "completed", context)
+        self.assertEqual(state.excitation_percent, 5)
+        backend.close(context)
+
+    def test_independent_current_over_limit_is_rejected_before_connection(self):
+        state = _FakeVisaState()
+        backend = self._backend(state, [])
+        context = self._context([])
+        settings = self._common_settings()
+        settings["channels"]["r2"].update(independent=True, current_a=0.004)
+        open_module(backend, context)
+        with self.assertRaises(ModuleError):
+            backend.configure(settings, context)
+        self.assertEqual(state.opened, [])
+
+    def test_generated_trace_cache_restores_matching_excitation(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        backend = self._backend(state, [])
+        context = self._context([], _samples(2))
+        settings = self._common_settings(limit=0.001)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context, 1)
+        run_end(backend, "completed", context)
+        run_start(backend, context)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (2, 2, 100))
+        measure_module(backend, context, 1)
+        run_end(backend, "completed", context)
+        backend.close(context)
+
+    def test_trace_uses_largest_legal_excitation_without_exceeding_limit(self):
+        for limit in (0.03, 0.003, 0.001, 0.0003, 1e-6, 1e-9):
+            with self.subTest(limit=limit):
+                normalized = LR700Backend._normalized_settings(self._common_settings(limit=limit),
+                    require_resource=True, operation_timeout_seconds=120)
+                channel = normalized["channels"]["r1"]
+                lo, hi = channel["autorange_min_range"], channel["autorange_max_range"]
+                for r in range(lo, hi + 1):
+                    e = channel["autorange_trace"][r]
+                    self.assertIn(e, valid_excitation_indices(r))
+                    self.assertLessEqual(excitation_current_a(r, e), limit * (1 + 1e-12))
+                    for higher in valid_excitation_indices(r):
+                        if higher > e:
+                            self.assertGreater(excitation_current_a(r, higher), limit * (1 + 1e-12))
+
+    def test_fixed_low_current_does_not_require_usable_autorange_trace(self):
+        settings = self._common_settings(mode="fixed", limit=1e-10)
+        settings["common"].update(range_index=9, current_a=1e-10)
+        normalized = LR700Backend._normalized_settings(settings, require_resource=True, operation_timeout_seconds=120)
+        channel = normalized["channels"]["r1"]
+        self.assertAlmostEqual(excitation_current_a(9, channel["excitation_index"], channel["excitation_percent"]), 1e-10)
+
+    def test_mixed_autorange_and_fixed_override_returns_to_saved_trace(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        backend = self._backend(state, [])
+        context = self._context([], _samples(3))
+        settings = self._common_settings(limit=0.001)
+        settings["channels"]["r2"].update(independent=True, range_index=3, current_a=0.0006)
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context, 1)
+        measure_module(backend, context, 2)
+        self.assertEqual(state.autorange, 0)
+        self.assertAlmostEqual(excitation_current_a(state.range_index, state.excitation_index, state.excitation_percent), 0.0006)
+        measure_module(backend, context, 1)
+        self.assertEqual((state.autorange, state.range_index, state.excitation_index, state.excitation_percent), (1, 2, 2, 100))
+        run_end(backend, "completed", context)
+        backend.close(context)
+
+    def _reference_state(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        state.sensor = 1
+        state.resistance_reply_by_sensor.update({1: "+15.00000 MOHMR", 2: "+150.00000 MOHMR"})
+        return state
+
+    def test_x10_captures_all_enabled_channels_and_restores_fixed_references(self):
+        state = self._reference_state()
+        waits = []
+        backend = self._backend(state, waits)
+        context = self._context([], _samples(4))
+        open_module(backend, context)
+        backend.configure(self._common_settings(mode="fixed"), context)
+        run_start(backend, context)
+        waits.clear()
+        backend.execute_sequence_command("x10_on", {}, context)
+        self.assertEqual(set(backend._x10_channels), {1, 2})
+        self.assertAlmostEqual(backend._x10_channels[1]["reference"], 0.015)
+        self.assertAlmostEqual(backend._x10_channels[2]["reference"], 0.150)
+        self.assertEqual(sum(waits), 27.0)
+        state.resistance_reply_by_sensor.update({1: "+15.00100 MOHMR", 2: "+149.99900 MOHMR"})
+        for slot, reference in ((1, .015), (2, .150), (1, .015), (2, .150)):
+            start = len(state.commands)
+            row = measure_module(backend, context, slot)
+            writes = [c for action, c in state.commands[start:] if action == "write"]
+            self.assertEqual(writes[0], "MODE 0")
+            self.assertEqual(writes[-1], "MODE 1")
+            self.assertLess(writes.index("MODE 0"), writes.index(f"SELECT S={slot:02d}"))
+            self.assertAlmostEqual(state.rset, reference)
+            self.assertEqual(state.mode, 1)
+            self.assertEqual(state.autorange, 0)
+            self.assertEqual(row["StatusCode"], 0)
+        self.assertAlmostEqual(backend._x10_channels[1]["reference"], .015)
+        self.assertAlmostEqual(backend._x10_channels[2]["reference"], .150)
+        start = len(state.commands)
+        backend.execute_sequence_command("x10_off", {}, context)
+        self.assertEqual([c for action,c in state.commands[start:] if action == "write"], ["MODE 0"])
+        self.assertAlmostEqual(state.rset, .150)
+        self.assertEqual(backend._x10_channels, {})
+        run_end(backend, "completed", context)
+        backend.close(context)
+
+    def test_x10_freezes_autorange_and_off_resumes_normal_settings(self):
+        state = self._reference_state()
+        backend = self._backend(state, [])
+        context = self._context([], _samples(2))
+        open_module(backend, context)
+        backend.configure(self._common_settings(), context)
+        run_start(backend, context)
+        backend.execute_sequence_command("x10_on", {}, context)
+        self.assertEqual(state.autorange, 0)
+        self.assertEqual(backend.applied_settings["channels"]["r1"]["range_mode"], "autorange")
+        measure_module(backend, context, 1)
+        self.assertEqual((state.autorange, state.mode), (0, 1))
+        backend.execute_sequence_command("x10_off", {}, context)
+        measure_module(backend, context, 1)
+        self.assertEqual((state.autorange, state.mode), (1, 0))
+        run_end(backend, "completed", context)
+        backend.close(context)
+
+    def test_x10_restores_each_range_before_reference_without_recapturing(self):
+        state = self._reference_state()
+        settings = self._common_settings(mode="fixed")
+        settings["channels"]["r2"].update(independent=True, range_index=3, current_a=.003)
+        state.resistance_reply_by_sensor[2] = "+1.50000 OHMR"
+        backend = self._backend(state, [])
+        context = self._context([], _samples(2))
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        backend.execute_sequence_command("x10_on", {}, context)
+        for slot, expected_range, reference in ((1, 2, .015), (2, 3, 1.5)):
+            measure_module(backend, context, slot)
+            self.assertEqual(state.range_index, expected_range)
+            self.assertAlmostEqual(state.rset, reference)
+            self.assertEqual(state.mode, 1)
+        run_end(backend, "stopped", context)
+        self.assertEqual((state.mode, state.excitation_percent), (0, 5))
+        self.assertEqual(backend._x10_channels, {})
+        backend.close(context)
+
+    def test_x10_partial_capture_failure_does_not_activate_partial_cache(self):
+        state = self._reference_state()
+        state.overloads[2] = 4
+        backend = self._backend(state, [])
+        context = self._context([])
+        open_module(backend, context)
+        backend.configure(self._common_settings(mode="fixed"), context)
+        run_start(backend, context)
+        with self.assertRaises(ModuleWarning) as error:
+            backend.execute_sequence_command("x10_on", {}, context)
+        self.assertEqual(error.exception.code, "LR700_REFERENCE_OVERLOAD")
+        self.assertEqual(backend._x10_channels, {})
+        self.assertEqual(state.mode, 0)
+        run_end(backend, "error", context)
+        backend.close(context)
+
+    def test_x10_readback_errors_and_cancellation_propagate(self):
+        for failure in ("reference", "mode", "cancel"):
+            with self.subTest(failure=failure):
+                state = self._reference_state()
+                backend = self._backend(state, [])
+                context = self._context([])
+                open_module(backend, context)
+                backend.configure(self._common_settings(mode="fixed"), context)
+                run_start(backend, context)
+                if failure == "reference":
+                    state.query_overrides["GET 4"] = "+0.00000 OHMRSET"
+                elif failure == "mode":
+                    state.ignore_mode_one = True
+                else:
+                    def cancel(_api, _seconds):
+                        raise InterruptedError("operator stopped")
+                    backend._waiter = cancel
+                with self.assertRaises(InterruptedError if failure == "cancel" else ModuleError):
+                    backend.execute_sequence_command("x10_on", {}, context)
+                self.assertEqual(backend._x10_channels, {})
+                run_end(backend, "error", context)
+                self.assertEqual(state.mode, 0)
+                backend.close(context)
+
+    def test_x10_command_metadata_and_sequence_round_trip(self):
+        from labcontrol.module_commands import normalize_module_commands
+        from labcontrol.sequence.model import Command, CommandType, SequenceDocument
+        from labcontrol.sequence.parser import parse_sequence, serialize_sequence
+        commands = normalize_module_commands("lr700", LR700Backend.sequence_commands)
+        self.assertEqual([command.command_id for command in commands], ["x10_on", "x10_off"])
+        document = SequenceDocument([Command(CommandType.MODULE_COMMAND, {}, module_id="lr700", module_command_id=command.command_id) for command in commands])
+        result = parse_sequence(serialize_sequence(document))
+        self.assertFalse(result.has_errors)
+        self.assertEqual([command.module_command_id for command in result.document.commands], ["x10_on", "x10_off"])
 
     def test_open_reads_registry_without_connecting_or_writing(
         self,
@@ -551,11 +845,11 @@ class LR700BackendTests(unittest.TestCase):
                 self.assertEqual(closed["Connection"], "Disconnected")
                 self.assertEqual(closed["Current Excitation Current"], "-")
 
-    def test_autorange_mode_programs_custom_trace_handles_mid_read_step_and_restores_safe_state(
+    def test_autorange_mode_preserves_site_trace_handles_mid_read_step_and_restores_safe_state(
         self,
     ) -> None:
-        # 场景 A：四槽位中启用 R1/R2 共享自动量程（L=19, FILTER 1），Run 开始时下发自定义
-        # trace 表 AUTORANGE U=0135666666 与 AUTORANGE T=4、同步当前量程对应的激励档，并只开启一次
+        # 场景 A：四槽位中启用 R1/R2 共享自动量程（L=19, FILTER 1），保留现场已设定的
+        # trace 表、同步当前量程对应的激励档，并只开启一次
         # AUTORANGE 1；同量程切通道只发 SELECT S=nn（不跳 max_range、不反复开关 AUTORANGE、不降 5%），
         # 1/4 到等待结束之间换挡会跳过 dwell 直接重等；Run 结束才恢复 AUTORANGE 0 + 5%。
         settings_two_ar = default_settings()
@@ -573,7 +867,8 @@ class LR700BackendTests(unittest.TestCase):
         state_settle = _FakeVisaState()
         state_settle.range_index = 2  # 桥已在 200 mOhm，不得被强行拉到 2 MOhm (9R)
         state_settle.excitation_index = 0
-        state_settle.autorange_trace = 1  # 模拟仪表原本停在出厂 Default T=1
+        state_settle.autorange_trace = 4
+        state_settle.autorange_user_trace = (0, 1, 3, 5, 6, 6, 6, 6, 6, 6)
         state_settle.resistance_reply_by_sensor[1] = "+15.248 M OHMR"
         state_settle.reactance_reply_by_sensor[1] = "+0.067 M OHMX"
         state_settle.resistance_reply_by_sensor[2] = "+19.626 M OHMR"
@@ -611,8 +906,10 @@ class LR700BackendTests(unittest.TestCase):
             state_settle.autorange_user_trace,
             (0, 1, 3, 5, 6, 6, 6, 6, 6, 6),
         )
-        self.assertIn(("write", "AUTORANGE U=0135666666"), state_settle.commands)
-        self.assertIn(("write", "AUTORANGE T=4"), state_settle.commands)
+        self.assertFalse(any(
+            action == "write" and cmd.startswith(("AUTORANGE U=", "AUTORANGE T="))
+            for action, cmd in state_settle.commands
+        ))
         self.assertIn(("write", "EXCITATION 3"), state_settle.commands)
         self.assertNotIn(("write", "RANGE 9"), state_settle.commands)
 
@@ -746,7 +1043,7 @@ class LR700BackendTests(unittest.TestCase):
         open_module(backend_osc, context_osc)
         backend_osc.configure(settings, context_osc)
         run_start(backend_osc, context_osc)
-        with self.assertRaises(ModuleError) as unstable:
+        with self.assertRaises(ModuleWarning) as unstable:
             measure_module(backend_osc, context_osc, 1)
         self.assertEqual(unstable.exception.code, "LR700_AUTORANGE_UNSTABLE")
         self.assertEqual(state_osc.autorange, 0)
@@ -860,8 +1157,10 @@ class LR700BackendTests(unittest.TestCase):
         self.assertIn("RANGE 7", writes_back_s1)
         self.assertIn("RANGE 1", writes_back_s1)
         self.assertIn("EXCITATION 1", writes_back_s1)
-        self.assertIn("AUTORANGE U=0135666666", writes_back_s1)
-        self.assertIn("AUTORANGE T=4", writes_back_s1)
+        self.assertFalse(any(
+            cmd.startswith(("AUTORANGE U=", "AUTORANGE T="))
+            for cmd in writes_back_s1
+        ))
         self.assertLess(
             writes_back_s1.index("SELECT S=01"),
             writes_back_s1.index("RANGE 1"),
@@ -934,6 +1233,38 @@ class LR700BackendTests(unittest.TestCase):
             ar_timeout.exception.code,
             "LR700_MEASURE_TIMEOUT_UNSAFE",
         )
+
+    def test_cached_range_restores_excitation_without_rewriting_site_trace(self) -> None:
+        state = _FakeVisaState()
+        state.range_index = 2
+        state.autorange_trace = 4
+        state.autorange_user_trace = (0, 1, 3, 5, 6, 6, 6, 6, 6, 6)
+        settings = default_settings()
+        settings["resource"] = "GPIB0::18::INSTR"
+        settings["channels"]["r1"]["range_mode"] = "autorange"
+        backend = self._backend(state, [])
+        context = self._context([], _samples(1))
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context, 1)
+        run_end(backend, "completed", context)
+        self.assertEqual(backend._autorange_last_range, {1: 2})
+        self.assertEqual((state.excitation_index, state.excitation_percent), (0, 5))
+
+        start = len(state.commands)
+        run_start(backend, context)
+        writes = [cmd for action, cmd in state.commands[start:] if action == "write"]
+        self.assertLess(writes.index("EXCITATION 3"), writes.index("VAREXC 0"))
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (2, 3, 100))
+        self.assertEqual(state.autorange_trace, 4)
+        self.assertEqual(state.autorange_user_trace, (0, 1, 3, 5, 6, 6, 6, 6, 6, 6))
+        self.assertFalse(any(
+            action == "write" and cmd.startswith(("AUTORANGE U=", "AUTORANGE T="))
+            for action, cmd in state.commands
+        ))
+        run_end(backend, "completed", context)
+        backend.close(context)
 
     def test_transient_read_failure_reopens_and_resolves_warning(
         self,
@@ -1535,93 +1866,35 @@ class LR700FrontendTests(unittest.TestCase):
             or QApplication([])
         )
 
-    def test_settings_round_trip_valid_excitation_filter_and_autorange_ui(
-        self,
-    ) -> None:
-        context = ModuleUIAPI(resources=measurement_resources({
-            "bridge-lr700": "GPIB0::18::INSTR",
-            "alternate-bridge": "GPIB0::5::INSTR",
-        }))
+    def test_common_table_round_trip_preview_and_fixed_override(self) -> None:
+        context = ModuleUIAPI(resources=measurement_resources({"bridge-lr700": "GPIB0::18::INSTR"}))
         frontend = LR700Frontend(context)
-        owner = QWidget()
-        settings_page = frontend
-        status_page = frontend.status_widget
-        self.assertGreaterEqual(settings_page.sizeHint().width(), 1180)
-        self.assertGreaterEqual(settings_page.sizeHint().height(), 700)
-
-        # 滤波下拉框必须为 1 s / 3 s / 10 s，不包含 Off。
-        r1_filter = frontend.channel_widgets["r1"]["filter_index"]
-        filter_labels = [r1_filter.itemText(i) for i in range(r1_filter.count())]
-        self.assertEqual(filter_labels, ["1 s", "3 s", "10 s"])
-
-        settings = _two_slot_settings()
+        settings = frontend.dump()
         settings["resource"] = "bridge-lr700"
-        settings["channels"]["r3"].update({
-            "input_channel": 3,
-            "enabled": True,
-            "range_mode": "autorange",
-            "autorange_min_range": 1,
-            "autorange_max_range": 9,
-            "filter_index": 1,
-        })
-        settings["channels"]["r4"].update({
-            "input_channel": 16,
-            "enabled": True,
-            "range_mode": "fixed",
-            "range_index": 8,
-            "excitation_index": 2,
-            "excitation_percent": 25,
-            "filter_index": 1,
-        })
+        settings["channels"]["r2"].update(enabled=True, independent=True, range_index=2, current_a=0.00123)
         frontend.load(settings)
-        frontend.show_status({"Connection": "Disconnected"})
-
         self.assertEqual(frontend.dump(), settings)
-        # r3 为自动量程：固定量程控件禁用、自动量程控件启用，且自动量程下拉仅含 20 mOhm (1) 及以上量程。
-        self.assertFalse(frontend.channel_widgets["r3"]["range_index"].isEnabled())
-        ar_min_widget = frontend.channel_widgets["r3"]["autorange_min_range"]
-        ar_max_widget = frontend.channel_widgets["r3"]["autorange_max_range"]
-        self.assertTrue(ar_min_widget.isEnabled())
-        self.assertEqual(
-            [ar_min_widget.itemData(i) for i in range(ar_min_widget.count())],
-            list(range(1, 9)),
-        )
-        self.assertEqual(
-            [ar_max_widget.itemData(i) for i in range(ar_max_widget.count())],
-            list(range(2, 10)),
-        )
-        self.assertIn("T=4", frontend._current_previews["r3"].text())
-        self.assertIn("3 mA", frontend._current_previews["r3"].text())
-        # 切换 r1 到 2 MOhm (9) 时，激励下拉只保留 2 mV / 6 mV / 20 mV (4, 5, 6)。
-        r1_range = frontend.channel_widgets["r1"]["range_index"]
-        r1_exc = frontend.channel_widgets["r1"]["excitation_index"]
-        r1_range.setCurrentIndex(r1_range.findData(9))
-        exc_values = [r1_exc.itemData(i) for i in range(r1_exc.count())]
-        self.assertEqual(exc_values, [4, 5, 6])
-        self.assertEqual(r1_exc.currentData(), 4)
-
-        self.assertGreaterEqual(frontend.resource.count(), 2)
-        self.assertEqual(
-            frontend.status_labels["Connection"].text(),
-            "Disconnected",
-        )
-        actions: list[tuple[str, dict]] = []
-        context.actionRequested.connect(
-            lambda action, payload: actions.append((action, payload))
-        )
-        frontend.resource.setCurrentIndex(
-            frontend.resource.findData("alternate-bridge")
-        )
+        self.assertEqual(frontend.channel_table.rowCount(), 4)
+        self.assertFalse(frontend.channel_widgets["r1"]["range_index"].isEnabled())
+        self.assertTrue(frontend.channel_widgets["r2"]["range_index"].isEnabled())
+        self.assertIn("1.23 mA", frontend.channel_widgets["r2"]["actual"].text())
+        self.assertIn("U=0135666666", frontend.trace_preview.text())
+        filter_widget = frontend.common_widgets["filter_index"]
+        self.assertEqual([filter_widget.itemText(i) for i in range(filter_widget.count())], ["1 s", "3 s", "10 s"])
+        frontend.common_widgets["current_limit_a"].setValue(1)
+        self.assertIn("200 mOhm", frontend.trace_preview.text())
+        self.assertIn("exceeds limit", frontend.channel_widgets["r2"]["actual"].text())
+        actions = []
+        context.actionRequested.connect(lambda action, payload: actions.append((action, payload)))
         frontend.test_connection_button.click()
-        self.application.processEvents()
         self.assertEqual(actions[-1][0], "test_connection")
-        self.assertEqual(
-            actions[-1][1]["settings"]["resource"],
-            "alternate-bridge",
-        )
-        settings_page.deleteLater()
-        status_page.deleteLater()
-        owner.deleteLater()
+        self.assertEqual(actions[-1][1]["settings"]["common"]["current_limit_a"], 0.001)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settings.toml"
+            save_settings(path, frontend.dump())
+            self.assertEqual(load_settings(path), frontend.dump())
+        frontend.deleteLater()
+        frontend.status_widget.deleteLater()
         self.application.processEvents()
 
     def test_nested_settings_can_be_saved_as_toml(
@@ -1641,7 +1914,7 @@ class LR700ManifestTests(unittest.TestCase):
         descriptor = load_manifest(MODULE)
         self.assertTrue(descriptor.valid, descriptor.error)
         self.assertEqual(descriptor.id, "lr700")
-        self.assertEqual(descriptor.version, "0.1.0b7")
+        self.assertEqual(descriptor.version, "0.1.0b9")
         names = list(LR700Backend.columns)
         self.assertEqual(
             names[:4],

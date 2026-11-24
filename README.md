@@ -15,7 +15,7 @@
 | `keithley_2614b` | Keithley 2614B 双通道 SMU A/B 电阻测量 | Beta（仅仿真/协议测试） |
 | `keithley_6517b` | Keithley 6517B 高阻测量（内置电压源 FVMI） | Beta（仅仿真/协议测试） |
 | `lakeshore_372a` | Lake Shore 372 / 372A 交流电阻电桥（1–16 通道扫描） | Beta（仅仿真/协议测试） |
-| `lr700` | Linear Research LR-700 + LR-720-16 交流电桥 | Beta（仅仿真/协议测试） |
+| `lr700` | Linear Research LR-700 + LR-720-16 交流电桥（通用／独立配置、电流上限生成 Trace、固定基准 ×10） | Beta（已有命令读写测试；本次重构与 ×10 仅离线验证） |
 | `simulated_transport` | 无需硬件的四通道模拟电阻模块 | 教学与仿真测试用 |
 
 > 接真机前请先阅读对应模块目录中的 `README.md`，并在假负载上完成低风险验证。软件测试不能替代硬件联锁、限流/限压和人工急停。

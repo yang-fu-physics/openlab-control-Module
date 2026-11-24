@@ -10,7 +10,7 @@
 
 LR-700 没有真正的 excitation-off 命令。软件能确认的最低状态是“当前电阻量程允许的
 最低激励档 × 5%”（0-7 档为 20 uV，200 kOhm 为 200 uV，2 MOhm 为 2 mV）；
-切换通道、Stop、Error、Disable 和退出时都回到并读回确认该状态。任何无法读回确认
+配置变化、Stop、Error、Disable 和退出时回到并读回确认该状态；同配置通道切换只发送 SELECT。任何无法读回确认
 最低激励的情况都是 Error，不能仅凭 worker 已退出宣称仪表安全。
 """
 
@@ -43,12 +43,16 @@ from .constants import (
     STATUS_CODE_OVER_RANGE,
     autorange_trace_excitation_index,
     default_settings,
+    common_defaults,
+    generate_trace,
+    fixed_current_settings,
     excitation_current_a,
     excitation_label,
     format_current,
     is_valid_range_excitation,
     minimum_excitation_index,
     range_label,
+    range_ohms,
     valid_excitation_indices,
 )
 from . import lr700 as instrument
@@ -91,6 +95,13 @@ class LR700Backend:
     }
     display_columns = ("R1", "R2", "R3", "R4")
 
+    sequence_commands = [
+        {"id": "x10_on", "label": "10x Delta R On", "kind": "command",
+         "description": "Capture fixed R Set references for every enabled sensor, freeze their settled range/excitation and enable 10x. Restore each sensor's reference during the field sweep.", "fields": []},
+        {"id": "x10_off", "label": "10x Delta R Off", "kind": "command",
+         "description": "Return to 1x difference gain, keeping R Set unchanged.", "fields": []},
+    ]
+
     def __init__(
         self,
         transport_factory: TransportFactory | None = None,
@@ -113,6 +124,8 @@ class LR700Backend:
         self.sequence_active = False
         self.last_values: dict[str, Any] = {}
         self._last_safe_bridge: dict[str, int] | None = None
+        self._measurement_mode = 0
+        self._x10_channels: dict[int, dict[str, Any]] = {}
         self._autorange_running = False
         self._autorange_active_limits: tuple[int, int] | None = None
         self._autorange_active_filter: int | None = None
@@ -156,12 +169,7 @@ class LR700Backend:
         settings: Mapping[str, Any],
         api: ModuleAPI,
     ) -> Mapping[str, Any]:
-        """连接并确认 LR-700 协议，然后把桥置于最低可确认激励。
-
-        LR-700 的量程、滤波和激励是全局状态，不能同时为多个传感器各保存一套。
-        因此 Apply 表示“接受并验证四槽位扫描参数”，Measure 才在切换每个物理输入后
-        发送该槽位的参数。Apply 不会把 R1 的工作激励长期留在样品上。
-        """
+        """验证通用/独立配置，连接并降至最低激励；自动量程 Trace 在此写入并保存。"""
 
         desired = self._normalized_settings(
             settings,
@@ -201,6 +209,10 @@ class LR700Backend:
             )
             connected = True
             safe_bridge = self._set_safe_state(api)
+            if "common" in desired and any(c["enabled"] and c["range_mode"] == "autorange" for c in desired["channels"].values()):
+                trace_text = "".join(str(e) for e in desired["autorange_trace"])
+                self._write_absolute(f"AUTORANGE U={trace_text}", api)
+                self._write_absolute("AUTORANGE T=4", api)
         except Exception as failure:
             cleanup_error = (
                 self._best_effort_safe_state(api)
@@ -219,14 +231,15 @@ class LR700Backend:
                 ) from failure
             raise
         self.applied_settings = deepcopy(desired)
+        self._x10_channels.clear()
         self._autorange_last_range.clear()
         status = {
             "Connection": "Connected",
             "Resource": desired["resource"],
             "Protocol": self.protocol_signature,
             "Applied Settings": (
-                "Applied; per-slot settings are sent "
-                "during Measure"
+                "Applied; generated trace saved; "
+                "channel settings resolved for Measure"
             ),
             "Excitation Safety": self._safe_state_text(safe_bridge),
             **self._bridge_status_fields(safe_bridge),
@@ -236,6 +249,113 @@ class LR700Backend:
         }
         api.status(status)
         return status
+
+    def execute_sequence_command(self, command_id, parameters, api):
+        self._require_ready()
+        settle = float(self.applied_settings["switch_settle_seconds"])
+        if command_id == "x10_off":
+            self._write_absolute("MODE 0", api)
+            self._measurement_mode = 0
+            bridge = self._query_bridge_settings(api)
+            if bridge["mode"] != 0:
+                raise ModuleError("LR700 did not confirm 1x mode", "LR700_SETTINGS_VERIFY_FAILED")
+            self._x10_channels.clear()
+            self._waiter(api, settle)
+            status = {**self._bridge_status_fields(bridge), "10x References": "Inactive",
+                      "Last Action": "10x off; R Set retained; normal channel settings resume on Measure"}
+        elif command_id == "x10_on":
+            settings = self.applied_settings
+            attempts = sum(self._slot_measure_attempts(settings["channels"][f"r{slot}"], settings) for slot in self.slots)
+            estimate = attempts * (settle + 2.0) + settle + float(settings["io_timeout_seconds"]) * int(settings["retry_attempts"]) + 5.0
+            if estimate > api.timeout - 2.0:
+                raise ModuleError(f"Capturing all LR700 references may require {estimate:.1f} s; increase the module operation timeout before activation", "LR700_REFERENCE_TIMEOUT_UNSAFE")
+            self._write_absolute("MODE 0", api)
+            self._measurement_mode = 0
+            self._x10_channels.clear()
+            captured = {}
+            for slot in self.slots:
+                channel = settings["channels"][f"r{slot}"]
+                sensor = int(channel["input_channel"])
+                self._prepare_sensor(sensor, channel, settings, api)
+                # Capture absolute R in 1x with a zero offset, including signed Hall signals.
+                self._write_absolute("OFFSET R=+000000", api)
+                for _attempt in range(self._slot_measure_attempts(channel, settings)):
+                    if channel["range_mode"] == "autorange":
+                        self._waiter(api, settle / 4)
+                        mid = self._query_bridge_settings(api)
+                        self._verify_channel_readback(sensor, channel, mid)
+                        self._waiter(api, settle * 3 / 4)
+                        before = self._query_bridge_settings(api)
+                        self._verify_channel_readback(sensor, channel, before)
+                        if not self._same_bridge_range_state(mid, before):
+                            continue
+                    else:
+                        self._waiter(api, settle)
+                        before = self._query_bridge_settings(api)
+                        self._verify_channel_readback(sensor, channel, before)
+                    resistance = self._query_measurement(instrument.GET_RESISTANCE, "R", before["range_index"], api)
+                    bits = self._query_overloads(api)
+                    after = self._query_bridge_settings(api)
+                    self._verify_channel_readback(sensor, channel, after)
+                    if not self._same_bridge_range_state(before, after):
+                        continue
+                    if bits:
+                        raise ModuleWarning(f"Cannot capture R{slot}/S{sensor} reference while the bridge reports overload", "LR700_REFERENCE_OVERLOAD")
+                    break
+                else:
+                    raise ModuleWarning(f"LR700 did not settle before capturing R{slot}/S{sensor}", "LR700_AUTORANGE_UNSTABLE")
+                self._write_absolute("AUTORANGE 0", api)
+                self._reset_autorange_session()
+                frozen = {**channel, "range_mode": "fixed", **{name: after[name] for name in (
+                    "range_index", "excitation_index", "excitation_percent", "filter_index")}}
+                full_scale = range_ohms(after["range_index"])
+                counts = round(resistance / full_scale * 200000)
+                if not -199999 <= counts <= 199999:
+                    raise ModuleError(f"R{slot} cannot be represented by R Set on this range", "LR700_REFERENCE_OUT_OF_RANGE")
+                reference = self._set_reference(counts, after["range_index"], api)
+                captured[slot] = {"channel": frozen, "counts": counts, "reference": reference}
+                self._autorange_last_range[sensor] = after["range_index"]
+            self._write_absolute("MODE 1", api)
+            bridge = self._query_bridge_settings(api)
+            if bridge["mode"] != 1:
+                raise ModuleError("LR700 did not confirm 10x mode", "LR700_SETTINGS_VERIFY_FAILED")
+            self._measurement_mode = 1
+            self._waiter(api, settle)
+            bridge = self._query_bridge_settings(api)
+            self._verify_channel_readback(sensor, frozen, bridge)
+            self._x10_channels = captured
+            references = "; ".join(f"R{slot}/S{entry['channel']['input_channel']}: {entry['reference']:.12g} Ohm @ {range_label(entry['channel']['range_index'])}" for slot, entry in captured.items())
+            status = {**self._bridge_status_fields(bridge), "10x References": references,
+                      "Last Action": "All enabled sensor references captured; 10x on, ranges fixed"}
+        else:
+            raise ModuleError(f"Unknown LR700 command: {command_id}", "LR700_INVALID_COMMAND")
+        api.status(status)
+        return status
+
+    def _set_reference(self, counts: int, range_index: int, api: ModuleAPI) -> float:
+        self._write_absolute(f"OFFSET R={counts:+07d}", api)
+        reference = self._query_measurement("GET 4", "RSET", range_index, api)
+        full_scale = range_ohms(range_index)
+        if abs(reference - counts * full_scale / 200000) > full_scale / 200000 * 0.51:
+            raise ModuleError("LR700 R Set readback mismatch", "LR700_SETTINGS_VERIFY_FAILED")
+        return reference
+
+    def _prepare_x10_sensor(self, slot, input_channel, channel, settings, api):
+        current = self._query_bridge_settings(api)
+        if current["sensor"] == input_channel and current["mode"] == 1 and all(
+            current[name] == int(channel[name]) for name in ("range_index", "excitation_index", "excitation_percent", "filter_index")
+        ):
+            self._verify_channel_readback(input_channel, channel, current)
+            return current
+        self._write_absolute("MODE 0", api)
+        self._measurement_mode = 0
+        self._prepare_sensor(input_channel, channel, settings, api)
+        self._set_reference(self._x10_channels[slot]["counts"], channel["range_index"], api)
+        self._write_absolute("MODE 1", api)
+        self._measurement_mode = 1
+        bridge = self._query_bridge_settings(api)
+        self._verify_channel_readback(input_channel, channel, bridge)
+        return bridge
 
     def _run_start(
         self,
@@ -310,6 +430,8 @@ class LR700Backend:
                 "LR700_LOGICAL_SLOT_DISABLED",
                 f"r{slot}",
             )
+        if self._x10_channels:
+            channel = self._x10_channels[slot]["channel"]
         self._validate_measure_duration(
             settings,
             api.timeout,
@@ -333,6 +455,41 @@ class LR700Backend:
             if self.applied_settings["channels"][f"r{slot}"]["enabled"]
         )
 
+    def _prepare_sensor(self, input_channel, channel, settings, api):
+        is_autorange = channel["range_mode"] == "autorange"
+        if is_autorange and self._autorange_running:
+            configured_bridge = self._switch_autorange_sensor(
+                input_channel,
+                channel,
+                api,
+            )
+        elif is_autorange:
+            safe_bridge = self._set_safe_state(api)
+            configured_bridge = self._start_autorange_session(
+                input_channel,
+                channel,
+                api,
+                current_range_index=int(safe_bridge["range_index"]),
+                target_range_index=self._autorange_last_range.get(input_channel),
+            )
+        else:
+            current = self._query_bridge_settings(api) if "common" in settings and self.sequence_active else None
+            same_configuration = current is not None and not self._autorange_running and all(
+                current[name] == int(channel[name])
+                for name in ("range_index", "excitation_index", "excitation_percent", "filter_index")
+            )
+            if same_configuration:
+                self._write_absolute(f"SELECT S={input_channel:02d}", api)
+                configured_bridge = self._query_bridge_settings(api)
+                self._verify_channel_readback(input_channel, channel, configured_bridge)
+            else:
+                safe_bridge = self._set_safe_state(api)
+                configured_bridge = self._configure_sensor(
+                    input_channel, channel, api,
+                    current_range_index=int(safe_bridge["range_index"]),
+                )
+        return configured_bridge
+
     def _measure_sensor(
         self,
         slot: int,
@@ -355,29 +512,10 @@ class LR700Backend:
         )
         failure: BaseException | None = None
         try:
-            if is_autorange and self._autorange_running:
-                configured_bridge = self._switch_autorange_sensor(
-                    input_channel,
-                    channel,
-                    api,
-                )
-            elif is_autorange:
-                safe_bridge = self._set_safe_state(api)
-                configured_bridge = self._start_autorange_session(
-                    input_channel,
-                    channel,
-                    api,
-                    current_range_index=int(safe_bridge["range_index"]),
-                    target_range_index=self._autorange_last_range.get(input_channel),
-                )
+            if self._x10_channels:
+                configured_bridge = self._prepare_x10_sensor(slot, input_channel, channel, settings, api)
             else:
-                safe_bridge = self._set_safe_state(api)
-                configured_bridge = self._configure_sensor(
-                    input_channel,
-                    channel,
-                    api,
-                    current_range_index=int(safe_bridge["range_index"]),
-                )
+                configured_bridge = self._prepare_sensor(input_channel, channel, settings, api)
             api.status({
                 **self._bridge_status_fields(configured_bridge),
                 "Excitation Safety": (
@@ -497,7 +635,7 @@ class LR700Backend:
                     settled_bridge = after
                     break
             if settled_bridge is None:
-                raise ModuleError(
+                raise ModuleWarning(
                     "LR-700 autorange range or excitation kept changing "
                     f"during measurement on sensor {input_channel}; "
                     "increase Switch / filter settle time or narrow "
@@ -618,9 +756,8 @@ class LR700Backend:
         finally:
             keep_autorange_running = (
                 failure is None
-                and is_autorange
                 and self.sequence_active
-                and self._autorange_running
+                and ((is_autorange and self._autorange_running) or (not is_autorange and "common" in settings))
             )
             if not keep_autorange_running:
                 # Stop 会让普通 api checkpoint 立即取消，因此清理路径直接使用带
@@ -665,7 +802,7 @@ class LR700Backend:
             }
             api.status(status)
             return status
-        error = self._best_effort_safe_state(api)
+        error = self._best_effort_safe_state(api, reset_mode=True)
         self.sequence_active = False
         if error is not None:
             api.status({
@@ -702,7 +839,7 @@ class LR700Backend:
             self.applied_settings
         )
         error = (
-            self._best_effort_safe_state(api)
+            self._best_effort_safe_state(api, reset_mode=True)
             if had_applied_connection
             else None
         )
@@ -1074,16 +1211,17 @@ class LR700Backend:
             channel,
             current_range_index=current_range_index,
             target_range_index=target_range_index,
+            measurement_mode=self._measurement_mode,
         )
         for command in commands:
             self._write_absolute(command, api)
+        self._autorange_running = True
         bridge = self._query_bridge_settings(api)
         self._verify_channel_readback(
             input_channel,
             channel,
             bridge,
         )
-        self._autorange_running = True
         self._autorange_active_limits = (
             int(channel["autorange_min_range"]),
             int(channel["autorange_max_range"]),
@@ -1109,7 +1247,7 @@ class LR700Backend:
         in_new_bounds = min_range <= current_range <= max_range
         same_as_cached = cached_range is None or cached_range == current_range
         exc_matches_trace = (
-            current_exc == autorange_trace_excitation_index(current_range)
+            current_exc == channel.get("autorange_trace", tuple(autorange_trace_excitation_index(r) for r in range(10)))[current_range]
         )
 
         if not in_new_bounds or not same_as_cached or not exc_matches_trace:
@@ -1154,6 +1292,7 @@ class LR700Backend:
             input_channel,
             channel,
             current_range_index=current_range_index,
+            measurement_mode=self._measurement_mode,
         )
         for command in commands:
             self._write_absolute(
@@ -1198,6 +1337,8 @@ class LR700Backend:
     def _best_effort_safe_state(
         self,
         api: ModuleAPI,
+        *,
+        reset_mode: bool = False,
     ) -> str | None:
         """在取消/异常路径直接按当前电阻量程设置最低激励，返回未确认原因而不吞掉原异常。
 
@@ -1282,6 +1423,14 @@ class LR700Backend:
                         ).strip()
                     )
                 self._verify_safe_state(bridge)
+                if reset_mode:
+                    if bridge["mode"] != 0:
+                        transport.write("MODE 0")
+                        bridge = self._parse_bridge_settings(str(transport.query(instrument.GET_SETTINGS)).strip())
+                        if bridge["mode"] != 0:
+                            raise ModuleError("LR700 did not confirm 1x during cleanup", "LR700_SETTINGS_VERIFY_FAILED")
+                    self._measurement_mode = 0
+                    self._x10_channels.clear()
                 self._last_safe_bridge = dict(bridge)
                 return None
             except Exception as exc:
@@ -1320,6 +1469,7 @@ class LR700Backend:
             "Current Excitation (%)": percent,
             "Current Excitation Current": current_text,
             "Current Filter Index": int(bridge["filter_index"]),
+            "Current Difference Mode": "10x" if bridge["mode"] else "1x",
         }
 
     @staticmethod
@@ -1333,6 +1483,7 @@ class LR700Backend:
             "Current Excitation (%)": placeholder,
             "Current Excitation Current": placeholder,
             "Current Filter Index": placeholder,
+            "Current Difference Mode": placeholder,
         }
 
     @staticmethod
@@ -1360,9 +1511,8 @@ class LR700Backend:
         self,
         api: ModuleAPI,
     ) -> dict[str, int]:
-        return self._parse_bridge_settings(
-            self._query_text(instrument.GET_SETTINGS, api)
-        )
+        bridge = self._parse_bridge_settings(self._query_text(instrument.GET_SETTINGS, api))
+        return bridge
 
     @classmethod
     def _parse_bridge_settings(
@@ -1401,8 +1551,8 @@ class LR700Backend:
             == int(right["excitation_percent"])
         )
 
-    @staticmethod
     def _verify_channel_readback(
+        self,
         input_channel: int,
         channel: Mapping[str, Any],
         bridge: Mapping[str, int],
@@ -1416,7 +1566,7 @@ class LR700Backend:
             expected_common = {
                 "filter_index": int(channel["filter_index"]),
                 "excitation_percent": 100,
-                "mode": 0,
+                "mode": self._measurement_mode,
                 "sensor": input_channel,
             }
             actual_common = {
@@ -1463,7 +1613,7 @@ class LR700Backend:
             "filter_index": int(
                 channel["filter_index"]
             ),
-            "mode": 0,
+            "mode": self._measurement_mode,
             "sensor": input_channel,
         }
         actual = {
@@ -1894,6 +2044,55 @@ class LR700Backend:
 
         defaults = default_settings()
         raw = dict(settings)
+        common = None
+        if "common" in raw:
+            if not isinstance(raw["common"], Mapping):
+                raise ModuleError("common must be a settings table", "LR700_INVALID_SETTINGS", "common")
+            common = {**common_defaults(), **raw["common"]}
+            common["current_limit_a"] = cls._number(common["current_limit_a"], 1e-12, 0.03, "common.current_limit_a")
+            common["current_a"] = cls._number(common["current_a"], 1e-12, 0.03, "common.current_a")
+            lo = cls._integer(common["autorange_min_range"], 1, 8, "common.autorange_min_range")
+            hi = cls._integer(common["autorange_max_range"], 2, 9, "common.autorange_max_range")
+            if lo >= hi:
+                raise ModuleError("Autorange maximum must exceed minimum", "LR700_INVALID_SETTINGS", "common")
+            common["range_mode"] = str(common["range_mode"]).strip().casefold()
+            if common["range_mode"] not in {"autorange", "fixed"}:
+                raise ModuleError("Unknown common range mode", "LR700_INVALID_SETTINGS", "common.range_mode")
+            if common["range_mode"] == "autorange":
+                try:
+                    trace, effective_lo, effective_hi = generate_trace(common["current_limit_a"], lo, hi)
+                except ValueError as exc:
+                    raise ModuleError(str(exc), "LR700_INVALID_SETTINGS", "common.current_limit_a") from exc
+            else:
+                trace = [minimum_excitation_index(r) for r in range(10)]
+                effective_lo, effective_hi = lo, hi
+            raw_channels = raw.get("channels", {})
+            if not isinstance(raw_channels, Mapping):
+                raise ModuleError("channels must be a settings table", "LR700_INVALID_SETTINGS", "channels")
+            resolved = {}
+            for slot in range(1, 5):
+                key = f"r{slot}"
+                supplied = raw_channels.get(key, {})
+                if not isinstance(supplied, Mapping):
+                    raise ModuleError(f"{key} must be a settings table", "LR700_INVALID_SETTINGS", key)
+                override = cls._boolean(supplied.get("independent", False), f"{key}.independent")
+                channel = {**defaults["channels"][key], **common,
+                           "input_channel": supplied.get("input_channel", slot),
+                           "enabled": supplied.get("enabled", slot == 1),
+                           "autorange_min_range": effective_lo, "autorange_max_range": effective_hi}
+                if override:
+                    channel.update(range_mode="fixed", range_index=supplied.get("range_index", 2),
+                                   current_a=supplied.get("current_a", 0.003))
+                if channel["range_mode"] == "fixed":
+                    r = cls._integer(channel["range_index"], 0, 9, f"{key}.range_index")
+                    current = cls._number(channel["current_a"], 1e-12, common["current_limit_a"], f"{key}.current_a")
+                    try:
+                        e, percent, _actual = fixed_current_settings(r, current)
+                    except ValueError as exc:
+                        raise ModuleError(str(exc), "LR700_INVALID_SETTINGS", key) from exc
+                    channel.update(range_index=r, excitation_index=e, excitation_percent=percent)
+                resolved[key] = channel
+            raw["channels"] = resolved
         result = {
             key: raw.get(key, value)
             for key, value in defaults.items()
@@ -2116,6 +2315,14 @@ class LR700Backend:
                 "LR700_INVALID_SETTINGS",
                 "switch_settle_seconds",
             )
+        if common is not None:
+            result["common"] = common
+            result["channel_overrides"] = deepcopy(settings.get("channels", {}))
+            result["autorange_trace"] = trace
+            result["effective_autorange_min_range"] = effective_lo
+            result["effective_autorange_max_range"] = effective_hi
+            for channel in channels.values():
+                channel["autorange_trace"] = trace
         result["channels"] = channels
         cls._validate_measure_duration(
             result,

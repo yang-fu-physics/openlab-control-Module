@@ -72,20 +72,18 @@ FILTERS: tuple[
 FILTER_SETTLE_MULTIPLIER = 3.0
 
 # 通道量程模式：固定量程与仪表自动量程（LR-700-AR）。
-# 自动量程下发自定义 User Defined 跟踪表（AUTORANGE U=0135666666 与 AUTORANGE T=4），
-# 仅开放 20 mOhm (1R) 及以上量程（AUTORANGE L=<1-8><2-9>），不使用出厂常见 trace 表
-# （Default T=1 / Min Power T=2 / Max Power T=3）。
+# 自动量程使用操作者已在仪表上设置的 T=4 / U=0135666666；软件不改写 U= 或 T=。
+# 下面的映射只用于恢复量程时同步激励，仅开放 20 mOhm (1R) 及以上量程。
 RANGE_MODES: tuple[tuple[str, str], ...] = (
     ("fixed", "Fixed"),
     ("autorange", "Autorange"),
 )
 
-AUTORANGE_TRACE_INDEX = 4
 AUTORANGE_MIN_RANGE_INDEX = 1
 AUTORANGE_MAX_RANGE_INDEX = 9
 
-# 手册 p. 3-32：AUTORANGE U= 必须提供 0-9 共 10 个量程的激励编码。
-# 本模块自动量程仅允许 20 mOhm (1) 及以上量程；索引 0 (2 mOhm) 仅作合法协议占位（0E / 20 uV）。
+# 现场已确认的 10 档激励映射；更改仪表 Trace 时须同步此映射。
+# 本模块自动量程仅允许 20 mOhm (1) 及以上量程，不使用索引 0 (2 mOhm)。
 # 1: 20 mOhm  -> 1 (60 uV,  3 mA)
 # 2: 200 mOhm -> 3 (600 uV, 3 mA)
 # 3: 2 Ohm    -> 5 (6 mV,   3 mA)
@@ -202,12 +200,6 @@ def autorange_trace_excitation_index(range_index: int) -> int:
     return AUTORANGE_USER_TRACE_EXCITATIONS[index]
 
 
-def autorange_user_trace_parameter() -> str:
-    """返回 AUTORANGE U= 所需的 10 位激励编码串（'0135666666'）。"""
-
-    return "".join(str(exc) for exc in AUTORANGE_USER_TRACE_EXCITATIONS)
-
-
 def excitation_current_a(
     range_index: int,
     excitation_index: int,
@@ -235,6 +227,44 @@ def format_current(amperes: float) -> str:
         if magnitude >= threshold:
             return f"{amperes * scale:.4g} {unit}"
     return f"{amperes * 1.0e12:.4g} pA"
+
+
+def common_defaults() -> dict[str, Any]:
+    return {
+        "range_mode": "autorange", "range_index": 2,
+        "current_a": 0.003, "current_limit_a": 0.003,
+        "autorange_min_range": 1, "autorange_max_range": 9,
+        "filter_index": 1,
+    }
+
+
+def generate_trace(limit_a: float, lo: int, hi: int) -> tuple[list[int], int, int]:
+    """Trace uses 100%; exclude ranges whose minimum excitation exceeds the limit."""
+    trace: list[int] = []
+    usable: list[int] = []
+    for r in range(10):
+        allowed = valid_excitation_indices(r)
+        candidates = [e for e in allowed if excitation_current_a(r, e) <= limit_a * (1 + 1e-12)]
+        trace.append(candidates[-1] if candidates else allowed[0])
+        if lo <= r <= hi and candidates:
+            usable.append(r)
+    if len(usable) < 2:
+        raise ValueError("Current limit leaves fewer than two autorange ranges")
+    return trace, usable[0], usable[-1]
+
+
+def fixed_current_settings(range_index: int, current_a: float) -> tuple[int, int, float]:
+    """Choose the closest representable current at or below the requested current."""
+    import math
+    candidates = []
+    for e in valid_excitation_indices(range_index):
+        full = excitation_current_a(range_index, e)
+        percent = min(100, math.floor(current_a / full * 100 + 1e-10))
+        if percent >= 5:
+            candidates.append((e, percent, full * percent / 100))
+    if not candidates:
+        raise ValueError(f"Requested current is below the minimum on {range_label(range_index)}")
+    return max(candidates, key=lambda item: item[2])
 
 
 def default_channel(slot: int) -> dict[str, Any]:
@@ -280,7 +310,6 @@ def default_settings() -> dict[str, Any]:
 __all__ = [
     "AUTORANGE_MAX_RANGE_INDEX",
     "AUTORANGE_MIN_RANGE_INDEX",
-    "AUTORANGE_TRACE_INDEX",
     "AUTORANGE_USER_TRACE_EXCITATIONS",
     "COMMON_MODE_OVERLOAD_HINT",
     "COMMON_MODE_OVERLOAD_MASK",
@@ -298,7 +327,6 @@ __all__ = [
     "STATUS_CODE_OVER_RANGE",
     "VALID_EXCITATION_INDICES_BY_RANGE",
     "autorange_trace_excitation_index",
-    "autorange_user_trace_parameter",
     "default_channel",
     "default_settings",
     "excitation_current_a",

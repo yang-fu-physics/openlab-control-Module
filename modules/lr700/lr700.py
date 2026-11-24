@@ -15,11 +15,9 @@ from typing import Any, Protocol
 from labcontrol.measurement.visa import VisaSession
 
 from .constants import (
-    AUTORANGE_TRACE_INDEX,
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
     autorange_trace_excitation_index,
-    autorange_user_trace_parameter,
     minimum_excitation_index,
 )
 
@@ -120,6 +118,7 @@ def autorange_start_commands(
     *,
     current_range_index: int | None = None,
     target_range_index: int | None = None,
+    measurement_mode: int = 0,
 ) -> tuple[str, ...]:
     """在 5% 安全态下切传感器、切到目标量程并同步自定义 trace 激励后开启 AUTORANGE 1。
 
@@ -127,8 +126,8 @@ def autorange_start_commands(
       则先在 5% 下安全切至该缓存量程；
     - 否则保持当前量程（若当前量程落在 ``[min_range, max_range]`` 之外则钳位进边界）；
     - 无论是否改变电阻量程，都会把 ``EXCITATION`` 更新为自定义 trace 表中对应目标量程的
-      激发电压（即对应目标激发电流），再下发 ``AUTORANGE U=0135666666``、``AUTORANGE T=4``、
-      ``AUTORANGE L=``、``VAREXC 0`` 与 ``AUTORANGE 1``。
+      激发电压（即对应目标激发电流），再下发 ``AUTORANGE L=``、``VAREXC 0`` 与
+      ``AUTORANGE 1``。Trace 已在 Apply 阶段写入，此处复用已保存的映射。
     """
 
     min_range = int(channel["autorange_min_range"])
@@ -147,7 +146,7 @@ def autorange_start_commands(
     if target_range is None:
         switch_sequence: tuple[str, ...] = (select_cmd,)
     else:
-        target_exc = autorange_trace_excitation_index(target_range)
+        target_exc = channel.get("autorange_trace", tuple(autorange_trace_excitation_index(r) for r in range(10)))[target_range]
         move_commands: tuple[str, ...] = (
             ()
             if current_range_index is not None
@@ -174,11 +173,9 @@ def autorange_start_commands(
 
     return (
         "AUTORANGE 0",
-        "MODE 0",
+        f"MODE {measurement_mode}",
         *switch_sequence,
         f"FILTER {filter_index}",
-        f"AUTORANGE U={autorange_user_trace_parameter()}",
-        f"AUTORANGE T={AUTORANGE_TRACE_INDEX}",
         f"AUTORANGE L={min_range}{max_range}",
         "VAREXC 0",
         "AUTORANGE 1",
@@ -211,12 +208,13 @@ def configuration_commands(
     channel: Mapping[str, object],
     *,
     current_range_index: int | None = None,
+    measurement_mode: int = 0,
 ) -> tuple[str, ...]:
     """生成当前传感器的完整绝对配置，并保证切换中间态不提前抬高激励。
 
     调用前桥应处于最低激励 x 5%。固定量程模式先切传感器、量程、激励档和滤波，
     最后才抬升激励百分比；自动量程模式复用 ``autorange_start_commands``，
-    按自定义 ``T=4`` 跟踪表同步目标量程激励并下发 ``AUTORANGE U=`` / ``T=4`` / ``L=``。
+    按现场已确认的跟踪表同步目标量程激励，仅下发 ``AUTORANGE L=``，不改写 Trace。
     """
 
     mode = str(channel.get("range_mode", "fixed")).strip().casefold()
@@ -225,6 +223,7 @@ def configuration_commands(
             input_channel,
             channel,
             current_range_index=current_range_index,
+            measurement_mode=measurement_mode,
         )
 
     filter_index = int(channel["filter_index"])
@@ -232,7 +231,7 @@ def configuration_commands(
     target_excitation = int(channel["excitation_index"])
     return (
         "AUTORANGE 0",
-        "MODE 0",
+        f"MODE {measurement_mode}",
         f"SELECT S={int(input_channel):02d}",
         *_range_transition_commands(target_range, current_range_index),
         f"EXCITATION {target_excitation}",
