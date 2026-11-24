@@ -490,3 +490,139 @@ class LockInTests(unittest.TestCase):
         for point in v_points:
             self.scan("voltage", point)
         self.assertAlmostEqual(self.module.measure(1, self.api)["Source Voltage"], 0.1)
+
+    def test_set_current_holds_output_through_repeated_measurements(self):
+        self.start_current()
+        with patch.object(ModuleAPI, "sleep", autospec=True) as wait:
+            self.current_module.execute_sequence_command("set_current", {"current": "1mA", "settle_seconds": 3}, self.api)
+        self.assertEqual(wait.call_args.args[1], 3)
+        writes = self.source.writes[:]
+        for _ in range(3):
+            row = self.current_module.measure(1, self.api)
+            self.assertEqual(row["Source Current"], .001)
+        self.assertEqual(self.source.writes, writes)
+        self.assertEqual(self.source.values["OUTP?"], "1")
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            self.current_module.on_event("run_end", {"reason": "stopped"}, self.api)
+        self.assertEqual(self.source.values["OUTP?"], "0")
+
+    def test_set_current_sign_change_and_zero_use_existing_ramp(self):
+        self.start_current()
+        with patch.object(ModuleAPI, "sleep", autospec=True):
+            for value in ("100u", "-100u"):
+                self.current_module.execute_sequence_command("set_current", {"current": value, "settle_seconds": 0}, self.api)
+            self.assertEqual(self.current_module.measure(1, self.api)["Marker Phase"], 180)
+            self.assertEqual(self.source.writes.count("SOUR:WAVE:INIT"), 1)
+            self.current_module.execute_sequence_command("set_current", {"current": "0", "settle_seconds": 0}, self.api)
+        self.assertEqual(self.source.values["OUTP?"], "0")
+        self.assertEqual(self.current_module.point, 0)
+
+    def test_set_current_rejects_over_limit_before_writing(self):
+        self.start_current()
+        writes = self.source.writes[:]
+        with self.assertRaisesRegex(ModuleError, "exceeds the sample limit"):
+            self.current_module.execute_sequence_command("set_current", {"current": "2mA", "settle_seconds": 0}, self.api)
+        self.assertEqual(self.source.writes, writes)
+
+    def test_error_run_end_ramps_down_before_off(self):
+        self.start_current()
+        self.scan("current", "500u")
+        before = len(self.source.writes)
+        self.current_module.on_event("run_end", {"reason": "error"}, self.api)
+        writes = self.source.writes[before:]
+        self.assertTrue(writes[0].startswith("SOUR:WAVE:AMPL "))
+        self.assertEqual(writes[-2:], ["SOUR:WAVE:ABOR", "OUTP OFF"])
+        values = [.0005] + [float(c.split()[-1]) / math.sqrt(2) for c in writes if c.startswith("SOUR:WAVE:AMPL ")]
+        self.assertTrue(all(0 < a - b <= .0000500001 for a, b in zip(values, values[1:])))
+
+    def test_transient_readback_error_ramps_down_and_preserves_original_error(self):
+        self.start_current()
+        self.scan("current", "100u")
+        before = len(self.source.writes)
+        original = self.source.query
+        failed = False
+
+        def query(command):
+            nonlocal failed
+            if command == "SOUR:WAVE:AMPL?" and len(self.source.writes) > before and not failed:
+                failed = True
+                return "0"
+            return original(command)
+
+        with patch.object(self.source, "query", side_effect=query):
+            with self.assertRaisesRegex(ModuleError, "expected.*got"):
+                self.scan("current", "200u")
+        writes = self.source.writes[before:]
+        amplitudes = [float(c.split()[-1]) for c in writes if c.startswith('SOUR:WAVE:AMPL ')]
+        self.assertGreater(len(amplitudes), 1)
+        self.assertTrue(all(a > b for a, b in zip(amplitudes, amplitudes[1:])))
+        self.assertEqual(writes[-2:], ['SOUR:WAVE:ABOR', 'OUTP OFF'])
+
+    def test_lost_communication_reports_unconfirmed_off_and_still_sends_off(self):
+        self.start_current()
+        self.scan("current", "100u")
+        before = len(self.source.writes)
+        with patch.object(self.source, 'query', side_effect=TimeoutError('disconnected')):
+            with self.assertRaisesRegex(ModuleError, 'off could not be confirmed'):
+                self.current_module.on_event('run_end', {'reason': 'error'}, self.api)
+        self.assertEqual(self.source.writes[before:], ['SOUR:WAVE:ABOR', 'OUTP OFF'])
+
+    def test_abort_write_failure_still_attempts_output_off(self):
+        self.start_current()
+        self.scan("current", "100u")
+        original = self.source.write
+
+        def write(command):
+            if command == 'SOUR:WAVE:ABOR':
+                raise TimeoutError('abort failed')
+            return original(command)
+
+        with patch.object(self.source, 'write', side_effect=write):
+            with self.assertRaisesRegex(ModuleError, 'abort failed'):
+                self.current_module.on_event('run_end', {'reason': 'error'}, self.api)
+        self.assertEqual(self.source.writes[-1], 'OUTP OFF')
+        self.assertEqual(self.source.values['OUTP?'], '0')
+
+    def test_mid_ramp_cancel_ramps_from_actual_amplitude_not_old_point(self):
+        self.start_current()
+        self.scan("current", "100u")
+        before = len(self.source.writes)
+        calls = 0
+
+        def cancel_on_third_step(api, seconds):
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                raise InterruptedError("cancelled")
+
+        with patch.object(ModuleAPI, "sleep", autospec=True, side_effect=cancel_on_third_step):
+            with self.assertRaises(InterruptedError):
+                self.current_module.execute_sequence_command("set_current", {"current": "500u", "settle_seconds": 0}, self.api)
+        writes = self.source.writes[before:]
+        values = [.0001] + [float(c.split()[-1]) / math.sqrt(2) for c in writes if c.startswith("SOUR:WAVE:AMPL ")]
+        self.assertGreater(values[2], values[1])
+        self.assertTrue(all(0 < a - b <= .0000500001 for a, b in zip(values[2:], values[3:])))
+        self.assertEqual(writes[-2:], ["SOUR:WAVE:ABOR", "OUTP OFF"])
+
+    def test_measurement_error_and_disable_both_ramp_before_off(self):
+        self.start_current()
+        for action in ('measure', 'close'):
+            with self.subTest(action=action):
+                self.scan("current", "500u")
+                before = len(self.source.writes)
+                if action == 'measure':
+                    original = self.source.query
+
+                    def query(command):
+                        if command == 'STAT:MEAS:COND?':
+                            raise TimeoutError('read timeout')
+                        return original(command)
+
+                    with patch.object(self.source, 'query', side_effect=query):
+                        with self.assertRaises(TimeoutError):
+                            self.current_module.measure(1, self.api)
+                else:
+                    self.current_module.close(self.api)
+                writes = self.source.writes[before:]
+                self.assertTrue(writes[0].startswith('SOUR:WAVE:AMPL '))
+                self.assertEqual(writes[-2:], ['SOUR:WAVE:ABOR', 'OUTP OFF'])

@@ -72,11 +72,33 @@ FILTERS: tuple[
 FILTER_SETTLE_MULTIPLIER = 3.0
 
 # 通道量程模式：固定量程与仪表自动量程（LR-700-AR）。
-# 自动量程只发送 AUTORANGE L=<min><max> 与 AUTORANGE 1/0，不下发 AUTORANGE T=，
-# 以保留操作者在仪器上预先设定好的跟踪曲线（含自定义 T=4 激励表）。
+# 通用配置在 Apply 阶段按电流上限动态生成非标自定义跟踪表（AUTORANGE U=<10位> 与 AUTORANGE T=4），
+# 仅开放 20 mOhm (1R) 及以上量程（AUTORANGE L=<1-8><2-9>），不使用出厂常见 T=1/2/3 trace 表。
 RANGE_MODES: tuple[tuple[str, str], ...] = (
     ("fixed", "Fixed"),
     ("autorange", "Autorange"),
+)
+
+AUTORANGE_MIN_RANGE_INDEX = 1
+AUTORANGE_MAX_RANGE_INDEX = 9
+
+# 默认 3 mA 上限对应的非标自定义 10 档激励映射（U=0135666666，T=4）；
+# 本模块自动量程仅允许 20 mOhm (1) 及以上量程，索引 0 (2 mOhm) 仅作 10 位协议占位。
+# 1: 20 mOhm  -> 1 (60 uV,  3 mA)
+# 2: 200 mOhm -> 3 (600 uV, 3 mA)
+# 3: 2 Ohm    -> 5 (6 mV,   3 mA)
+# 4-9: 20 Ohm..2 MOhm -> 6 (20 mV, 1 mA..10 nA)
+AUTORANGE_USER_TRACE_EXCITATIONS: tuple[int, ...] = (
+    0,
+    1,
+    3,
+    5,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
 )
 
 # DAT 的 StatusCode 是本模块自有整数枚举。LR-700 没有 372A 的 current-source
@@ -169,6 +191,15 @@ def is_valid_range_excitation(
     return int(excitation_index) in valid_excitation_indices(range_index)
 
 
+def autorange_trace_excitation_index(range_index: int) -> int:
+    """返回自定义自动量程 trace 表中指定电阻量程对应的满量程激励档编码。"""
+
+    index = int(range_index)
+    if not 0 <= index < len(AUTORANGE_USER_TRACE_EXCITATIONS):
+        raise ValueError(f"invalid LR-700 range index: {range_index!r}")
+    return AUTORANGE_USER_TRACE_EXCITATIONS[index]
+
+
 def excitation_current_a(
     range_index: int,
     excitation_index: int,
@@ -196,6 +227,54 @@ def format_current(amperes: float) -> str:
         if magnitude >= threshold:
             return f"{amperes * scale:.4g} {unit}"
     return f"{amperes * 1.0e12:.4g} pA"
+
+
+def common_defaults() -> dict[str, Any]:
+    return {
+        "range_mode": "autorange", "range_index": 2,
+        "current_a": 0.003, "current_limit_a": 0.003,
+        "autorange_min_range": 1, "autorange_max_range": 9,
+        "filter_index": 1,
+    }
+
+
+def generate_trace(limit_a: float, lo: int, hi: int) -> tuple[list[int], int, int]:
+    """Trace uses 100%; exclude ranges whose minimum excitation exceeds the limit."""
+    trace: list[int] = []
+    usable: list[int] = []
+    for r in range(10):
+        allowed = valid_excitation_indices(r)
+        candidates = [e for e in allowed if excitation_current_a(r, e) <= limit_a * (1 + 1e-12)]
+        trace.append(candidates[-1] if candidates else allowed[0])
+        if lo <= r <= hi and candidates:
+            usable.append(r)
+    if len(usable) < 2:
+        raise ValueError("Current limit leaves fewer than two autorange ranges")
+    return trace, usable[0], usable[-1]
+
+
+def fixed_current_settings(range_index: int, current_a: float) -> tuple[int, int, float]:
+    """Choose the closest representable current at or below the requested current.
+
+    Uses exact Decimal arithmetic and breaks ties by preferring the highest
+    VAREXC percentage (lowest EXCITATION step), per LR-700 v1.3 manual p. 2-6.
+    """
+    from decimal import Decimal, ROUND_FLOOR
+
+    requested = Decimal(str(current_a))
+    r_ohms = Decimal(str(range_ohms(range_index)))
+    candidates: list[tuple[Decimal, int, int, float]] = []
+    for e in valid_excitation_indices(range_index):
+        full = Decimal(str(excitation_volts(e))) / r_ohms
+        pct_exact = (requested / full) * Decimal(100)
+        percent = min(100, int((pct_exact + Decimal("1e-10")).to_integral_value(rounding=ROUND_FLOOR)))
+        if percent >= 5:
+            actual_dec = full * Decimal(percent) / Decimal(100)
+            candidates.append((actual_dec, percent, -e, float(actual_dec)))
+    if not candidates:
+        raise ValueError(f"Requested current is below the minimum on {range_label(range_index)}")
+    _dec, percent, neg_e, actual = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+    return -neg_e, percent, actual
 
 
 def default_channel(slot: int) -> dict[str, Any]:
@@ -239,6 +318,9 @@ def default_settings() -> dict[str, Any]:
 
 
 __all__ = [
+    "AUTORANGE_MAX_RANGE_INDEX",
+    "AUTORANGE_MIN_RANGE_INDEX",
+    "AUTORANGE_USER_TRACE_EXCITATIONS",
     "COMMON_MODE_OVERLOAD_HINT",
     "COMMON_MODE_OVERLOAD_MASK",
     "EXCITATIONS",
@@ -254,6 +336,8 @@ __all__ = [
     "STATUS_CODE_OVERLOAD",
     "STATUS_CODE_OVER_RANGE",
     "VALID_EXCITATION_INDICES_BY_RANGE",
+    "autorange_trace_excitation_index",
+    "common_defaults",
     "default_channel",
     "default_settings",
     "excitation_current_a",
@@ -261,7 +345,9 @@ __all__ = [
     "excitation_volts",
     "filter_label",
     "filter_seconds",
+    "fixed_current_settings",
     "format_current",
+    "generate_trace",
     "is_valid_range_excitation",
     "minimum_excitation_index",
     "range_label",
