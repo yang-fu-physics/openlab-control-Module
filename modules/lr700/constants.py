@@ -72,11 +72,35 @@ FILTERS: tuple[
 FILTER_SETTLE_MULTIPLIER = 3.0
 
 # 通道量程模式：固定量程与仪表自动量程（LR-700-AR）。
-# 自动量程只发送 AUTORANGE L=<min><max> 与 AUTORANGE 1/0，不下发 AUTORANGE T=，
-# 以保留操作者在仪器上预先设定好的跟踪曲线（含自定义 T=4 激励表）。
+# 自动量程下发自定义 User Defined 跟踪表（AUTORANGE U=0135666666 与 AUTORANGE T=4），
+# 仅开放 20 mOhm (1R) 及以上量程（AUTORANGE L=<1-8><2-9>），不使用出厂常见 trace 表
+# （Default T=1 / Min Power T=2 / Max Power T=3）。
 RANGE_MODES: tuple[tuple[str, str], ...] = (
     ("fixed", "Fixed"),
     ("autorange", "Autorange"),
+)
+
+AUTORANGE_TRACE_INDEX = 4
+AUTORANGE_MIN_RANGE_INDEX = 1
+AUTORANGE_MAX_RANGE_INDEX = 9
+
+# 手册 p. 3-32：AUTORANGE U= 必须提供 0-9 共 10 个量程的激励编码。
+# 本模块自动量程仅允许 20 mOhm (1) 及以上量程；索引 0 (2 mOhm) 仅作合法协议占位（0E / 20 uV）。
+# 1: 20 mOhm  -> 1 (60 uV,  3 mA)
+# 2: 200 mOhm -> 3 (600 uV, 3 mA)
+# 3: 2 Ohm    -> 5 (6 mV,   3 mA)
+# 4-9: 20 Ohm..2 MOhm -> 6 (20 mV, 1 mA..10 nA)
+AUTORANGE_USER_TRACE_EXCITATIONS: tuple[int, ...] = (
+    0,
+    1,
+    3,
+    5,
+    6,
+    6,
+    6,
+    6,
+    6,
+    6,
 )
 
 # DAT 的 StatusCode 是本模块自有整数枚举。LR-700 没有 372A 的 current-source
@@ -169,6 +193,21 @@ def is_valid_range_excitation(
     return int(excitation_index) in valid_excitation_indices(range_index)
 
 
+def autorange_trace_excitation_index(range_index: int) -> int:
+    """返回自定义自动量程 trace 表中指定电阻量程对应的满量程激励档编码。"""
+
+    index = int(range_index)
+    if not 0 <= index < len(AUTORANGE_USER_TRACE_EXCITATIONS):
+        raise ValueError(f"invalid LR-700 range index: {range_index!r}")
+    return AUTORANGE_USER_TRACE_EXCITATIONS[index]
+
+
+def autorange_user_trace_parameter() -> str:
+    """返回 AUTORANGE U= 所需的 10 位激励编码串（'0135666666'）。"""
+
+    return "".join(str(exc) for exc in AUTORANGE_USER_TRACE_EXCITATIONS)
+
+
 def excitation_current_a(
     range_index: int,
     excitation_index: int,
@@ -239,6 +278,10 @@ def default_settings() -> dict[str, Any]:
 
 
 __all__ = [
+    "AUTORANGE_MAX_RANGE_INDEX",
+    "AUTORANGE_MIN_RANGE_INDEX",
+    "AUTORANGE_TRACE_INDEX",
+    "AUTORANGE_USER_TRACE_EXCITATIONS",
     "COMMON_MODE_OVERLOAD_HINT",
     "COMMON_MODE_OVERLOAD_MASK",
     "EXCITATIONS",
@@ -254,6 +297,8 @@ __all__ = [
     "STATUS_CODE_OVERLOAD",
     "STATUS_CODE_OVER_RANGE",
     "VALID_EXCITATION_INDICES_BY_RANGE",
+    "autorange_trace_excitation_index",
+    "autorange_user_trace_parameter",
     "default_channel",
     "default_settings",
     "excitation_current_a",
