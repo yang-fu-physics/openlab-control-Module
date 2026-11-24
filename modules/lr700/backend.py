@@ -611,8 +611,9 @@ class LR700Backend:
 
         固定量程槽位每次测量前后都恢复并确认最低激励；连续自动量程 Run 期间
         保持 ``AUTORANGE 1``，切通道只下发 ``SELECT S=nn``（及发生变化的 ``L=``
-        与 ``FILTER``），仅在 Run 结束、Stop、Error、Disable 或任何异常时恢复
-        ``AUTORANGE 0`` + 5% 最低激励。
+        与 ``FILTER``）。运行中触发可恢复的量程未稳警告（``LR700_AUTORANGE_UNSTABLE``）
+        不退出自动量程也不发额外清理命令，仅在 Run 结束、Stop、Error、Disable 或
+        其他异常时恢复 ``AUTORANGE 0`` + 5% 最低激励。
         """
 
         is_autorange = (
@@ -863,8 +864,12 @@ class LR700Backend:
             failure = exc
             raise
         finally:
+            unstable_warning_only = (
+                isinstance(failure, ModuleWarning)
+                and failure.code == "LR700_AUTORANGE_UNSTABLE"
+            )
             keep_autorange_running = (
-                failure is None
+                (failure is None or unstable_warning_only)
                 and self.sequence_active
                 and (
                     (is_autorange and self._autorange_running)

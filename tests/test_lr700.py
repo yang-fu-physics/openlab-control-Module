@@ -1200,7 +1200,8 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(state.autorange, 0)
         self.assertEqual(state.excitation_percent, 5)
 
-        # 场景 C：连续两轮 1/4 与结束点都不一致（超过 retry_attempts=2），必须报不稳定并立即恢复安全状态。
+        # 场景 C：连续两轮 1/4 与结束点都不一致（超过 retry_attempts=2），报可恢复不稳定警告；
+        # 运行中不触发额外清理/退出自动量程，后续测量直接继续，直到 run_end 才恢复 5% 安全态。
         state_osc = _FakeVisaState()
         state_osc.range_index = 5
         state_osc.autorange_target_by_sensor[1] = (5, 6)
@@ -1221,8 +1222,20 @@ class LR700BackendTests(unittest.TestCase):
         with self.assertRaises(ModuleWarning) as unstable:
             measure_module(backend_osc, context_osc, 1)
         self.assertEqual(unstable.exception.code, "LR700_AUTORANGE_UNSTABLE")
+        self.assertEqual(state_osc.autorange, 1)
+        self.assertEqual(state_osc.excitation_percent, 100)
+        self.assertTrue(backend_osc._autorange_running)
+        self.assertEqual(state_osc.commands[-1], ("query", "GET 6"))
+        # 后续测量直接沿用运行中的自动量程会话，无需重新下发 AUTORANGE 0/1。
+        before_next = len(state_osc.commands)
+        next_row = measure_module(backend_osc, context_osc, 1)
+        self.assertEqual(next_row["StatusCode"], 0)
+        next_writes = [cmd for action, cmd in state_osc.commands[before_next:] if action == "write"]
+        self.assertEqual(next_writes, ["SELECT S=01"])
+        run_end(backend_osc, "completed", context_osc)
         self.assertEqual(state_osc.autorange, 0)
         self.assertEqual(state_osc.excitation_percent, 5)
+        backend_osc.close(context_osc)
 
         # 场景 D：S1 停在 1R（20 mOhm, 60 uV -> 3 mA，L=19）切换到 S2（L=49，20 Ohm 以上最大仅 1 mA），
         # 必须先降 5% 并升量程至 4R 再发 SELECT S=02，然后同步 6E (20 mV)，接通 S2 后峰值电流不超过 1 mA。

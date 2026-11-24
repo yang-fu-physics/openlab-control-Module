@@ -124,8 +124,10 @@ moving to a higher resistance range, and stepping `2 MOhm → 200 kOhm / 200 uV 
 for `FILTER 1`). Measurements check range settling (`GET 6` before/after) and
 read R, X, and overload status using `GET 0/1/7`. Continuous range/excitation
 oscillation during autorange measurement (`LR700_AUTORANGE_UNSTABLE`) is
-reported as a recoverable Warning rather than stopping the SEQ. A standalone
-measurement restores the minimum `5%` state afterwards. During Run the application
+reported as a recoverable Warning rather than stopping the SEQ, and during an
+active Run it does not exit autorange or send extra safe-state cleanup commands
+so subsequent slots continue smoothly. A standalone measurement restores the
+minimum `5%` state afterwards. During Run the application
 owns instrument settings; manual or third-party changes are not supported. The
 current limit is enforced by programmed settings, not an independent hardware
 protection circuit.
