@@ -190,17 +190,14 @@ interlocks and the laboratory's manual emergency procedure remain necessary.
   and waits the configured `switch_settle_seconds` + `dwell_seconds` before
   reading. References are never recaptured during the sweep. DAT absolute
   `R`/`X` columns are unchanged.
-  - **Current readback & `10ΔX` caveats**: Measure currently still queries
-    `GET 0` (`R`) and `GET 1` (`X`) rather than `GET 2` (`10ΔR`), so while
-    hardware `MODE 1` engages the 10x analog difference amplifier, digital
-    readback remains in `GET 0`'s 5.5-digit full-scale format (upgrading to
-    `RSET + GET 2` for the extra 10x digit awaits a real-instrument `GET 2`
-    format check). In addition, hardware `MODE 1` magnifies **both `ΔR` and
-    `ΔX` by 10x** (limiting the window to ±10% of full scale around
-    `RSET`/`XSET`), while this command only writes `R Set` (not `X Set`). If a
-    sensor's reactance exceeds ±10% of full scale, `GET 7` reports
-    `±ΔX overrange` (bits 1/2 → `StatusCode = 1`), leaving that row's `R` and
-    `X` blank.
+  - **Readback & `10ΔX` notes**: Measure intentionally queries `GET 0` (`R`)
+    and `GET 1` (`X`) directly (keeping standard 5.5-digit absolute `R`/`X`
+    readback while `MODE 1` engages the 10x analog difference gain). Hardware
+    `MODE 1` magnifies **both `ΔR` and `ΔX` by 10x** (limiting the window to
+    ±10% of full scale around `RSET`/`XSET`), while this command only writes
+    `R Set` (not `X Set`). If a sensor's reactance exceeds ±10% of full scale,
+    `GET 7` reports `±ΔX overrange` (bits 1/2 → `StatusCode = 1`), leaving that
+    row's `R` and `X` blank.
 - **`x10_off` (10x Delta R Off)**: checks its settle timeout budget, writes and
   confirms `MODE 0`, waits `switch_settle_seconds`, leaves the physical `R Set`
   unchanged, and releases the active reference cache so subsequent `Measure`
