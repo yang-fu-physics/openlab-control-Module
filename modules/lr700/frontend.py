@@ -15,6 +15,7 @@ from .constants import (
     autorange_trace_excitation_index, generate_trace, fixed_current_settings,
     excitation_current_a, format_current, range_label,
 )
+from .lr700 import range_transition_peak_current_a
 
 
 class LR700Frontend(QWidget):
@@ -242,7 +243,27 @@ class LR700Frontend(QWidget):
         for name in ("autorange_min_range", "autorange_max_range"):
             self.common_widgets[name].setEnabled(auto)
         if not auto:
-            self.trace_preview.setText("Fixed mode: no Trace is written. Actual fixed currents are shown below.")
+            fixed_ranges = [
+                int(ch["range_index"] if ch["independent"] else common["range_index"])
+                for ch in settings["channels"].values()
+                if ch["enabled"]
+            ]
+            transition_warnings = [
+                f"{range_label(r_from)} -> {range_label(r_to)} hits {format_current(peak)}"
+                for r_from in dict.fromkeys(fixed_ranges)
+                for r_to in dict.fromkeys(fixed_ranges)
+                if r_from != r_to
+                and (peak := range_transition_peak_current_a(r_to, r_from))
+                > common["current_limit_a"] * (1.0 + 1.0e-12)
+            ]
+            if transition_warnings:
+                self.trace_preview.setText(
+                    "Fixed mode: no Trace is written. Warning — range transition exceeds limit ("
+                    + "; ".join(transition_warnings)
+                    + ") and will be rejected on Apply."
+                )
+            else:
+                self.trace_preview.setText("Fixed mode: no Trace is written. Actual fixed currents are shown below.")
         elif common["autorange_min_range"] >= common["autorange_max_range"]:
             self.trace_preview.setText("Autorange maximum must exceed minimum")
         else:

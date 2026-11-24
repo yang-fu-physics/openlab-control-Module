@@ -209,6 +209,27 @@ class LR700Backend:
             )
             connected = True
             safe_bridge = self._set_safe_state(api, reset_mode=True)
+            if "common" in desired:
+                limit_a = float(desired["common"]["current_limit_a"])
+                current_range = int(safe_bridge["range_index"])
+                for channel in desired["channels"].values():
+                    if not channel["enabled"]:
+                        continue
+                    if channel["range_mode"] == "fixed":
+                        self._require_safe_range_transition(
+                            current_range,
+                            int(channel["range_index"]),
+                            limit_a,
+                        )
+                    else:
+                        lo = int(channel["autorange_min_range"])
+                        hi = int(channel["autorange_max_range"])
+                        clamped = max(lo, min(hi, current_range))
+                        self._require_safe_range_transition(
+                            current_range,
+                            clamped,
+                            limit_a,
+                        )
             if "common" in desired and any(
                 c["enabled"] and c["range_mode"] == "autorange"
                 for c in desired["channels"].values()
@@ -1298,6 +1319,32 @@ class LR700Backend:
         self._autorange_active_limits = None
         self._autorange_active_filter = None
 
+    @staticmethod
+    def _require_safe_range_transition(
+        current_range_index: int | None,
+        target_range: int,
+        current_limit_a: float,
+    ) -> None:
+        """拒绝任何在 5% 安全态换挡中间步骤会超过 current_limit_a 的量程切换。"""
+
+        if current_range_index is None:
+            return
+        current = int(current_range_index)
+        target = int(target_range)
+        if current == target:
+            return
+        peak = instrument.range_transition_peak_current_a(target, current)
+        if peak > current_limit_a * (1.0 + 1.0e-12):
+            raise ModuleError(
+                f"Switching LR-700 from {range_label(current)} to {range_label(target)} "
+                f"reaches an unavoidable hardware intermediate current of {format_current(peak)} "
+                f"(at 5% minimum excitation), exceeding the configured current limit "
+                f"{format_current(current_limit_a)}. Raise Maximum excitation current to at least "
+                f"{format_current(peak)} or switch the bridge range before connecting sensitive samples.",
+                "LR700_TRANSITION_OVER_LIMIT",
+                "common.current_limit_a",
+            )
+
     def _start_autorange_session(
         self,
         input_channel: int,
@@ -1309,6 +1356,18 @@ class LR700Backend:
     ) -> dict[str, int]:
         """在 5% 安全态下切至目标传感器与量程、同步自定义 trace 激励并开启 AUTORANGE 1。"""
 
+        if "common" in self.applied_settings and current_range_index is not None:
+            min_range = int(channel["autorange_min_range"])
+            max_range = int(channel["autorange_max_range"])
+            if target_range_index is not None and min_range <= int(target_range_index) <= max_range:
+                resolved_target = int(target_range_index)
+            else:
+                resolved_target = max(min_range, min(max_range, int(current_range_index)))
+            self._require_safe_range_transition(
+                current_range_index,
+                resolved_target,
+                float(self.applied_settings["common"]["current_limit_a"]),
+            )
         commands = instrument.autorange_start_commands(
             input_channel,
             channel,
@@ -1391,6 +1450,16 @@ class LR700Backend:
     ) -> dict[str, int]:
         """发送一套完整的当前传感器绝对设置，并用 GET 6 逐字段读回。"""
 
+        if (
+            "common" in self.applied_settings
+            and current_range_index is not None
+            and str(channel.get("range_mode", "fixed")).strip().casefold() == "fixed"
+        ):
+            self._require_safe_range_transition(
+                current_range_index,
+                int(channel["range_index"]),
+                float(self.applied_settings["common"]["current_limit_a"]),
+            )
         commands = instrument.configuration_commands(
             input_channel,
             channel,
@@ -2233,6 +2302,18 @@ class LR700Backend:
                             excitation_percent=SAFE_EXCITATION_PERCENT,
                         )
                 resolved[key] = channel
+            enabled_fixed_ranges = [
+                int(ch["range_index"])
+                for ch in resolved.values()
+                if ch["enabled"] and ch["range_mode"] == "fixed"
+            ]
+            for r_from in enabled_fixed_ranges:
+                for r_to in enabled_fixed_ranges:
+                    cls._require_safe_range_transition(
+                        r_from,
+                        r_to,
+                        float(common["current_limit_a"]),
+                    )
             raw["channels"] = resolved
         result = {
             key: raw.get(key, value)

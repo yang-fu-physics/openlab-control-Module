@@ -740,6 +740,72 @@ class LR700BackendTests(unittest.TestCase):
         self.assertTrue(normalized["channels"]["r1"]["enabled"])
         self.assertFalse(normalized["channels"]["r2"]["enabled"])
 
+    def test_low_current_limit_rejects_range_transitions_that_exceed_limit_at_intermediate_steps(self):
+        # 1) Multi-channel static check: 2 MOhm (9) + 20 kOhm (7) with 100 pA limit hits 500 pA intermediate
+        state = _FakeVisaState()
+        backend = self._backend(state, [])
+        context = self._context([], _samples(2))
+        settings = self._common_settings(mode="fixed", limit=1e-10)
+        settings["common"].update(range_index=9, current_a=1e-10)
+        settings["channels"]["r1"].update(enabled=True, independent=False)
+        settings["channels"]["r2"].update(enabled=True, independent=True, range_index=7, current_a=1e-10)
+        open_module(backend, context)
+        with self.assertRaises(ModuleError) as static_err:
+            backend.configure(settings, context)
+        self.assertEqual(static_err.exception.code, "LR700_TRANSITION_OVER_LIMIT")
+        self.assertEqual(state.opened, [])
+
+        # 2) Single-channel Apply check: bridge currently sits on 2 MOhm (9), target is 20 kOhm (7) @ 100 pA
+        state_apply = _FakeVisaState()
+        state_apply.range_index = 9
+        state_apply.excitation_index = 4
+        backend_apply = self._backend(state_apply, [])
+        single = self._common_settings(mode="fixed", limit=1e-10)
+        single["common"].update(range_index=7, current_a=1e-10)
+        single["channels"]["r2"]["enabled"] = False
+        open_module(backend_apply, context)
+        with self.assertRaises(ModuleError) as apply_err:
+            backend_apply.configure(single, context)
+        self.assertEqual(apply_err.exception.code, "LR700_TRANSITION_OVER_LIMIT")
+        self.assertFalse(any(a == "write" and c.startswith("RANGE ") for a, c in state_apply.commands))
+        self.assertEqual((state_apply.range_index, state_apply.excitation_percent), (9, 5))
+
+        # 3) Runtime check: Apply succeeded on 20 kOhm (7), then bridge range moved to 2 MOhm (9) before Measure
+        state_rt = _FakeVisaState()
+        state_rt.range_index = 7
+        state_rt.excitation_index = 0
+        backend_rt = self._backend(state_rt, [])
+        open_module(backend_rt, context)
+        backend_rt.configure(single, context)
+        run_start(backend_rt, context)
+        state_rt.range_index = 9
+        state_rt.excitation_index = 4
+        before_measure = len(state_rt.commands)
+        with self.assertRaises(ModuleError) as rt_err:
+            measure_module(backend_rt, context, 1)
+        self.assertEqual(rt_err.exception.code, "LR700_TRANSITION_OVER_LIMIT")
+        self.assertFalse(any(a == "write" and c.startswith("RANGE ") for a, c in state_rt.commands[before_measure:]))
+        self.assertEqual((state_rt.range_index, state_rt.excitation_percent), (9, 5))
+        run_end(backend_rt, "error", context)
+        backend_rt.close(context)
+
+        # 4) Raising limit to 500 pA allows 2 MOhm (9) -> 20 kOhm (7) via 200 kOhm (8) safely
+        state_ok = _FakeVisaState()
+        state_ok.range_index = 9
+        state_ok.excitation_index = 4
+        backend_ok = self._backend(state_ok, [])
+        ok_settings = self._common_settings(mode="fixed", limit=5e-10)
+        ok_settings["common"].update(range_index=7, current_a=1e-10)
+        ok_settings["channels"]["r2"]["enabled"] = False
+        open_module(backend_ok, context)
+        backend_ok.configure(ok_settings, context)
+        run_start(backend_ok, context)
+        row = measure_module(backend_ok, context, 1)
+        self.assertEqual(row["StatusCode"], 0)
+        self.assertEqual(state_ok.range_index, 7)
+        run_end(backend_ok, "completed", context)
+        backend_ok.close(context)
+
     def test_x10_readback_errors_and_cancellation_propagate(self):
         for failure in ("reference", "mode", "cancel"):
             with self.subTest(failure=failure):

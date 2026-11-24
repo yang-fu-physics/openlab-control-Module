@@ -110,6 +110,15 @@ moving to a higher resistance range, and stepping `2 MOhm → 200 kOhm / 200 uV 
 20 kOhm / 20 uV` when descending from `2 MOhm` so transient current stays
 `<= 500 pA`), even when the resistance range is unchanged.
 
+> **Hardware transition limit below `500 pA`**: Because LR-700 hardware requires
+> `EXCITATION >= 4` (`2 mV`) on `2 MOhm` and `>= 2` (`200 uV`) on `200 kOhm`
+> with minimum `VAREXC = 5%`, any downward range switch `2 MOhm → 200 kOhm`,
+> `2 MOhm → 20 kOhm`, or `200 kOhm → 20 kOhm` unavoidably passes through a
+> `500 pA` intermediate state. When `current_limit_a < 500 pA`, Apply and
+> runtime channel transitions reject any configuration or live bridge-range
+> transition that would exceed `current_limit_a` (`LR700_TRANSITION_OVER_LIMIT`)
+> before sending `RANGE`.
+
 `FILTER 0/1/2` select `1/3/10 s`; fixed digital filtering has no Off setting.
 `switch_settle_seconds` must be at least **3x** the filter time (default `9.0 s`
 for `FILTER 1`). Measurements check range settling (`GET 6` before/after) and

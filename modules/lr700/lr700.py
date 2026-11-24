@@ -18,7 +18,9 @@ from .constants import (
     SAFE_EXCITATION_INDEX,
     SAFE_EXCITATION_PERCENT,
     autorange_trace_excitation_index,
+    excitation_current_a,
     minimum_excitation_index,
+    valid_excitation_indices,
 )
 
 
@@ -152,6 +154,48 @@ def _range_transition_commands(
                 f"RANGE {target}",
             )
     return (f"RANGE {target}",)
+
+
+def range_transition_peak_current_a(
+    target_range: int,
+    current_range_index: int | None,
+) -> float:
+    """计算安全态（5% 最低激励）下从 current_range_index 切至 target_range 经过的最高中间电流（A）。
+
+    硬件在 2 MOhm (9R) 最低仅允许 4E (2 mV)、在 200 kOhm (8R) 最低仅允许 2E (200 uV)，
+    且 VAREXC 最低为 5%；因此 9R->8R、9R->7R、8R->7R 必然经过 500 pA 中间态。
+    """
+
+    target = int(target_range)
+    if current_range_index is None:
+        return excitation_current_a(
+            target,
+            minimum_excitation_index(target),
+            SAFE_EXCITATION_PERCENT,
+        )
+    r = int(current_range_index)
+    if r == target:
+        return excitation_current_a(
+            target,
+            minimum_excitation_index(target),
+            SAFE_EXCITATION_PERCENT,
+        )
+    e = minimum_excitation_index(r)
+    peak = 0.0
+    for command in _range_transition_commands(target, r):
+        if command.startswith("RANGE "):
+            r = int(command.split(" ", 1)[1])
+            allowed = valid_excitation_indices(r)
+            if e < allowed[0]:
+                e = allowed[0]
+            elif e > allowed[-1]:
+                e = allowed[-1]
+        elif command.startswith("EXCITATION "):
+            requested = int(command.split(" ", 1)[1])
+            if requested in valid_excitation_indices(r):
+                e = requested
+        peak = max(peak, excitation_current_a(r, e, SAFE_EXCITATION_PERCENT))
+    return peak
 
 
 def autorange_start_commands(
@@ -410,6 +454,7 @@ __all__ = [
     "select_sensor_command",
     "offset_r_command",
     "autorange_trace_commands",
+    "range_transition_peak_current_a",
     "autorange_start_commands",
     "autorange_switch_commands",
     "configuration_commands",
