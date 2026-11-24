@@ -69,8 +69,36 @@ class Transport(Protocol):
 
 GET_RESISTANCE = "GET 0"
 GET_REACTANCE = "GET 1"
+GET_RSET = "GET 4"
 GET_SETTINGS = "GET 6"
 GET_OVERLOADS = "GET 7"
+AUTORANGE_OFF = "AUTORANGE 0"
+OFFSET_CLEAR_ALL = "OFFSET =0"
+
+
+def mode_command(mode: int) -> str:
+    value = int(mode)
+    if value not in (0, 1):
+        raise ValueError(f"invalid LR-700 difference mode: {mode!r}")
+    return f"MODE {value}"
+
+
+def select_sensor_command(input_channel: int) -> str:
+    return f"SELECT S={int(input_channel):02d}"
+
+
+def offset_r_command(counts: int) -> str:
+    value = int(counts)
+    if not -199999 <= value <= 199999:
+        raise ValueError(f"LR-700 R Set counts out of range: {counts!r}")
+    return f"OFFSET R={value:+07d}"
+
+
+def autorange_trace_commands(trace: tuple[int, ...] | list[int]) -> tuple[str, str]:
+    digits = "".join(str(int(e)) for e in trace)
+    if len(digits) != 10:
+        raise ValueError(f"LR-700 custom trace requires 10 entries, got {len(digits)}")
+    return (f"AUTORANGE U={digits}", "AUTORANGE T=4")
 
 _SETTINGS_RE = re.compile(
     r"^\s*(\d)R\s*,\s*(\d)E\s*,\s*(\d{1,3})%\s*,"
@@ -97,19 +125,33 @@ def _range_transition_commands(
     target_range: int,
     current_range_index: int | None,
 ) -> tuple[str, ...]:
-    """从高阻量程（8/9，最低激励 2E/4E）向低阻量程切换时先经 20 kOhm 降至 0E。"""
+    """从高阻量程（8/9，最低激励 2E/4E）向低阻量程切换时分级降激励，避免瞬态电流超限。
 
-    if (
-        current_range_index is not None
-        and int(current_range_index) >= 8
-        and int(target_range) < _SAFE_STEP_DOWN_RANGE_INDEX
-    ):
-        return (
-            f"RANGE {_SAFE_STEP_DOWN_RANGE_INDEX}",
-            f"EXCITATION {SAFE_EXCITATION_INDEX}",
-            f"RANGE {int(target_range)}",
-        )
-    return (f"RANGE {int(target_range)}",)
+    - 从 9 (2 MOhm, 4E=2 mV x 5% = 50 pA) 降至 <= 7 时，先经 8 (200 kOhm) 降至 2E (200 uV)，
+      再经 7 (20 kOhm) 降至 0E (20 uV)，每步中间态峰值电流均 <= 500 pA（不超过 1 nA 下限）；
+    - 从 8 (200 kOhm, 2E=200 uV x 5% = 50 pA) 降至 < 7 时，先经 7 降至 0E。
+    """
+
+    target = int(target_range)
+    if current_range_index is not None:
+        current = int(current_range_index)
+        if current == 9 and target <= _SAFE_STEP_DOWN_RANGE_INDEX:
+            steps = [
+                "RANGE 8",
+                f"EXCITATION {minimum_excitation_index(8)}",
+                f"RANGE {_SAFE_STEP_DOWN_RANGE_INDEX}",
+                f"EXCITATION {SAFE_EXCITATION_INDEX}",
+            ]
+            if target < _SAFE_STEP_DOWN_RANGE_INDEX:
+                steps.append(f"RANGE {target}")
+            return tuple(steps)
+        if current == 8 and target < _SAFE_STEP_DOWN_RANGE_INDEX:
+            return (
+                f"RANGE {_SAFE_STEP_DOWN_RANGE_INDEX}",
+                f"EXCITATION {SAFE_EXCITATION_INDEX}",
+                f"RANGE {target}",
+            )
+    return (f"RANGE {target}",)
 
 
 def autorange_start_commands(
@@ -212,9 +254,10 @@ def configuration_commands(
 ) -> tuple[str, ...]:
     """生成当前传感器的完整绝对配置，并保证切换中间态不提前抬高激励。
 
-    调用前桥应处于最低激励 x 5%。固定量程模式先切传感器、量程、激励档和滤波，
-    最后才抬升激励百分比；自动量程模式复用 ``autorange_start_commands``，
-    按现场已确认的跟踪表同步目标量程激励，仅下发 ``AUTORANGE L=``，不改写 Trace。
+    调用前桥应处于最低激励 x 5%。固定量程模式切向更高阻（更小电流）量程时先升
+    量程再切传感器，避免高阻敏感样品在切通瞬间承受低阻档安全态电流；切向更低阻
+    或保持同量程时先在 5% 下切传感器、再分级降量程、设激励与滤波，最后抬升百分比。
+    自动量程模式复用 ``autorange_start_commands``，Trace 已在 Apply 阶段写入。
     """
 
     mode = str(channel.get("range_mode", "fixed")).strip().casefold()
@@ -229,11 +272,16 @@ def configuration_commands(
     filter_index = int(channel["filter_index"])
     target_range = int(channel["range_index"])
     target_excitation = int(channel["excitation_index"])
+    select_cmd = select_sensor_command(int(input_channel))
+    move_commands = _range_transition_commands(target_range, current_range_index)
+    if current_range_index is not None and target_range > int(current_range_index):
+        switch_sequence: tuple[str, ...] = (*move_commands, select_cmd)
+    else:
+        switch_sequence = (select_cmd, *move_commands)
     return (
-        "AUTORANGE 0",
-        f"MODE {measurement_mode}",
-        f"SELECT S={int(input_channel):02d}",
-        *_range_transition_commands(target_range, current_range_index),
+        AUTORANGE_OFF,
+        mode_command(measurement_mode),
+        *switch_sequence,
         f"EXCITATION {target_excitation}",
         f"FILTER {filter_index}",
         *variable_excitation_commands(channel["excitation_percent"]),
@@ -353,8 +401,15 @@ __all__ = [
     "PyVisaTransport",
     "GET_RESISTANCE",
     "GET_REACTANCE",
+    "GET_RSET",
     "GET_SETTINGS",
     "GET_OVERLOADS",
+    "AUTORANGE_OFF",
+    "OFFSET_CLEAR_ALL",
+    "mode_command",
+    "select_sensor_command",
+    "offset_r_command",
+    "autorange_trace_commands",
     "autorange_start_commands",
     "autorange_switch_commands",
     "configuration_commands",

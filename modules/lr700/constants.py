@@ -72,8 +72,8 @@ FILTERS: tuple[
 FILTER_SETTLE_MULTIPLIER = 3.0
 
 # 通道量程模式：固定量程与仪表自动量程（LR-700-AR）。
-# 自动量程使用操作者已在仪表上设置的 T=4 / U=0135666666；软件不改写 U= 或 T=。
-# 下面的映射只用于恢复量程时同步激励，仅开放 20 mOhm (1R) 及以上量程。
+# 通用配置在 Apply 阶段按电流上限动态生成非标自定义跟踪表（AUTORANGE U=<10位> 与 AUTORANGE T=4），
+# 仅开放 20 mOhm (1R) 及以上量程（AUTORANGE L=<1-8><2-9>），不使用出厂常见 T=1/2/3 trace 表。
 RANGE_MODES: tuple[tuple[str, str], ...] = (
     ("fixed", "Fixed"),
     ("autorange", "Autorange"),
@@ -82,8 +82,8 @@ RANGE_MODES: tuple[tuple[str, str], ...] = (
 AUTORANGE_MIN_RANGE_INDEX = 1
 AUTORANGE_MAX_RANGE_INDEX = 9
 
-# 现场已确认的 10 档激励映射；更改仪表 Trace 时须同步此映射。
-# 本模块自动量程仅允许 20 mOhm (1) 及以上量程，不使用索引 0 (2 mOhm)。
+# 默认 3 mA 上限对应的非标自定义 10 档激励映射（U=0135666666，T=4）；
+# 本模块自动量程仅允许 20 mOhm (1) 及以上量程，索引 0 (2 mOhm) 仅作 10 位协议占位。
 # 1: 20 mOhm  -> 1 (60 uV,  3 mA)
 # 2: 200 mOhm -> 3 (600 uV, 3 mA)
 # 3: 2 Ohm    -> 5 (6 mV,   3 mA)
@@ -254,17 +254,27 @@ def generate_trace(limit_a: float, lo: int, hi: int) -> tuple[list[int], int, in
 
 
 def fixed_current_settings(range_index: int, current_a: float) -> tuple[int, int, float]:
-    """Choose the closest representable current at or below the requested current."""
-    import math
-    candidates = []
+    """Choose the closest representable current at or below the requested current.
+
+    Uses exact Decimal arithmetic and breaks ties by preferring the highest
+    VAREXC percentage (lowest EXCITATION step), per LR-700 v1.3 manual p. 2-6.
+    """
+    from decimal import Decimal, ROUND_FLOOR
+
+    requested = Decimal(str(current_a))
+    r_ohms = Decimal(str(range_ohms(range_index)))
+    candidates: list[tuple[Decimal, int, int, float]] = []
     for e in valid_excitation_indices(range_index):
-        full = excitation_current_a(range_index, e)
-        percent = min(100, math.floor(current_a / full * 100 + 1e-10))
+        full = Decimal(str(excitation_volts(e))) / r_ohms
+        pct_exact = (requested / full) * Decimal(100)
+        percent = min(100, int((pct_exact + Decimal("1e-10")).to_integral_value(rounding=ROUND_FLOOR)))
         if percent >= 5:
-            candidates.append((e, percent, full * percent / 100))
+            actual_dec = full * Decimal(percent) / Decimal(100)
+            candidates.append((actual_dec, percent, -e, float(actual_dec)))
     if not candidates:
         raise ValueError(f"Requested current is below the minimum on {range_label(range_index)}")
-    return max(candidates, key=lambda item: item[2])
+    _dec, percent, neg_e, actual = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+    return -neg_e, percent, actual
 
 
 def default_channel(slot: int) -> dict[str, Any]:
@@ -327,6 +337,7 @@ __all__ = [
     "STATUS_CODE_OVER_RANGE",
     "VALID_EXCITATION_INDICES_BY_RANGE",
     "autorange_trace_excitation_index",
+    "common_defaults",
     "default_channel",
     "default_settings",
     "excitation_current_a",
@@ -334,7 +345,9 @@ __all__ = [
     "excitation_volts",
     "filter_label",
     "filter_seconds",
+    "fixed_current_settings",
     "format_current",
+    "generate_trace",
     "is_valid_range_excitation",
     "minimum_excitation_index",
     "range_label",

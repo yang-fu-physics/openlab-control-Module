@@ -26,65 +26,106 @@ framework's global defaults:
 
 ## Common configuration and channel table
 
-Four logical slots R1–R4 each select one LR720 physical input S1–S16. The common
-configuration selects fixed/autorange, digital filter, fixed range/current,
-autorange bounds and maximum excitation current. A row may override only the
-fixed range and current. All rows use the common filter and current limit.
+Four logical slots R1–R4 each select one unique LR-720-16 physical input S1–S16.
+The common configuration selects fixed/autorange, digital filter, fixed
+range/current, autorange bounds, and maximum excitation current (`current_limit_a`).
+A channel row may override only the fixed range and fixed current (`independent`);
+all rows share the common digital filter and common current limit.
 
-Currents in settings files are amperes; the UI uses mA. A fixed current is converted
-to a hardware-valid EXCITATION and integer VAREXC percentage (5–100%). The closest
-value at or below the requested current is used and displayed. An unrepresentable
-current or a requested current above the common limit rejects Apply before connecting.
+Currents in settings files are amperes; the UI uses mA. A fixed current is
+converted to a hardware-valid `EXCITATION` and integer `VAREXC` percentage
+(`5%–100%`), selecting the closest representable value at or below the requested
+current and displaying the actual value in the channel table (if the requested
+current exceeds the chosen range's hardware maximum, e.g., `3 mA` on `2 MOhm`,
+it clamps down to that range's maximum). A current below the range minimum or
+above `current_limit_a` rejects Apply before opening VISA.
 
-### Generated autorange Trace
+### Generated Non-Standard Autorange Trace (`AUTORANGE T=4`)
 
-Apply computes a ten-entry custom trace from the common current limit. For each
-range, it selects the largest legal excitation whose full-scale current at 100%
-does not exceed the limit. Ranges whose minimum full-scale excitation exceeds
-the limit are excluded by the effective AUTORANGE L bounds. At least two usable
-ranges are required. The UI displays effective bounds and each active range's
-current. The supported autorange range indices are 1–9 (20 mOhm–2 MOhm).
+> **Important (Non-Standard Trace)**: This module does **not** use the LR-700's
+> common factory autorange traces (`T=1` Default / `T=2` Minimum Power / `T=3`
+> Maximum Power in LR-700 v1.3 manual p. 2-18). Instead, Apply dynamically
+> computes a 10-entry User Defined trace (`AUTORANGE U=<10 digits>`,
+> `AUTORANGE T=4`) from the common maximum excitation current limit over
+> **`20 mOhm` (`1R`)–`2 MOhm` (`9R`)** (`2 mOhm` / `0R` is always excluded from
+> autorange).
 
-For the default 3 mA limit, U=0135666666 and L=19: 20 mOhm/60 uV,
-200 mOhm/600 uV and 2 Ohm/6 mV give 3 mA; higher ranges use 20 mV and
-progressively smaller currents. The excluded 2 mOhm entry is not active.
+For each range `0–9`, Apply selects the largest hardware-valid excitation whose
+full-scale current at `100%` does not exceed `current_limit_a`. Ranges whose
+minimum full-scale excitation exceeds `current_limit_a` are automatically
+excluded by tightening the effective `AUTORANGE L=<min><max>` bounds (at least
+two usable ranges are required). The UI previews the effective bounds, the
+generated `U=` string, and each active range's full-scale current.
 
-After lowering excitation, Apply writes AUTORANGE U=<generated digits> and
-AUTORANGE T=4 if an enabled channel uses autorange. It leaves AUTORANGE off at
-minimum excitation. The applied settings retain the trace, effective bounds,
-resolved channel configurations and original overrides. Re-Apply regenerates
-the trace and clears cached ranges. GET 6 does not report the trace table;
-there is no invented trace query. Range, excitation, percentage, filter and
-sensor are checked through documented GET 6 readbacks during operation.
+For the default **`3 mA`** current limit, the generated trace is
+`AUTORANGE U=0135666666` with effective bounds `L=19`:
+
+| Range index | Resistance range | Excitation (`V_fs`) | Excitation index | Full-scale current (`100%`) | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `0` | `2 mOhm` | `20 uV` *(placeholder)* | `0` | — | **Excluded from Autorange** (`L` lower limit `>= 1`); index `0` is filled only because `AUTORANGE U=` requires all 10 digits (manual p. 3-32). |
+| `1` | `20 mOhm` | `60 uV` | `1` | `3 mA` | Active `T=4` range |
+| `2` | `200 mOhm` | `600 uV` | `3` | `3 mA` | Active `T=4` range |
+| `3` | `2 Ohm` | `6 mV` | `5` | `3 mA` | Active `T=4` range |
+| `4` | `20 Ohm` | `20 mV` | `6` | `1 mA` | Active `T=4` range |
+| `5` | `200 Ohm` | `20 mV` | `6` | `100 uA` | Active `T=4` range |
+| `6` | `2 kOhm` | `20 mV` | `6` | `10 uA` | Active `T=4` range |
+| `7` | `20 kOhm` | `20 mV` | `6` | `1 uA` | Active `T=4` range |
+| `8` | `200 kOhm` | `20 mV` | `6` | `100 nA` | Active `T=4` range |
+| `9` | `2 MOhm` | `20 mV` | `6` | `10 nA` | Active `T=4` range |
+
+Because the default `3 mA` custom trace applies up to `3 mA` (on `20 mOhm`–`2 Ohm`)
+and `20 mV` (on `20 Ohm`–`2 MOhm`) — higher than the factory `Default` (`T=1`) and
+`Min Power` (`T=2`) traces — sensitive low-temperature samples that require lower
+excitation should lower the common **Maximum excitation current** limit, raise
+`autorange_min_range`, or use **Fixed** range mode.
+
+After lowering excitation to the safe state, Apply writes
+`AUTORANGE U=<generated digits>` and `AUTORANGE T=4` when using the common
+configuration with at least one enabled autorange channel, and leaves `AUTORANGE`
+off at minimum `5%` excitation. The applied settings retain the generated trace,
+effective bounds, resolved channel configurations, and original overrides.
+Re-Apply regenerates the trace and clears cached sensor ranges. `GET 6` does not
+report the trace table; there is no invented trace query. Range, excitation,
+percentage, filter, mode, and sensor are checked through documented `GET 6`
+readbacks during operation.
 
 ### Channel switching
 
 During Run, autorange remains active between autorange channels. Each physical
-sensor remembers its last normally settled range. If the next sensor uses the
-current range (or has no cached range) and the current configuration matches,
-only SELECT is written: no RANGE or EXCITATION reset. A required range change
-first lowers excitation, restores the cached/clamped range and the corresponding
-entry from the applied trace, then restores 100% and autorange. The trace itself
-is not rewritten during scanning.
+sensor caches its last normally settled range index (cleared on re-Apply/Close).
+If the next sensor uses the current range (or has no cached range yet), stays
+within effective bounds, and has the matching applied-trace excitation and filter,
+only `SELECT S=nn` is written — no `RANGE` or `EXCITATION` reset. When a range
+or excitation restore is required, the module first lowers excitation to `5%`,
+restores the cached/clamped range and **updates `EXCITATION` to the corresponding
+entry from the applied trace** (so the excitation current matches the active
+trace table), then restores `100%` (`VAREXC 0`) and `AUTORANGE 1`. The trace
+table itself is not rewritten during scanning.
 
-For fixed channels with the same range, actual current and common filter,
-switching also writes SELECT only. Independently configured different currents
-or a change between fixed/autorange require lowering excitation and applying
-the target configuration, even when the resistance range is unchanged.
+For fixed channels with the same range, actual current, mode, and common filter
+during a Run, switching also writes `SELECT S=nn` only. Independently configured
+different currents or switching between fixed and autorange lowers excitation
+first and applies the target configuration (raising `RANGE` before `SELECT` when
+moving to a higher resistance range, and stepping `2 MOhm → 200 kOhm / 200 uV →
+20 kOhm / 20 uV` when descending from `2 MOhm` so transient current stays
+`<= 500 pA`), even when the resistance range is unchanged.
 
-FILTER 0/1/2 mean 1/3/10 seconds; there is no digital-filter Off value.
-Switch settle must be at least 3x the filter time (default 9 s for FILTER 1).
-Measurements check range settling and read R, X and overload status using
-GET 0/1/7. Run end, Stop, Error and Disable restore and readback-confirm
-AUTORANGE 0 and the minimum legal excitation at 5%. LR700 has no excitation-off
-command. A standalone measurement also restores this minimum state afterwards.
-During Run the application owns instrument settings; manual/other-program
-changes are not supported. The current limit is implemented by programmed
-settings, not an independent hardware protection circuit.
+`FILTER 0/1/2` select `1/3/10 s`; fixed digital filtering has no Off setting.
+`switch_settle_seconds` must be at least **3x** the filter time (default `9.0 s`
+for `FILTER 1`). Measurements check range settling (`GET 6` before/after) and
+read R, X, and overload status using `GET 0/1/7`. Continuous range/excitation
+oscillation during autorange measurement (`LR700_AUTORANGE_UNSTABLE`) is
+reported as a recoverable Warning rather than stopping the SEQ. A standalone
+measurement restores the minimum `5%` state afterwards. During Run the application
+owns instrument settings; manual or third-party changes are not supported. The
+current limit is enforced by programmed settings, not an independent hardware
+protection circuit.
 
 Legacy per-channel files can be loaded into the new UI when their enabled
 channels share a filter and autorange bounds. Fixed rows become independent
-overrides. Files with conflicting common fields require explicit reconfiguration.
+overrides and `current_limit_a` is derived from enabled channels only (so
+low-current fixed configs are not raised to `3 mA`). Files with conflicting
+common fields are rejected without partially modifying UI widgets.
 
 The fixed output columns are `TemperatureAverage`, `FieldAverage`, `R1/X1`
 through `R4/X4`, and one common integer `StatusCode` column. Only the current
@@ -108,37 +149,82 @@ Non-zero status is a recoverable Warning and does not stop the SEQ. Every
 nonzero row retains the temperature/field averages and `StatusCode`, but leaves
 the current slot's R/X fields empty; all unmeasured slots are empty as well.
 
-## Verification
+## Excitation safety boundary
 
-The refactor is verified offline with protocol simulation, settings round trips,
-generated trace limits, cached range restoration, fixed/auto mixed scans and
-SELECT-only switching. Previous real-instrument protocol tests remain the basis
-for the LR700 VISA session and command encoding. This refactor has not yet been
-retested with connected samples.
+The LR-700 command set does not provide a true excitation-off command. The
+lowest software-confirmable state depends on the active resistance range
+(LR-700 v1.3 manual p. 4-12 and hardware-verified):
+
+| Resistance range | Minimum allowable excitation | Confirmed safe state (`5%`) |
+| --- | --- | --- |
+| `0–7` (`2 mOhm`–`20 kOhm`) | `EXCITATION 0` (`20 uV`) | `20 uV x 5%` |
+| `8` (`200 kOhm`) | `EXCITATION 2` (`200 uV`) | `200 uV x 5%` (`50 pA`) |
+| `9` (`2 MOhm`) | `EXCITATION 4` (`2 mV`) | `2 mV x 5%` (`50 pA`) |
+
+During Apply, configuration transitions, standalone measurements, and every
+completed/Stop/Error `run_end` or `close(api)`, the module reads `GET 6`, sets
+`AUTORANGE 0`, lowers `VAREXC` to `5%`, selects the minimum allowable
+`EXCITATION` for the active range, and confirms the result via `GET 6` (`run_end`
+and `close` also confirm `MODE 0`). If the safe state cannot be read back, the
+module reports an Error rather than claiming the bridge is safe. Hardware
+interlocks and the laboratory's manual emergency procedure remain necessary.
 
 ## Fixed-reference 10x SEQ commands (0.1.0b9)
 
-**10x Delta R On** captures the settled absolute R of every enabled sensor in 1x.
-Each reference is written as OFFSET R=<counts>, checked with GET 4, and retained
-with that sensor's settled range, excitation percentage and filter. Capture uses
-the normal applied range strategy; autorange is then disabled for the 10x session.
-Only after all captures succeed is the reference set activated. No reference is
-entered manually. The status page lists the references and their resistance ranges.
+`LR700Backend.sequence_commands` exposes two parameterless SEQ commands:
+`x10_on` (**10x Delta R On**) and `x10_off` (**10x Delta R Off**).
 
-During a field sweep, selecting another sensor first writes MODE 0, applies its
-frozen channel configuration, restores its saved R Set, then writes MODE 1. The
-normal configured settle/dwell precedes the formal reading. References are never
-recaptured during the sweep. The hardware 10x mode also affects Delta X; this
-feature writes only R Set, not X Set. DAT absolute R/X columns are unchanged.
+- **`x10_on` (10x Delta R On)**: confirms `MODE 0`, clears both `RSET` and any
+  stale `XSET` via `OFFSET =0` before switching/autorange capture, captures the
+  settled absolute R of every enabled sensor in 1x (using the applied
+  fixed/autorange strategy), writes `OFFSET R=<counts>` checked via `GET 4`,
+  disables autorange, and freezes each sensor's settled range, excitation,
+  percentage, and filter. Only after all enabled sensors succeed are the
+  references activated and `MODE 1` confirmed. Any capture warning, error, or
+  cancellation clears the partial cache and restores `MODE 0` + minimum `5%`
+  excitation. No reference is entered manually; the Status page lists the
+  captured references and ranges.
+- **Scanning in 10x mode**: switching to another sensor writes and confirms
+  `MODE 0`, applies that sensor's frozen channel configuration, restores its
+  saved `R Set` via `OFFSET R=` / `GET 4`, then writes and confirms `MODE 1`
+  and waits the configured `switch_settle_seconds` + `dwell_seconds` before
+  reading. References are never recaptured during the sweep. DAT absolute
+  `R`/`X` columns are unchanged.
+  - **Current readback & `10ΔX` caveats**: Measure currently still queries
+    `GET 0` (`R`) and `GET 1` (`X`) rather than `GET 2` (`10ΔR`), so while
+    hardware `MODE 1` engages the 10x analog difference amplifier, digital
+    readback remains in `GET 0`'s 5.5-digit full-scale format (upgrading to
+    `RSET + GET 2` for the extra 10x digit awaits a real-instrument `GET 2`
+    format check). In addition, hardware `MODE 1` magnifies **both `ΔR` and
+    `ΔX` by 10x** (limiting the window to ±10% of full scale around
+    `RSET`/`XSET`), while this command only writes `R Set` (not `X Set`). If a
+    sensor's reactance exceeds ±10% of full scale, `GET 7` reports
+    `±ΔX overrange` (bits 1/2 → `StatusCode = 1`), leaving that row's `R` and
+    `X` blank.
+- **`x10_off` (10x Delta R Off)**: checks its settle timeout budget, writes and
+  confirms `MODE 0`, waits `switch_settle_seconds`, leaves the physical `R Set`
+  unchanged, and releases the active reference cache so subsequent `Measure`
+  resumes the applied autorange/fixed settings. Re-Apply (`configure`),
+  failed/cancelled `Measure` during 10x, `run_end` (completed/Stop/Error), and
+  `close` also return to `MODE 0`, reset Status `"10x References"` to
+  `"Inactive"`, and confirm minimum 5% excitation. A new `x10_on` captures
+  fresh references (e.g., at the next temperature point). Unstable ranging,
+  overload, or out-of-range counts (`|counts| > 199999`) during capture raises
+  a recoverable Warning; communication and readback failures remain Errors.
+- **Timeout budget**: `x10_on` checks worst-case capture duration against
+  `api.timeout - 2.0 s` before writing. With four fixed channels, `3 s` filter,
+  and `9 s` settle, normal capture waits total `45 s` (`4 x 9 s` plus the final
+  `9 s` 10x settle), excluding GPIB I/O; autorange channels reserve extra settle
+  attempts in the worst-case estimate (`attempts * (settle + 2) + settle +
+  io_timeout * retry + 5`). Subsequent scanning waits once per sensor.
 
-**10x Delta R Off** writes MODE 0 and leaves the current physical R Set unchanged.
-The internal active references are released; subsequent Measure uses the original
-applied automatic/fixed range configuration. Run end/Stop/Error/Disable also return
-to 1x and confirm minimum excitation. A new On captures new references for the next
-temperature point. Unstable ranging/capture or capture overload is a Warning,
-not a fatal SEQ error; communication and write/readback failures remain errors.
+## Verification boundaries
 
-Capture timeout is checked before writes. With four channels, 3 s filters and
-9 s settle, normal capture waits total 45 s (4x9 s plus final 10x settle), excluding
-communication. Scanning then waits once per sensor, not two new baseline waits.
-The new OFFSET/GET 4 sequence has offline verification only, not a new bench test.
+Protocol details were checked against the LR-700 v1.3 manual (pp. 2-3 to 2-10,
+2-18 to 2-25, 3-25 to 3-56, 4-3 to 4-16) and against earlier real LR-700 /
+LR-720-16 bench tests (no-load command checks, S1–S4 loaded fixed-range reads,
+and S1 `AUTORANGE L=19 / T=2`). The common-configuration refactor, generated
+`T=4` trace table, fixed/auto mixed switching, and `OFFSET`/`GET 4`/`MODE 1`
+10x commands are verified **offline only** via protocol simulation and have not
+yet been retested on connected samples. Verify with a noncritical dummy load
+before connecting sensitive samples.

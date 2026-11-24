@@ -166,6 +166,9 @@ class _FakeTransport:
             requested = int(command.split(" ", 1)[1])
             if not (requested == 1 and self.state.ignore_mode_one):
                 self.state.mode = requested
+        elif upper == "OFFSET =0":
+            self.state.rset = 0.0
+            self.state.xset = 0.0
         elif upper.startswith("OFFSET R="):
             counts = int(command.split("=", 1)[1])
             self.state.rset = counts / 200000 * (0.002 * 10**self.state.range_index)
@@ -361,6 +364,7 @@ class LR700BackendTests(unittest.TestCase):
         messages: list[tuple[str, dict]],
         samples: list[dict] | None = None,
         resources: dict[str, dict] | None = None,
+        timeout: float = 120.0,
     ) -> TestModuleAPI:
         iterator = iter(samples or [])
         return TestModuleAPI(
@@ -374,7 +378,7 @@ class LR700BackendTests(unittest.TestCase):
                 else None
             ),
             lambda _timeout: "running",
-            120.0,
+            timeout,
             resources=resources,
         )
 
@@ -628,8 +632,113 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "LR700_REFERENCE_OVERLOAD")
         self.assertEqual(backend._x10_channels, {})
         self.assertEqual(state.mode, 0)
+        self.assertEqual(state.autorange, 0)
+        self.assertEqual(state.excitation_percent, 5)
         run_end(backend, "error", context)
         backend.close(context)
+
+    def test_x10_late_cancel_reapply_and_failed_measure_restore_1x_and_safe_state(self):
+        # Late cancellation during the final 10x settle wait must reset MODE 0 & 5%
+        state = self._reference_state()
+        backend = self._backend(state, [])
+        context = self._context([], _samples(2))
+        open_module(backend, context)
+        backend.configure(self._common_settings(mode="fixed"), context)
+        run_start(backend, context)
+        waits = 0
+
+        def cancel_on_final_settle(_api, _seconds):
+            nonlocal waits
+            waits += 1
+            if waits == 3:
+                raise InterruptedError("cancelled during final 10x settle")
+
+        backend._waiter = cancel_on_final_settle
+        with self.assertRaises(InterruptedError):
+            backend.execute_sequence_command("x10_on", {}, context)
+        self.assertEqual((state.mode, state.excitation_percent, backend._measurement_mode), (0, 5, 0))
+        self.assertEqual(backend._x10_channels, {})
+
+        # Re-Apply while bridge is left in MODE 1 must reset MODE 0 & _measurement_mode
+        backend._waiter = lambda _api, _s: None
+        backend.execute_sequence_command("x10_on", {}, context)
+        self.assertEqual((state.mode, backend._measurement_mode), (1, 1))
+        status = backend.configure(self._common_settings(mode="fixed"), context)
+        self.assertEqual((state.mode, backend._measurement_mode, backend._x10_channels), (0, 0, {}))
+        self.assertEqual(status["10x References"], "Inactive")
+
+        # Out-of-range capture (>199999 counts) is a recoverable Warning and cleans up
+        run_start(backend, context)
+        state.resistance_reply_by_sensor[1] = "+200.40000 MOHMR"
+        with self.assertRaises(ModuleWarning) as out_of_range:
+            backend.execute_sequence_command("x10_on", {}, context)
+        self.assertEqual(out_of_range.exception.code, "LR700_REFERENCE_OUT_OF_RANGE")
+        self.assertEqual((state.mode, state.excitation_percent), (0, 5))
+
+        # x10_off checks timeout before writing
+        short_ctx = self._context([], timeout=5.0)
+        with self.assertRaises(ModuleError) as timeout_err:
+            backend.execute_sequence_command("x10_off", {}, short_ctx)
+        self.assertEqual(timeout_err.exception.code, "LR700_REFERENCE_TIMEOUT_UNSAFE")
+        run_end(backend, "completed", context)
+        backend.close(context)
+
+    def test_x10_clears_offsets_before_starting_autorange(self):
+        state = self._reference_state()
+        state.xset = 0.05
+        backend = self._backend(state, [])
+        context = self._context([])
+        open_module(backend, context)
+        backend.configure(self._common_settings(mode="autorange"), context)
+        run_start(backend, context)
+        start = len(state.commands)
+        backend.execute_sequence_command("x10_on", {}, context)
+        writes = [c for action, c in state.commands[start:] if action == "write"]
+        self.assertIn("OFFSET =0", writes)
+        self.assertEqual(state.xset, 0.0)
+        first_offset_zero = writes.index("OFFSET =0")
+        first_autorange_on = next(i for i, c in enumerate(writes) if c == "AUTORANGE 1")
+        self.assertLess(first_offset_zero, first_autorange_on)
+        run_end(backend, "completed", context)
+        backend.close(context)
+
+    def test_fixed_low_to_high_range_raises_range_before_select_and_9_to_7_steps_via_8(self):
+        from modules.lr700.lr700 import configuration_commands
+
+        up_cmds = configuration_commands(
+            2,
+            {"range_mode": "fixed", "range_index": 9, "excitation_index": 6, "excitation_percent": 100, "filter_index": 1},
+            current_range_index=1,
+        )
+        self.assertLess(up_cmds.index("RANGE 9"), up_cmds.index("SELECT S=02"))
+
+        down_cmds = configuration_commands(
+            1,
+            {"range_mode": "fixed", "range_index": 7, "excitation_index": 0, "excitation_percent": 100, "filter_index": 1},
+            current_range_index=9,
+        )
+        self.assertLess(down_cmds.index("RANGE 8"), down_cmds.index("EXCITATION 2"))
+        self.assertLess(down_cmds.index("EXCITATION 2"), down_cmds.index("RANGE 7"))
+        self.assertLess(down_cmds.index("RANGE 7"), down_cmds.index("EXCITATION 0"))
+
+    def test_fixed_current_settings_prefers_100_percent_over_low_varexc_on_exact_ties(self):
+        from modules.lr700.constants import fixed_current_settings
+
+        for r in range(10):
+            for e in valid_excitation_indices(r):
+                i_full = excitation_current_a(r, e, 100)
+                got_e, got_pct, _actual = fixed_current_settings(r, i_full)
+                self.assertEqual((got_e, got_pct), (e, 100), f"range={r}, exc={e}, I={i_full}")
+
+    def test_disabled_row_and_all_independent_fixed_do_not_block_apply(self):
+        settings = self._common_settings(mode="autorange", limit=1e-10)
+        settings["channels"]["r1"].update(enabled=True, independent=True, range_index=9, current_a=1e-10)
+        settings["channels"]["r2"].update(enabled=False, independent=True, range_index=2, current_a=0.003)
+        normalized = LR700Backend._normalized_settings(
+            settings, require_resource=True, operation_timeout_seconds=120
+        )
+        self.assertTrue(normalized["channels"]["r1"]["enabled"])
+        self.assertFalse(normalized["channels"]["r2"]["enabled"])
 
     def test_x10_readback_errors_and_cancellation_propagate(self):
         for failure in ("reference", "mode", "cancel"):

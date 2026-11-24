@@ -12,8 +12,8 @@ from labcontrol.measurement.frontend_api import ModuleUIAPI
 from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 from .constants import (
     default_settings, common_defaults, RANGE_MODES, RESISTANCE_RANGES, FILTERS,
-    generate_trace, fixed_current_settings, excitation_current_a, format_current,
-    range_label,
+    autorange_trace_excitation_index, generate_trace, fixed_current_settings,
+    excitation_current_a, format_current, range_label,
 )
 
 
@@ -109,7 +109,6 @@ class LR700Frontend(QWidget):
         self.channel_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.channel_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.channel_table.setMinimumHeight(165)
-        self.channel_table.setMaximumHeight(185)
         self.channel_widgets = {}
         for row in range(4):
             widgets = {"enabled": QCheckBox(), "input_channel": QSpinBox(),
@@ -122,7 +121,14 @@ class LR700Frontend(QWidget):
                                  (4, "range_index"), (5, "current_a"), (6, "actual")):
                 self.channel_table.setCellWidget(row, column, widgets[name])
         layout.addWidget(self.channel_table)
-        note = QLabel("Apply writes custom Trace T=4 from the current limit. Fixed currents are rounded down to a supported value; the actual value is shown above. Same range/current: SELECT only. Different configuration: lower excitation, then restore. Settle must be at least 3x the digital filter. Run end/Stop/Error restores minimum excitation at 5%; LR700 has no excitation-off command.")
+        note = QLabel(
+            "Apply writes custom non-standard Trace T=4 from the current limit (not factory T=1/2/3). "
+            "Fixed currents are rounded down to a supported value; the actual value is shown above. "
+            "Same range/current: SELECT only. Different configuration: lower excitation, then restore. "
+            "Settle must be at least 3x the digital filter. Run end/Stop/Error/Disable restores minimum "
+            "excitation at 5%; LR700 has no excitation-off command. Front panel GPIB requires SPECIAL 4 1 "
+            "(factory address 18, SPECIAL 43); Enable and Test Connection are read-only."
+        )
         note.setWordWrap(True)
         layout.addWidget(note)
         layout.addStretch()
@@ -154,17 +160,57 @@ class LR700Frontend(QWidget):
         defaults = default_settings()
         values = {**defaults, **settings}
         raw_channels = settings.get("channels", {})
-        # Existing per-channel files are converted at the settings boundary.
+        if not isinstance(raw_channels, Mapping):
+            raw_channels = {}
+        # Existing per-channel files are converted and validated BEFORE mutating any UI widget.
         legacy = "common" not in settings and bool(raw_channels)
-        first = next((c for c in raw_channels.values() if c.get("enabled") and c.get("range_mode") == "autorange"),
-                     next((c for c in raw_channels.values() if c.get("enabled")), defaults["channels"]["r1"]))
-        common = {**common_defaults(), **settings.get("common", {})}
+        merged_channels: dict[str, dict[str, Any]] = {}
+        for slot in range(1, 5):
+            key = f"r{slot}"
+            supplied = raw_channels.get(key, {})
+            if not isinstance(supplied, Mapping):
+                supplied = {}
+            merged_channels[key] = {**defaults["channels"][key], **supplied}
+
+        common = {**common_defaults(), **(settings["common"] if isinstance(settings.get("common"), Mapping) else {})}
         if legacy:
-            common.update({k: first[k] for k in ("range_mode", "range_index", "autorange_min_range", "autorange_max_range", "filter_index")})
-            common["current_a"] = excitation_current_a(first["range_index"], first["excitation_index"], first["excitation_percent"])
-            common["current_limit_a"] = max(0.003, *(excitation_current_a(c["range_index"], c["excitation_index"], c["excitation_percent"]) for c in raw_channels.values()))
-            if any(c.get("enabled") and c["filter_index"] != first["filter_index"] for c in raw_channels.values()):
+            enabled_channels = [c for c in merged_channels.values() if c.get("enabled")]
+            first = next(
+                (c for c in enabled_channels if c.get("range_mode") == "autorange"),
+                enabled_channels[0] if enabled_channels else defaults["channels"]["r1"],
+            )
+            if any(c["filter_index"] != first["filter_index"] for c in enabled_channels):
                 raise ValueError("Legacy channels use different filters; select one common filter before migration")
+            common.update({
+                k: first[k]
+                for k in ("range_mode", "range_index", "autorange_min_range", "autorange_max_range", "filter_index")
+            })
+            common["current_a"] = excitation_current_a(
+                first["range_index"], first["excitation_index"], first["excitation_percent"]
+            )
+            limit_candidates: list[float] = []
+            for channel in merged_channels.values():
+                channel["current_a"] = excitation_current_a(
+                    channel["range_index"], channel["excitation_index"], channel["excitation_percent"]
+                )
+                channel["independent"] = channel["range_mode"] == "fixed"
+                if channel["enabled"] and channel["range_mode"] == "autorange":
+                    if any(
+                        channel[k] != common[k] for k in ("autorange_min_range", "autorange_max_range")
+                    ):
+                        raise ValueError(
+                            "Legacy channels use different autorange limits; select common limits before migration"
+                        )
+                    lo = int(channel["autorange_min_range"])
+                    hi = int(channel["autorange_max_range"])
+                    limit_candidates.extend(
+                        excitation_current_a(r, autorange_trace_excitation_index(r), 100)
+                        for r in range(max(1, lo), min(9, hi) + 1)
+                    )
+                elif channel["enabled"]:
+                    limit_candidates.append(channel["current_a"])
+            common["current_limit_a"] = max(limit_candidates) if limit_candidates else common["current_a"]
+
         blockers = [QSignalBlocker(w) for w in self._setting_widgets()]
         self._select_resource(str(values["resource"]))
         for name, widget in (("io_timeout_seconds", self.io_timeout), ("retry_attempts", self.retry_attempts),
@@ -177,19 +223,12 @@ class LR700Frontend(QWidget):
                 widget.setValue(float(common[name]) * 1000)
         for slot in range(1, 5):
             key = f"r{slot}"
-            channel = {**defaults["channels"][key], **raw_channels.get(key, {})}
-            if legacy:
-                channel["current_a"] = excitation_current_a(channel["range_index"], channel["excitation_index"], channel["excitation_percent"])
-                channel["independent"] = channel["range_mode"] == "fixed"
-                if channel["enabled"] and channel["range_mode"] == "autorange" and any(
-                    channel[k] != common[k] for k in ("autorange_min_range", "autorange_max_range")
-                ):
-                    raise ValueError("Legacy channels use different autorange limits; select common limits before migration")
+            channel = merged_channels[key]
             w = self.channel_widgets[key]
-            w["enabled"].setChecked(channel["enabled"])
-            w["input_channel"].setValue(channel["input_channel"])
-            w["independent"].setChecked(channel.get("independent", False))
-            self._select_data(w["range_index"], channel["range_index"])
+            w["enabled"].setChecked(bool(channel["enabled"]))
+            w["input_channel"].setValue(int(channel["input_channel"]))
+            w["independent"].setChecked(bool(channel.get("independent", False)))
+            self._select_data(w["range_index"], int(channel["range_index"]))
             w["current_a"].setValue(float(channel.get("current_a", common["current_a"])) * 1000)
         del blockers
         self._update_preview()
@@ -202,13 +241,28 @@ class LR700Frontend(QWidget):
             self.common_widgets[name].setEnabled(not auto)
         for name in ("autorange_min_range", "autorange_max_range"):
             self.common_widgets[name].setEnabled(auto)
-        try:
-            trace, lo, hi = generate_trace(common["current_limit_a"], common["autorange_min_range"], common["autorange_max_range"])
-            self.trace_preview.setText(f"Effective autorange: {range_label(lo)} - {range_label(hi)}; T=4, U=" + "".join(map(str, trace)) + "\n" + " | ".join(f"{range_label(r)}: {format_current(excitation_current_a(r, trace[r]))}" for r in range(lo, hi + 1)))
-        except ValueError as exc:
-            self.trace_preview.setText(str(exc))
         if not auto:
             self.trace_preview.setText("Fixed mode: no Trace is written. Actual fixed currents are shown below.")
+        elif common["autorange_min_range"] >= common["autorange_max_range"]:
+            self.trace_preview.setText("Autorange maximum must exceed minimum")
+        else:
+            try:
+                trace, lo, hi = generate_trace(
+                    common["current_limit_a"],
+                    common["autorange_min_range"],
+                    common["autorange_max_range"],
+                )
+                self.trace_preview.setText(
+                    f"Effective autorange: {range_label(lo)} - {range_label(hi)}; T=4, U="
+                    + "".join(map(str, trace))
+                    + "\n"
+                    + " | ".join(
+                        f"{range_label(r)}: {format_current(excitation_current_a(r, trace[r]))}"
+                        for r in range(lo, hi + 1)
+                    )
+                )
+            except ValueError as exc:
+                self.trace_preview.setText(str(exc))
         for key, channel in settings["channels"].items():
             w = self.channel_widgets[key]
             independent = channel["independent"]

@@ -15,7 +15,7 @@
 | `keithley_2614b` | Keithley 2614B 双通道 SMU A/B 电阻测量 | Beta（仅仿真/协议测试） |
 | `keithley_6517b` | Keithley 6517B 高阻测量（内置电压源 FVMI） | Beta（仅仿真/协议测试） |
 | `lakeshore_372a` | Lake Shore 372 / 372A 交流电阻电桥（1–16 通道扫描） | Beta（仅仿真/协议测试） |
-| `lr700` | Linear Research LR-700 + LR-720-16 交流电桥（通用／独立配置、电流上限生成 Trace、固定基准 ×10） | Beta（已有命令读写测试；本次重构与 ×10 仅离线验证） |
+| `lr700` | Linear Research LR-700 + LR-720-16 交流电桥（通用／独立固定配置、按电流上限生成非标 `T=4` Trace、固定基准 ×10） | Beta（已有早期命令读写测试；本次重构与 ×10 仅离线验证，尚未接样品复测） |
 | `simulated_transport` | 无需硬件的四通道模拟电阻模块 | 教学与仿真测试用 |
 
 > 接真机前请先阅读对应模块目录中的 `README.md`，并在假负载上完成低风险验证。软件测试不能替代硬件联锁、限流/限压和人工急停。
@@ -88,5 +88,7 @@ class Module:
 ```powershell
 <OpenLabControl>\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+> 说明：`tests/test_instrument_file_layout.py` 为函数式布局与协议隔离检查（不会自动被 `unittest discover` 发现），提交硬件模块改动时请额外运行该文件确认无违例。
 
 真实硬件模块须覆盖：身份/量程/限流/互锁校验、命令顺序、写超时不重放、超量程/compliance/乱码与状态码、Pause/Stop、三种 `run_end`、重复 `close`、资源释放以及导入设置不自动 Apply。
