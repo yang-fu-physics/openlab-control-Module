@@ -17,19 +17,19 @@ The LR-700 manual requires GPIB to be enabled at the front panel with
 ### LR-700 VISA session timing
 
 `LR700VisaTransport` wraps OpenLab Control's shared `VisaSession` with LR-700-specific
-GPIB settings aligned with the LabVIEW `LR-700 Send Command.vi` driver without altering
-the framework's global defaults:
+GPIB settings without altering the framework's global defaults:
 
-- `read_termination = None` (end reads on GPIB EOI);
+- `read_termination = None` (end reads on GPIB EOI; no Bytes at Port polling);
 - `write_termination = "\n"`;
-- no extra `query_delay` on `GET` queries or writes (relying on IEEE-488 hardware
-  handshaking + EOI);
+- `query_delay = 0.1` (`100 ms`, `LR700_QUERY_DELAY_SECONDS`) on `LR700VisaTransport`
+  `GET` queries (`handle.query()`), leaving the framework's shared `VisaSession`
+  defaults unchanged;
 - **write-then-readback synchronization**: matching the LR-700 v1.3 manual (p. 3-50)
   and the LabVIEW `LR-700 Send Command.vi` pattern, every non-`GET` command sent via
-  `LR700VisaTransport.write()` calls `write()` followed immediately by `read()` to EOI,
-  expecting an empty line (`\n` + EOI), raising `LR700_COMMAND_REJECTED` immediately on
-  `"ERROR"`, and treating unexpected non-empty replies or I/O failures as
-  `LR700_WRITE_UNCERTAIN`;
+  `LR700VisaTransport.write()` calls `write()` followed immediately by `read()` to EOI
+  (no extra delay), expecting an empty line (`\n` + EOI), raising
+  `LR700_COMMAND_REJECTED` immediately on `"ERROR"`, and treating unexpected non-empty
+  replies or I/O failures as `LR700_WRITE_UNCERTAIN`;
 - **5.0 s reconnect delay**: after closing a failed GPIB session, both read-retry and
   safe-state cleanup wait `5.0 s` (`LR700_RECONNECT_DELAY_SECONDS`) before reopening.
 
@@ -241,13 +241,15 @@ interlocks and the laboratory's manual emergency procedure remain necessary.
 ## Verification boundaries
 
 Protocol details were checked against the LR-700 v1.3 manual (pp. 2-3 to 2-10,
-2-18 to 2-25, 3-25 to 3-56, 4-3 to 4-16) and against earlier real LR-700 /
-LR-720-16 bench tests (no-load command checks, S1–S4 loaded fixed-range reads,
-and S1 `AUTORANGE L=19 / T=2`). Removing the `0.2 s` `query_delay` on `GET`
-queries (to match LabVIEW's zero-delay `Send Command.vi`) has not yet been
-re-verified in a long real-hardware run (prior stress runs kept `0.2 s` on
-`GET`). The common-configuration refactor, generated `T=4` trace table,
-fixed/auto mixed switching, and `OFFSET`/`GET 4`/`MODE 1` 10x commands are
-verified **offline only** via protocol simulation and have not yet been
-retested on connected samples. Verify with a noncritical dummy load before
-connecting sensitive samples.
+2-18 to 2-25, 3-25 to 3-56, 4-3 to 4-16) and against real LR-700 / LR-720-16 bench
+tests (no-load command checks, S1–S4 loaded fixed-range reads, S1 `AUTORANGE L=19 / T=2`,
+and `GPIB0::18::INSTR` EOI query-delay tests). On `2026-11-25`, `20 ms` `query_delay`
+passed `600/600` long `GET 6` reads (`FILTER 3`, 30 bytes) but returned empty `b'\n'`
+replies in `3/3` mixed `GET 6/0/1/4/7` runs (both LF and CR), whereas `100 ms`
+(`query_delay = 0.1`) passed `300/300` long `GET 6` reads and `250/250` mixed `GET`
+queries. `100 ms` is still a bounded-sample verification and has not yet been long-run
+verified across full measurement and channel-switching workflows. The common-configuration
+refactor, generated `T=4` trace table, fixed/auto mixed switching, and
+`OFFSET`/`GET 4`/`MODE 1` 10x commands are verified **offline only** via protocol
+simulation and have not yet been retested on connected samples. Verify with a noncritical
+dummy load before connecting sensitive samples.

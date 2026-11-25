@@ -24,11 +24,14 @@ from .constants import (
 )
 
 
-# 实机 GPIB（NI GPIB-USB-HS）适配参数，与 LabVIEW LR-700 驱动保持一致：
-# 读取依赖 EOI（read_termination=None），写入以 "\n" 结尾，不额外叠加 query_delay，
-# 靠 GPIB 硬件握手同步；异常重连前预留 5.0 s 冷却间隔。
+# 实机 GPIB（NI GPIB-USB-HS）适配参数：
+# 读取依赖 EOI（read_termination=None），写入以 "\n" 结尾；
+# 混合 GET 查询在 20 ms 写后读延时下实测出现空行，100 ms 对照通过，故仅在 LR-700
+# 专用 Transport 上设置 query_delay=0.1（不修改框架通用 VisaSession 默认值）；
+# 非 GET 设置命令仍保持写后即时 EOI 回读，异常重连前预留 5.0 s 冷却间隔。
 LR700_READ_TERMINATION: str | None = None
 LR700_WRITE_TERMINATION = "\n"
+LR700_QUERY_DELAY_SECONDS = 0.1
 LR700_RECONNECT_DELAY_SECONDS = 5.0
 
 # 下降换挡中转量程：20 kOhm（编码 7）既支持 EXCITATION 0（20 uV），
@@ -41,7 +44,7 @@ class LR700CommandRejectedError(ValueError):
 
 
 class LR700VisaTransport(VisaSession):
-    """带 LR-700 专用 EOI 读取与写后即时回读同步的 VISA 会话包装。"""
+    """带 LR-700 专用 EOI 读取、100 ms 查询延时与写后即时回读同步的 VISA 会话包装。"""
 
     def __init__(
         self,
@@ -50,6 +53,7 @@ class LR700VisaTransport(VisaSession):
         *,
         read_termination: str | None = LR700_READ_TERMINATION,
         write_termination: str = LR700_WRITE_TERMINATION,
+        query_delay: float = LR700_QUERY_DELAY_SECONDS,
         **attributes: Any,
     ) -> None:
         super().__init__(
@@ -57,6 +61,7 @@ class LR700VisaTransport(VisaSession):
             timeout_seconds,
             read_termination=read_termination,
             write_termination=write_termination,
+            query_delay=query_delay,
             **attributes,
         )
 
@@ -463,6 +468,7 @@ def parse_overloads(reply: str) -> int:
 __all__ = [
     "LR700_READ_TERMINATION",
     "LR700_WRITE_TERMINATION",
+    "LR700_QUERY_DELAY_SECONDS",
     "LR700_RECONNECT_DELAY_SECONDS",
     "LR700CommandRejectedError",
     "LR700VisaTransport",
