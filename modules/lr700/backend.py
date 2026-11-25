@@ -1585,7 +1585,7 @@ class LR700Backend:
                 f"{type(exc).__name__}: {exc}"
             )
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(self._SAFE_CLEANUP_ATTEMPTS):
             transport = self.transport
             initial: dict[str, int] | None = None
             if transport is None:
@@ -1657,9 +1657,9 @@ class LR700Backend:
                 return None
             except Exception as exc:
                 last_error = exc
-                # 第一次失败后丢弃可能损坏的 session；第二次失败直接报告，避免
+                # 前序清理失败后丢弃可能损坏的 session；最后一轮失败直接报告，避免
                 # 安全清理无限阻塞 worker 退出。
-                if attempt == 0:
+                if attempt < self._SAFE_CLEANUP_ATTEMPTS - 1:
                     self._close_transport()
         assert last_error is not None
         return (
@@ -2582,10 +2582,11 @@ class LR700Backend:
             for channel in channels.values():
                 channel["autorange_trace"] = trace
         result["channels"] = channels
-        cls._validate_measure_duration(
-            result,
-            operation_timeout_seconds,
-        )
+        if require_resource:
+            cls._validate_measure_duration(
+                result,
+                operation_timeout_seconds,
+            )
         return result
 
     @staticmethod
@@ -2597,15 +2598,18 @@ class LR700Backend:
             return int(settings.get("retry_attempts", 2))
         return 1
 
-    @staticmethod
-    def _io_retry_margin(settings: Mapping[str, Any]) -> float:
+    _SAFE_CLEANUP_ATTEMPTS = 2
+
+    @classmethod
+    def _io_retry_margin(cls, settings: Mapping[str, Any]) -> float:
+        """覆盖读重试链与随后最低激励安全清理（含最多 2 轮重连冷却）的保守预算。"""
+
         attempts = int(settings["retry_attempts"])
-        reconnect_margin = max(
-            5.0,
-            max(0, attempts - 1)
-            * float(instrument.LR700_RECONNECT_DELAY_SECONDS),
-        )
-        return float(settings["io_timeout_seconds"]) * attempts + reconnect_margin
+        io_timeout = float(settings["io_timeout_seconds"])
+        reconnect_delay = float(instrument.LR700_RECONNECT_DELAY_SECONDS)
+        retry_budget = attempts * io_timeout + max(0, attempts - 1) * reconnect_delay
+        cleanup_budget = cls._SAFE_CLEANUP_ATTEMPTS * (io_timeout + reconnect_delay)
+        return retry_budget + cleanup_budget + 5.0
 
     @classmethod
     def _estimated_measure_seconds(

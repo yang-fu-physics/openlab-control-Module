@@ -1852,6 +1852,97 @@ class LR700BackendTests(unittest.TestCase):
         )
         self.assertEqual(state.opened, [])
 
+    def test_timeout_budget_covers_read_retry_and_post_error_safe_cleanup(
+        self,
+    ) -> None:
+        base = default_settings()
+        base["resource"] = "GPIB0::18::INSTR"
+        base["switch_settle_seconds"] = 9.0
+        base["dwell_seconds"] = 1.0
+        base["io_timeout_seconds"] = 3.0
+        base["retry_attempts"] = 2
+        for key, channel in base["channels"].items():
+            channel["enabled"] = key == "r1"
+            channel["range_mode"] = "fixed"
+            channel["filter_index"] = 1
+
+        # 25 s / 32 s / 37 s 都不足以覆盖 9+1 s 等待 + 读重试 + 失败后 2 轮安全清理重连。
+        for too_short in (25.0, 32.0, 37.0):
+            with self.subTest(rejected_timeout=too_short):
+                state = _FakeVisaState()
+                backend = self._backend(state, [])
+                context = self._context([], _samples(1), timeout=too_short)
+                open_module(backend, context)
+                with self.assertRaises(ModuleError) as err:
+                    backend.configure(base, context)
+                self.assertEqual(err.exception.code, "LR700_MEASURE_TIMEOUT_UNSAFE")
+                self.assertEqual(state.opened, [])
+
+        # 离线模拟完整最坏故障链（读超时重试 + 安全清理两轮失败重连），验证实际累计耗时
+        # 严格落在最小放行超时预算（46 s，对应 estimate 44 s + 2 s 余量）之内。
+        min_allowed_timeout = 46.0
+        for case_name, fail_reopen_on_retry, expected_elapsed in (
+            ("cleanup_starts_with_open_transport", False, 32.0),
+            ("cleanup_starts_with_closed_transport", True, 37.0),
+        ):
+            with self.subTest(case=case_name):
+                state = _FakeVisaState()
+                waits: list[float] = []
+                timed_out_calls = 0
+
+                class _TimeoutCountingTransport(_FakeTransport):
+                    def query(self, command: str) -> str:
+                        nonlocal timed_out_calls
+                        try:
+                            return super().query(command)
+                        except OSError:
+                            timed_out_calls += 1
+                            raise
+
+                def factory(resource: str, timeout: float):
+                    state.opened.append((resource, timeout))
+                    return _TimeoutCountingTransport(state)
+
+                backend = LR700Backend(
+                    transport_factory=factory,
+                    waiter=lambda _api, seconds: waits.append(seconds),
+                )
+                context = self._context([], _samples(1), timeout=min_allowed_timeout)
+                open_module(backend, context)
+                backend.configure(base, context)
+                run_start(backend, context)
+                waits.clear()
+
+                # Measure 会在 settle(9s) + dwell(1s) 后查询 GET 0；注入连续超时。
+                state.failures["GET 0"] = 2
+                # 前置 _prepare_sensor / settle 后的 GET 6 保持正常，只在 GET 0 失败后触发清理/重连超时。
+                orig_query = _TimeoutCountingTransport.query
+                get0_seen = {"count": 0}
+
+                def scripted_query(self_t, command: str) -> str:
+                    nonlocal timed_out_calls
+                    if command == "GET 0":
+                        get0_seen["count"] += 1
+                        timed_out_calls += 1
+                        raise OSError("simulated GET 0 timeout")
+                    if command == "GET 6" and get0_seen["count"] >= (
+                        1 if fail_reopen_on_retry else 2
+                    ):
+                        timed_out_calls += 1
+                        raise OSError("simulated GET 6 timeout during reopen/cleanup")
+                    return orig_query(self_t, command)
+
+                with patch.object(_TimeoutCountingTransport, "query", scripted_query):
+                    with self.assertRaises(ModuleError) as err:
+                        measure_module(backend, context)
+
+                self.assertEqual(err.exception.code, "LR700_SAFE_STATE_FAILED")
+                simulated_elapsed = sum(waits) + timed_out_calls * float(
+                    base["io_timeout_seconds"]
+                )
+                self.assertAlmostEqual(simulated_elapsed, expected_elapsed)
+                self.assertLessEqual(simulated_elapsed, min_allowed_timeout - 2.0)
+
     def test_invalid_range_excitation_and_autorange_limits_rejected_before_connect(
         self,
     ) -> None:
