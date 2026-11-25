@@ -56,6 +56,9 @@ LR700VisaTransport = load_source_object(
     "lr700:LR700VisaTransport",
     "test_lr700_protocol",
 )
+LR700CommandRejectedError = sys.modules[
+    LR700VisaTransport.__module__
+].LR700CommandRejectedError
 FILTERS = load_source_object(
     MODULE,
     "constants:FILTERS",
@@ -1492,7 +1495,7 @@ class LR700BackendTests(unittest.TestCase):
             ),
             2,
         )
-        self.assertIn(0.2, waits)
+        self.assertIn(5.0, waits)
         warning_codes = [
             payload.get("code")
             for kind, payload in messages
@@ -1740,10 +1743,11 @@ class LR700BackendTests(unittest.TestCase):
         self,
     ) -> None:
         state = _FakeVisaState()
+        waits: list[float] = []
         messages: list[tuple[str, dict]] = []
         settings = default_settings()
         settings["resource"] = "GPIB0::18::INSTR"
-        backend = self._backend(state)
+        backend = self._backend(state, waits)
         context = self._context(messages)
         open_module(backend, context)
         backend.configure(settings, context)
@@ -1755,6 +1759,7 @@ class LR700BackendTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(state.opened), 2)
         self.assertGreaterEqual(state.closed, 1)
+        self.assertIn(5.0, waits)
         self.assertEqual(state.excitation_index, 0)
         self.assertEqual(state.excitation_percent, 5)
         self.assertIn(
@@ -1847,6 +1852,97 @@ class LR700BackendTests(unittest.TestCase):
         )
         self.assertEqual(state.opened, [])
 
+    def test_timeout_budget_covers_read_retry_and_post_error_safe_cleanup(
+        self,
+    ) -> None:
+        base = default_settings()
+        base["resource"] = "GPIB0::18::INSTR"
+        base["switch_settle_seconds"] = 9.0
+        base["dwell_seconds"] = 1.0
+        base["io_timeout_seconds"] = 3.0
+        base["retry_attempts"] = 2
+        for key, channel in base["channels"].items():
+            channel["enabled"] = key == "r1"
+            channel["range_mode"] = "fixed"
+            channel["filter_index"] = 1
+
+        # 25 s / 32 s / 37 s 都不足以覆盖 9+1 s 等待 + 读重试 + 失败后 2 轮安全清理重连。
+        for too_short in (25.0, 32.0, 37.0):
+            with self.subTest(rejected_timeout=too_short):
+                state = _FakeVisaState()
+                backend = self._backend(state, [])
+                context = self._context([], _samples(1), timeout=too_short)
+                open_module(backend, context)
+                with self.assertRaises(ModuleError) as err:
+                    backend.configure(base, context)
+                self.assertEqual(err.exception.code, "LR700_MEASURE_TIMEOUT_UNSAFE")
+                self.assertEqual(state.opened, [])
+
+        # 离线模拟完整最坏故障链（读超时重试 + 安全清理两轮失败重连），验证实际累计耗时
+        # 严格落在最小放行超时预算（46 s，对应 estimate 44 s + 2 s 余量）之内。
+        min_allowed_timeout = 46.0
+        for case_name, fail_reopen_on_retry, expected_elapsed in (
+            ("cleanup_starts_with_open_transport", False, 32.0),
+            ("cleanup_starts_with_closed_transport", True, 37.0),
+        ):
+            with self.subTest(case=case_name):
+                state = _FakeVisaState()
+                waits: list[float] = []
+                timed_out_calls = 0
+
+                class _TimeoutCountingTransport(_FakeTransport):
+                    def query(self, command: str) -> str:
+                        nonlocal timed_out_calls
+                        try:
+                            return super().query(command)
+                        except OSError:
+                            timed_out_calls += 1
+                            raise
+
+                def factory(resource: str, timeout: float):
+                    state.opened.append((resource, timeout))
+                    return _TimeoutCountingTransport(state)
+
+                backend = LR700Backend(
+                    transport_factory=factory,
+                    waiter=lambda _api, seconds: waits.append(seconds),
+                )
+                context = self._context([], _samples(1), timeout=min_allowed_timeout)
+                open_module(backend, context)
+                backend.configure(base, context)
+                run_start(backend, context)
+                waits.clear()
+
+                # Measure 会在 settle(9s) + dwell(1s) 后查询 GET 0；注入连续超时。
+                state.failures["GET 0"] = 2
+                # 前置 _prepare_sensor / settle 后的 GET 6 保持正常，只在 GET 0 失败后触发清理/重连超时。
+                orig_query = _TimeoutCountingTransport.query
+                get0_seen = {"count": 0}
+
+                def scripted_query(self_t, command: str) -> str:
+                    nonlocal timed_out_calls
+                    if command == "GET 0":
+                        get0_seen["count"] += 1
+                        timed_out_calls += 1
+                        raise OSError("simulated GET 0 timeout")
+                    if command == "GET 6" and get0_seen["count"] >= (
+                        1 if fail_reopen_on_retry else 2
+                    ):
+                        timed_out_calls += 1
+                        raise OSError("simulated GET 6 timeout during reopen/cleanup")
+                    return orig_query(self_t, command)
+
+                with patch.object(_TimeoutCountingTransport, "query", scripted_query):
+                    with self.assertRaises(ModuleError) as err:
+                        measure_module(backend, context)
+
+                self.assertEqual(err.exception.code, "LR700_SAFE_STATE_FAILED")
+                simulated_elapsed = sum(waits) + timed_out_calls * float(
+                    base["io_timeout_seconds"]
+                )
+                self.assertAlmostEqual(simulated_elapsed, expected_elapsed)
+                self.assertLessEqual(simulated_elapsed, min_allowed_timeout - 2.0)
+
     def test_invalid_range_excitation_and_autorange_limits_rejected_before_connect(
         self,
     ) -> None:
@@ -1906,7 +2002,7 @@ class LR700BackendTests(unittest.TestCase):
         )
         self.assertEqual(normalized["channels"]["r1"]["range_mode"], "fixed")
 
-    def test_lr700_visa_transport_sets_eoi_and_query_delay_without_touching_core_defaults(
+    def test_lr700_visa_transport_sets_eoi_without_query_delay_or_touching_core_defaults(
         self,
     ) -> None:
         from labcontrol.measurement.visa import VisaSession
@@ -1944,11 +2040,157 @@ class LR700BackendTests(unittest.TestCase):
         lr_handle, core_handle = created_handles
         self.assertIsNone(lr_handle.read_termination)
         self.assertEqual(lr_handle.write_termination, "\n")
-        self.assertAlmostEqual(lr_handle.query_delay, 0.2)
+        self.assertIsNone(lr_handle.query_delay)
         # 框架通用 VisaSession 默认值保持不变。
         self.assertEqual(core_handle.read_termination, "\n")
         self.assertEqual(core_handle.write_termination, "\n")
         self.assertIsNone(core_handle.query_delay)
+
+    def test_lr700_visa_transport_write_reads_back_eoi_response_and_checks_errors(
+        self,
+    ) -> None:
+        from labcontrol.measurement.visa import VisaSession
+
+        created_handles = []
+
+        class _FakeHandle:
+            def __init__(self) -> None:
+                self.timeout = None
+                self.read_termination = "UNSET"
+                self.write_termination = "UNSET"
+                self.query_delay = None
+                self.ops: list[tuple[str, str]] = []
+                self._pending_reply = "\n"
+                self.reply_map: dict[str, str] = {
+                    "RANGE 2": "\n",
+                    "BOGUS": "ERROR\n",
+                    "SELECT S=01": "2R,3E,100%,1F,0M,0L,01S\n",
+                }
+
+            def write(self, command: str) -> None:
+                self.ops.append(("write", command))
+                self._pending_reply = self.reply_map.get(command, "\n")
+
+            def read(self) -> str:
+                self.ops.append(("read", ""))
+                return self._pending_reply
+
+            def query(self, command: str) -> str:
+                self.ops.append(("query", command))
+                return self.reply_map.get(command, "\n")
+
+            def close(self) -> None:
+                pass
+
+        class _FakeRM:
+            def open_resource(self, address, open_timeout=None):
+                handle = _FakeHandle()
+                created_handles.append(handle)
+                return handle
+
+        fake_pyvisa = types.ModuleType("pyvisa")
+        fake_pyvisa.ResourceManager = _FakeRM
+
+        with patch.dict(sys.modules, {"pyvisa": fake_pyvisa}):
+            lr_session = LR700VisaTransport("GPIB0::18::INSTR", 3.0)
+            core_session = VisaSession("GPIB0::10::INSTR", 3.0)
+
+            lr_session.write("RANGE 2")
+            core_session.write("RANGE 2")
+
+            with self.assertRaises(LR700CommandRejectedError):
+                lr_session.write("BOGUS")
+            with self.assertRaises(ValueError):
+                lr_session.write("SELECT S=01")
+
+            lr_session.close()
+            core_session.close()
+
+        lr_handle, core_handle = created_handles
+        self.assertEqual(
+            lr_handle.ops,
+            [
+                ("write", "RANGE 2"),
+                ("read", ""),
+                ("write", "BOGUS"),
+                ("read", ""),
+                ("write", "SELECT S=01"),
+                ("read", ""),
+            ],
+        )
+        self.assertEqual(core_handle.ops, [("write", "RANGE 2")])
+
+    def test_write_readback_rejected_and_unexpected_reply_in_backend(
+        self,
+    ) -> None:
+        for fault_reply, expected_code, expect_reopen in (
+            ("ERROR\n", "LR700_COMMAND_REJECTED", False),
+            ("2R,3E,100%,1F,0M,0L,01S\n", "LR700_WRITE_UNCERTAIN", True),
+        ):
+            with self.subTest(expected_code=expected_code):
+                state = _FakeVisaState()
+                waits: list[float] = []
+                opened_count = 0
+                fail_once = {"armed": True}
+
+                class _FakeHandle:
+                    def __init__(self) -> None:
+                        self.timeout = None
+                        self.read_termination = None
+                        self.write_termination = "\n"
+                        self.query_delay = None
+                        self._pending_reply = "\n"
+                        self._delegate = _FakeTransport(state)
+
+                    def write(self, command: str) -> None:
+                        if command == "SELECT S=01" and fail_once["armed"]:
+                            fail_once["armed"] = False
+                            self._pending_reply = fault_reply
+                            return
+                        self._delegate.write(command)
+                        self._pending_reply = "\n"
+
+                    def read(self) -> str:
+                        return self._pending_reply
+
+                    def query(self, command: str) -> str:
+                        return self._delegate.query(command)
+
+                    def close(self) -> None:
+                        self._delegate.close()
+
+                class _FakeRM:
+                    def open_resource(self, address, open_timeout=None):
+                        nonlocal opened_count
+                        opened_count += 1
+                        return _FakeHandle()
+
+                fake_pyvisa = types.ModuleType("pyvisa")
+                fake_pyvisa.ResourceManager = _FakeRM
+
+                messages: list[tuple[str, dict]] = []
+                settings = default_settings()
+                settings["resource"] = "GPIB0::18::INSTR"
+                context = self._context(messages, _samples(1))
+                with patch.dict(sys.modules, {"pyvisa": fake_pyvisa}):
+                    backend = LR700Backend(
+                        waiter=lambda _api, seconds: waits.append(seconds),
+                    )
+                    open_module(backend, context)
+                    backend.configure(settings, context)
+                    run_start(backend, context)
+
+                    with self.assertRaises(ModuleError) as captured:
+                        measure_module(backend, context)
+
+                self.assertEqual(captured.exception.code, expected_code)
+                self.assertEqual(opened_count, 2 if expect_reopen else 1)
+                if expect_reopen:
+                    self.assertIn(5.0, waits)
+                else:
+                    self.assertNotIn(5.0, waits)
+                self.assertEqual(state.excitation_index, 0)
+                self.assertEqual(state.excitation_percent, 5)
 
     def test_duplicate_physical_inputs_fail_before_connect(
         self,

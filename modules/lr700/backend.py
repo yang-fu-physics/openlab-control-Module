@@ -17,6 +17,7 @@ LR-700 没有真正的 excitation-off 命令。软件能确认的最低状态是
 from __future__ import annotations
 
 import math
+import time
 from labcontrol.formatting import require_precision
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -110,6 +111,7 @@ class LR700Backend:
         self._transport_factory = (
             transport_factory or instrument.PyVisaTransport
         )
+        self._custom_waiter = waiter is not None
         self._waiter = (
             waiter
             or (
@@ -283,7 +285,7 @@ class LR700Backend:
         self._require_ready()
         settings = self.applied_settings
         settle = float(settings["switch_settle_seconds"])
-        io_margin = float(settings["io_timeout_seconds"]) * int(settings["retry_attempts"]) + 5.0
+        io_margin = self._io_retry_margin(settings)
         if command_id == "x10_off":
             estimate = settle + io_margin
             if estimate > api.timeout - 2.0:
@@ -1190,11 +1192,12 @@ class LR700Backend:
         command: str,
         api: ModuleAPI,
     ) -> None:
-        """发送一次绝对设置命令；写超时后不自动重放。
+        """发送一次绝对设置命令并同步回读响应；异常后不自动重放。
 
-        GPIB 写异常无法判断仪表是否已经执行命令。即使命令本身是绝对值，盲目重放也
-        会掩盖链路故障，因此先关闭 session、报告 Error，再由 finally 使用独立的
-        最低激励恢复路径处理安全状态。
+        底层 ``LR700VisaTransport.write()`` 会在写入后按手册 p. 3-50 回读至 EOI：
+        若仪表明确返回 ``ERROR``，直接报告 ``LR700_COMMAND_REJECTED``；若发生 GPIB
+        读写异常或非预期响应，无法判断仪表是否已经执行命令，因此先关闭 session、报告
+        ``LR700_WRITE_UNCERTAIN``，再由 finally 使用独立的最低激励恢复路径处理安全状态。
         """
 
         api.sleep(0)
@@ -1207,6 +1210,12 @@ class LR700Backend:
             )
         try:
             transport.write(command)
+        except instrument.LR700CommandRejectedError as exc:
+            raise ModuleError(
+                f"LR-700 rejected command {command}",
+                "LR700_COMMAND_REJECTED",
+                command,
+            ) from exc
         except Exception as exc:
             self._close_transport()
             raise ModuleError(
@@ -1236,6 +1245,8 @@ class LR700Backend:
             api.sleep(0)
             transport = self.transport
             if transport is None:
+                if attempt == 1:
+                    self._wait_reconnect_delay(api, cancellable=True)
                 try:
                     self._reopen_transport(settings, api)
                     transport = self.transport
@@ -1273,11 +1284,8 @@ class LR700Backend:
                     f"{last_error}",
                     command,
                 )
-                self._waiter(api, 0.2)
-                try:
-                    self._reopen_transport(settings, api)
-                except Exception as exc:
-                    last_error = exc
+                self._close_transport()
+                self._wait_reconnect_delay(api, cancellable=True)
         api.warn("LR700_IO_RETRY", None, command)
         assert last_error is not None
         raise ModuleError(
@@ -1287,6 +1295,28 @@ class LR700Backend:
             "LR700_COMMUNICATION_FAILED",
             command,
         ) from last_error
+
+    def _wait_reconnect_delay(
+        self,
+        api: ModuleAPI,
+        *,
+        cancellable: bool,
+    ) -> None:
+        """异常关闭会话后等待一段冷却时间再重新打开 GPIB 连接。"""
+
+        delay = float(instrument.LR700_RECONNECT_DELAY_SECONDS)
+        if delay <= 0:
+            return
+        if cancellable:
+            self._waiter(api, delay)
+            return
+        if self._custom_waiter:
+            try:
+                self._waiter(api, delay)
+            except InterruptedError:
+                pass
+            return
+        time.sleep(delay)
 
     def _reopen_transport(
         self,
@@ -1555,10 +1585,11 @@ class LR700Backend:
                 f"{type(exc).__name__}: {exc}"
             )
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(self._SAFE_CLEANUP_ATTEMPTS):
             transport = self.transport
             initial: dict[str, int] | None = None
             if transport is None:
+                self._wait_reconnect_delay(api, cancellable=False)
                 try:
                     transport = self._transport_factory(
                         resource,
@@ -1626,9 +1657,9 @@ class LR700Backend:
                 return None
             except Exception as exc:
                 last_error = exc
-                # 第一次失败后丢弃可能损坏的 session；第二次失败直接报告，避免
+                # 前序清理失败后丢弃可能损坏的 session；最后一轮失败直接报告，避免
                 # 安全清理无限阻塞 worker 退出。
-                if attempt == 0:
+                if attempt < self._SAFE_CLEANUP_ATTEMPTS - 1:
                     self._close_transport()
         assert last_error is not None
         return (
@@ -2551,10 +2582,11 @@ class LR700Backend:
             for channel in channels.values():
                 channel["autorange_trace"] = trace
         result["channels"] = channels
-        cls._validate_measure_duration(
-            result,
-            operation_timeout_seconds,
-        )
+        if require_resource:
+            cls._validate_measure_duration(
+                result,
+                operation_timeout_seconds,
+            )
         return result
 
     @staticmethod
@@ -2565,6 +2597,19 @@ class LR700Backend:
         if str(channel.get("range_mode", "fixed")).strip().casefold() == "autorange":
             return int(settings.get("retry_attempts", 2))
         return 1
+
+    _SAFE_CLEANUP_ATTEMPTS = 2
+
+    @classmethod
+    def _io_retry_margin(cls, settings: Mapping[str, Any]) -> float:
+        """覆盖读重试链与随后最低激励安全清理（含最多 2 轮重连冷却）的保守预算。"""
+
+        attempts = int(settings["retry_attempts"])
+        io_timeout = float(settings["io_timeout_seconds"])
+        reconnect_delay = float(instrument.LR700_RECONNECT_DELAY_SECONDS)
+        retry_budget = attempts * io_timeout + max(0, attempts - 1) * reconnect_delay
+        cleanup_budget = cls._SAFE_CLEANUP_ATTEMPTS * (io_timeout + reconnect_delay)
+        return retry_budget + cleanup_budget + 5.0
 
     @classmethod
     def _estimated_measure_seconds(
@@ -2589,9 +2634,7 @@ class LR700Backend:
                 + float(settings["dwell_seconds"])
                 + 2.0
             )
-            + float(settings["io_timeout_seconds"])
-            * int(settings["retry_attempts"])
-            + 5.0
+            + cls._io_retry_margin(settings)
         )
 
     @classmethod
@@ -2615,9 +2658,7 @@ class LR700Backend:
                 + float(settings["dwell_seconds"])
                 + 2.0
             )
-            + float(settings["io_timeout_seconds"])
-            * int(settings["retry_attempts"])
-            + 5.0
+            + cls._io_retry_margin(settings)
         )
         timeout = float(operation_timeout_seconds)
         if (
