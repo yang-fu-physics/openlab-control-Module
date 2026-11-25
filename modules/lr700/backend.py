@@ -1190,11 +1190,12 @@ class LR700Backend:
         command: str,
         api: ModuleAPI,
     ) -> None:
-        """发送一次绝对设置命令；写超时后不自动重放。
+        """发送一次绝对设置命令并同步回读响应；异常后不自动重放。
 
-        GPIB 写异常无法判断仪表是否已经执行命令。即使命令本身是绝对值，盲目重放也
-        会掩盖链路故障，因此先关闭 session、报告 Error，再由 finally 使用独立的
-        最低激励恢复路径处理安全状态。
+        底层 ``LR700VisaTransport.write()`` 会在写入后按手册 p. 3-50 回读至 EOI：
+        若仪表明确返回 ``ERROR``，直接报告 ``LR700_COMMAND_REJECTED``；若发生 GPIB
+        读写异常或非预期响应，无法判断仪表是否已经执行命令，因此先关闭 session、报告
+        ``LR700_WRITE_UNCERTAIN``，再由 finally 使用独立的最低激励恢复路径处理安全状态。
         """
 
         api.sleep(0)
@@ -1207,6 +1208,12 @@ class LR700Backend:
             )
         try:
             transport.write(command)
+        except instrument.LR700CommandRejectedError as exc:
+            raise ModuleError(
+                f"LR-700 rejected command {command}",
+                "LR700_COMMAND_REJECTED",
+                command,
+            ) from exc
         except Exception as exc:
             self._close_transport()
             raise ModuleError(

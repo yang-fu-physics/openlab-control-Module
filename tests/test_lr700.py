@@ -56,6 +56,9 @@ LR700VisaTransport = load_source_object(
     "lr700:LR700VisaTransport",
     "test_lr700_protocol",
 )
+LR700CommandRejectedError = sys.modules[
+    LR700VisaTransport.__module__
+].LR700CommandRejectedError
 FILTERS = load_source_object(
     MODULE,
     "constants:FILTERS",
@@ -1949,6 +1952,128 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(core_handle.read_termination, "\n")
         self.assertEqual(core_handle.write_termination, "\n")
         self.assertIsNone(core_handle.query_delay)
+
+    def test_lr700_visa_transport_write_reads_back_eoi_response_and_checks_errors(
+        self,
+    ) -> None:
+        from labcontrol.measurement.visa import VisaSession
+
+        created_handles = []
+
+        class _FakeHandle:
+            def __init__(self) -> None:
+                self.timeout = None
+                self.read_termination = "UNSET"
+                self.write_termination = "UNSET"
+                self.query_delay = None
+                self.writes: list[str] = []
+                self.queries: list[str] = []
+                self.reply_map: dict[str, str] = {
+                    "RANGE 2": "\n",
+                    "BOGUS": "ERROR\n",
+                    "SELECT S=01": "2R,3E,100%,1F,0M,0L,01S\n",
+                }
+
+            def write(self, command: str) -> None:
+                self.writes.append(command)
+
+            def query(self, command: str) -> str:
+                self.queries.append(command)
+                return self.reply_map.get(command, "\n")
+
+            def close(self) -> None:
+                pass
+
+        class _FakeRM:
+            def open_resource(self, address, open_timeout=None):
+                handle = _FakeHandle()
+                created_handles.append(handle)
+                return handle
+
+        fake_pyvisa = types.ModuleType("pyvisa")
+        fake_pyvisa.ResourceManager = _FakeRM
+
+        with patch.dict(sys.modules, {"pyvisa": fake_pyvisa}):
+            lr_session = LR700VisaTransport("GPIB0::18::INSTR", 3.0)
+            core_session = VisaSession("GPIB0::10::INSTR", 3.0)
+
+            lr_session.write("RANGE 2")
+            core_session.write("RANGE 2")
+
+            with self.assertRaises(LR700CommandRejectedError):
+                lr_session.write("BOGUS")
+            with self.assertRaises(ValueError):
+                lr_session.write("SELECT S=01")
+
+            lr_session.close()
+            core_session.close()
+
+        lr_handle, core_handle = created_handles
+        self.assertEqual(lr_handle.writes, [])
+        self.assertEqual(lr_handle.queries, ["RANGE 2", "BOGUS", "SELECT S=01"])
+        self.assertEqual(core_handle.writes, ["RANGE 2"])
+        self.assertEqual(core_handle.queries, [])
+
+    def test_write_readback_rejected_and_unexpected_reply_in_backend(
+        self,
+    ) -> None:
+        for fault_reply, expected_code, expect_reopen in (
+            ("ERROR\n", "LR700_COMMAND_REJECTED", False),
+            ("2R,3E,100%,1F,0M,0L,01S\n", "LR700_WRITE_UNCERTAIN", True),
+        ):
+            with self.subTest(expected_code=expected_code):
+                state = _FakeVisaState()
+                opened_count = 0
+                fail_once = {"armed": True}
+
+                class _FakeHandle:
+                    def __init__(self) -> None:
+                        self.timeout = None
+                        self.read_termination = None
+                        self.write_termination = "\n"
+                        self.query_delay = 0.2
+                        self._delegate = _FakeTransport(state)
+
+                    def query(self, command: str) -> str:
+                        if command.upper().startswith("GET "):
+                            return self._delegate.query(command)
+                        if command == "SELECT S=01" and fail_once["armed"]:
+                            fail_once["armed"] = False
+                            return fault_reply
+                        self._delegate.write(command)
+                        return "\n"
+
+                    def close(self) -> None:
+                        self._delegate.close()
+
+                class _FakeRM:
+                    def open_resource(self, address, open_timeout=None):
+                        nonlocal opened_count
+                        opened_count += 1
+                        return _FakeHandle()
+
+                fake_pyvisa = types.ModuleType("pyvisa")
+                fake_pyvisa.ResourceManager = _FakeRM
+
+                messages: list[tuple[str, dict]] = []
+                settings = default_settings()
+                settings["resource"] = "GPIB0::18::INSTR"
+                context = self._context(messages, _samples(1))
+                with patch.dict(sys.modules, {"pyvisa": fake_pyvisa}):
+                    backend = LR700Backend(
+                        waiter=lambda _api, _seconds: None,
+                    )
+                    open_module(backend, context)
+                    backend.configure(settings, context)
+                    run_start(backend, context)
+
+                    with self.assertRaises(ModuleError) as captured:
+                        measure_module(backend, context)
+
+                self.assertEqual(captured.exception.code, expected_code)
+                self.assertEqual(opened_count, 2 if expect_reopen else 1)
+                self.assertEqual(state.excitation_index, 0)
+                self.assertEqual(state.excitation_percent, 5)
 
     def test_duplicate_physical_inputs_fail_before_connect(
         self,
