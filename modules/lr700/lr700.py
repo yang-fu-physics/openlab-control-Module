@@ -27,8 +27,8 @@ from .constants import (
 # 实机 GPIB（NI GPIB-USB-HS）适配参数：
 # 读取依赖 EOI（read_termination=None），写入以 "\n" 结尾；
 # 混合 GET 查询在 20 ms 写后读延时下实测出现空行，100 ms 对照通过，故仅在 LR-700
-# 专用 Transport 上设置 query_delay=0.1（不修改框架通用 VisaSession 默认值）；
-# 非 GET 设置命令仍保持写后即时 EOI 回读，异常重连前预留 5.0 s 冷却间隔。
+# 专用 Transport 上设置 query_delay=0.1（同时作用于 GET 查询与写后 EOI 回读，
+# 不修改框架通用 VisaSession 默认值）；异常重连前预留 5.0 s 冷却间隔。
 LR700_READ_TERMINATION: str | None = None
 LR700_WRITE_TERMINATION = "\n"
 LR700_QUERY_DELAY_SECONDS = 0.1
@@ -44,7 +44,7 @@ class LR700CommandRejectedError(ValueError):
 
 
 class LR700VisaTransport(VisaSession):
-    """带 LR-700 专用 EOI 读取、100 ms 查询延时与写后即时回读同步的 VISA 会话包装。"""
+    """带 LR-700 专用 EOI 读取、100 ms 读写延时与写后回读同步的 VISA 会话包装。"""
 
     def __init__(
         self,
@@ -66,16 +66,15 @@ class LR700VisaTransport(VisaSession):
         )
 
     def write(self, command: str) -> None:
-        """发送设置命令并按 LR-700 手册 p. 3-50 与 LabVIEW 驱动一致立即回读至 EOI。
+        """发送设置命令并按 LR-700 手册 p. 3-50 经 100 ms 延时回读至 EOI。
 
         LR-700 在 GPIB 下对非 GET 命令返回空行（LF + EOI），对无法识别的命令返回
-        ``ERROR``。写入后直接 ``handle.read()``（无额外 sleep，靠 GPIB 硬件握手等待
-        EOI），既清掉响应缓冲、同步等待仪表处理完当前命令，又能立即捕获 ``ERROR``
+        ``ERROR``。复用 ``handle.query()``（使用本会话的 ``query_delay=0.1`` 与 EOI
+        读取），既清掉响应缓冲、同步等待仪表处理完当前命令，又能立即捕获 ``ERROR``
         或错位响应。
         """
 
-        self.handle.write(command)
-        reply = str(self.handle.read()).strip()
+        reply = str(self.handle.query(command)).strip()
         if not reply:
             return
         if reply.casefold() == "error":

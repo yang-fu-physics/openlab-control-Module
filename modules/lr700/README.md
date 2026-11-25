@@ -22,14 +22,13 @@ GPIB settings without altering the framework's global defaults:
 - `read_termination = None` (end reads on GPIB EOI; no Bytes at Port polling);
 - `write_termination = "\n"`;
 - `query_delay = 0.1` (`100 ms`, `LR700_QUERY_DELAY_SECONDS`) on `LR700VisaTransport`
-  `GET` queries (`handle.query()`), leaving the framework's shared `VisaSession`
-  defaults unchanged;
-- **write-then-readback synchronization**: matching the LR-700 v1.3 manual (p. 3-50)
-  and the LabVIEW `LR-700 Send Command.vi` pattern, every non-`GET` command sent via
-  `LR700VisaTransport.write()` calls `write()` followed immediately by `read()` to EOI
-  (no extra delay), expecting an empty line (`\n` + EOI), raising
-  `LR700_COMMAND_REJECTED` immediately on `"ERROR"`, and treating unexpected non-empty
-  replies or I/O failures as `LR700_WRITE_UNCERTAIN`;
+  for both `GET` queries and `write()` readbacks (`handle.query()`), leaving the
+  framework's shared `VisaSession` defaults unchanged;
+- **write-then-readback synchronization**: matching the LR-700 v1.3 manual (p. 3-50),
+  every non-`GET` command sent via `LR700VisaTransport.write()` calls `handle.query()`
+  (applying the `100 ms` `query_delay` and reading to EOI), expecting an empty line
+  (`\n` + EOI), raising `LR700_COMMAND_REJECTED` immediately on `"ERROR"`, and treating
+  unexpected non-empty replies or I/O failures as `LR700_WRITE_UNCERTAIN`;
 - **5.0 s reconnect delay**: after closing a failed GPIB session, both read-retry and
   safe-state cleanup wait `5.0 s` (`LR700_RECONNECT_DELAY_SECONDS`) before reopening.
 

@@ -2121,12 +2121,9 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(
             lr_handle.ops,
             [
-                ("write", "RANGE 2"),
-                ("read", ""),
-                ("write", "BOGUS"),
-                ("read", ""),
-                ("write", "SELECT S=01"),
-                ("read", ""),
+                ("query", "RANGE 2"),
+                ("query", "BOGUS"),
+                ("query", "SELECT S=01"),
             ],
         )
         self.assertEqual(core_handle.ops, [("write", "RANGE 2")])
@@ -2165,7 +2162,13 @@ class LR700BackendTests(unittest.TestCase):
                         return self._pending_reply
 
                     def query(self, command: str) -> str:
-                        return self._delegate.query(command)
+                        if command.startswith("GET "):
+                            return self._delegate.query(command)
+                        if command == "SELECT S=01" and fail_once["armed"]:
+                            fail_once["armed"] = False
+                            return fault_reply
+                        self._delegate.write(command)
+                        return "\n"
 
                     def close(self) -> None:
                         self._delegate.close()
