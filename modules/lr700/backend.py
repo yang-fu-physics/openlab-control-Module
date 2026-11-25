@@ -17,6 +17,7 @@ LR-700 没有真正的 excitation-off 命令。软件能确认的最低状态是
 from __future__ import annotations
 
 import math
+import time
 from labcontrol.formatting import require_precision
 from collections.abc import Callable, Mapping
 from copy import deepcopy
@@ -110,6 +111,7 @@ class LR700Backend:
         self._transport_factory = (
             transport_factory or instrument.PyVisaTransport
         )
+        self._custom_waiter = waiter is not None
         self._waiter = (
             waiter
             or (
@@ -283,7 +285,7 @@ class LR700Backend:
         self._require_ready()
         settings = self.applied_settings
         settle = float(settings["switch_settle_seconds"])
-        io_margin = float(settings["io_timeout_seconds"]) * int(settings["retry_attempts"]) + 5.0
+        io_margin = self._io_retry_margin(settings)
         if command_id == "x10_off":
             estimate = settle + io_margin
             if estimate > api.timeout - 2.0:
@@ -1243,6 +1245,8 @@ class LR700Backend:
             api.sleep(0)
             transport = self.transport
             if transport is None:
+                if attempt == 1:
+                    self._wait_reconnect_delay(api, cancellable=True)
                 try:
                     self._reopen_transport(settings, api)
                     transport = self.transport
@@ -1280,11 +1284,8 @@ class LR700Backend:
                     f"{last_error}",
                     command,
                 )
-                self._waiter(api, 0.2)
-                try:
-                    self._reopen_transport(settings, api)
-                except Exception as exc:
-                    last_error = exc
+                self._close_transport()
+                self._wait_reconnect_delay(api, cancellable=True)
         api.warn("LR700_IO_RETRY", None, command)
         assert last_error is not None
         raise ModuleError(
@@ -1294,6 +1295,28 @@ class LR700Backend:
             "LR700_COMMUNICATION_FAILED",
             command,
         ) from last_error
+
+    def _wait_reconnect_delay(
+        self,
+        api: ModuleAPI,
+        *,
+        cancellable: bool,
+    ) -> None:
+        """异常关闭会话后等待一段冷却时间再重新打开 GPIB 连接。"""
+
+        delay = float(instrument.LR700_RECONNECT_DELAY_SECONDS)
+        if delay <= 0:
+            return
+        if cancellable:
+            self._waiter(api, delay)
+            return
+        if self._custom_waiter:
+            try:
+                self._waiter(api, delay)
+            except InterruptedError:
+                pass
+            return
+        time.sleep(delay)
 
     def _reopen_transport(
         self,
@@ -1566,6 +1589,7 @@ class LR700Backend:
             transport = self.transport
             initial: dict[str, int] | None = None
             if transport is None:
+                self._wait_reconnect_delay(api, cancellable=False)
                 try:
                     transport = self._transport_factory(
                         resource,
@@ -2573,6 +2597,16 @@ class LR700Backend:
             return int(settings.get("retry_attempts", 2))
         return 1
 
+    @staticmethod
+    def _io_retry_margin(settings: Mapping[str, Any]) -> float:
+        attempts = int(settings["retry_attempts"])
+        reconnect_margin = max(
+            5.0,
+            max(0, attempts - 1)
+            * float(instrument.LR700_RECONNECT_DELAY_SECONDS),
+        )
+        return float(settings["io_timeout_seconds"]) * attempts + reconnect_margin
+
     @classmethod
     def _estimated_measure_seconds(
         cls,
@@ -2596,9 +2630,7 @@ class LR700Backend:
                 + float(settings["dwell_seconds"])
                 + 2.0
             )
-            + float(settings["io_timeout_seconds"])
-            * int(settings["retry_attempts"])
-            + 5.0
+            + cls._io_retry_margin(settings)
         )
 
     @classmethod
@@ -2622,9 +2654,7 @@ class LR700Backend:
                 + float(settings["dwell_seconds"])
                 + 2.0
             )
-            + float(settings["io_timeout_seconds"])
-            * int(settings["retry_attempts"])
-            + 5.0
+            + cls._io_retry_margin(settings)
         )
         timeout = float(operation_timeout_seconds)
         if (

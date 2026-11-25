@@ -17,17 +17,21 @@ The LR-700 manual requires GPIB to be enabled at the front panel with
 ### LR-700 VISA session timing
 
 `LR700VisaTransport` wraps OpenLab Control's shared `VisaSession` with LR-700-specific
-GPIB settings confirmed on real NI GPIB-USB-HS hardware without altering the
-framework's global defaults:
+GPIB settings aligned with the LabVIEW `LR-700 Send Command.vi` driver without altering
+the framework's global defaults:
 
 - `read_termination = None` (end reads on GPIB EOI);
 - `write_termination = "\n"`;
-- `query_delay = 0.2 s`;
+- no extra `query_delay` on `GET` queries or writes (relying on IEEE-488 hardware
+  handshaking + EOI);
 - **write-then-readback synchronization**: matching the LR-700 v1.3 manual (p. 3-50)
   and the LabVIEW `LR-700 Send Command.vi` pattern, every non-`GET` command sent via
-  `LR700VisaTransport.write()` reads back to EOI (with the `0.2 s` delay), expecting an
-  empty line (`\n` + EOI), raising `LR700_COMMAND_REJECTED` immediately on `"ERROR"`,
-  and treating unexpected non-empty replies or I/O failures as `LR700_WRITE_UNCERTAIN`.
+  `LR700VisaTransport.write()` calls `write()` followed immediately by `read()` to EOI,
+  expecting an empty line (`\n` + EOI), raising `LR700_COMMAND_REJECTED` immediately on
+  `"ERROR"`, and treating unexpected non-empty replies or I/O failures as
+  `LR700_WRITE_UNCERTAIN`;
+- **5.0 s reconnect delay**: after closing a failed GPIB session, both read-retry and
+  safe-state cleanup wait `5.0 s` (`LR700_RECONNECT_DELAY_SECONDS`) before reopening.
 
 ## Common configuration and channel table
 

@@ -24,11 +24,12 @@ from .constants import (
 )
 
 
-# 实机 GPIB（NI GPIB-USB-HS）验证可稳定连续写入/回读的 LR-700 适配参数：
-# 读取依赖 EOI（read_termination=None），写入以 "\n" 结尾，查询/写后回读预留 0.2 s 处理时间。
+# 实机 GPIB（NI GPIB-USB-HS）适配参数，与 LabVIEW LR-700 驱动保持一致：
+# 读取依赖 EOI（read_termination=None），写入以 "\n" 结尾，不额外叠加 query_delay，
+# 靠 GPIB 硬件握手同步；异常重连前预留 5.0 s 冷却间隔。
 LR700_READ_TERMINATION: str | None = None
 LR700_WRITE_TERMINATION = "\n"
-LR700_QUERY_DELAY_SECONDS = 0.2
+LR700_RECONNECT_DELAY_SECONDS = 5.0
 
 # 下降换挡中转量程：20 kOhm（编码 7）既支持 EXCITATION 0（20 uV），
 # 从 200 kOhm / 2 MOhm（2E / 4E）切到 20 kOhm 时在 5% 下激励电流不超过 5 nA。
@@ -40,7 +41,7 @@ class LR700CommandRejectedError(ValueError):
 
 
 class LR700VisaTransport(VisaSession):
-    """带 LR-700 专用 EOI 读取、查询延迟与写后回读同步的 VISA 会话包装。"""
+    """带 LR-700 专用 EOI 读取与写后即时回读同步的 VISA 会话包装。"""
 
     def __init__(
         self,
@@ -49,7 +50,6 @@ class LR700VisaTransport(VisaSession):
         *,
         read_termination: str | None = LR700_READ_TERMINATION,
         write_termination: str = LR700_WRITE_TERMINATION,
-        query_delay: float = LR700_QUERY_DELAY_SECONDS,
         **attributes: Any,
     ) -> None:
         super().__init__(
@@ -57,19 +57,20 @@ class LR700VisaTransport(VisaSession):
             timeout_seconds,
             read_termination=read_termination,
             write_termination=write_termination,
-            query_delay=query_delay,
             **attributes,
         )
 
     def write(self, command: str) -> None:
-        """发送设置命令并按 LR-700 手册 p. 3-50 与 LabVIEW 驱动一致回读响应。
+        """发送设置命令并按 LR-700 手册 p. 3-50 与 LabVIEW 驱动一致立即回读至 EOI。
 
         LR-700 在 GPIB 下对非 GET 命令返回空行（LF + EOI），对无法识别的命令返回
-        ``ERROR``。复用 ``handle.query()``（含 0.2 s 处理延迟与 EOI 截断）在每次写入后
-        同步清掉响应并确认命令未被拒绝，避免多条命令零间隔连发或响应错位。
+        ``ERROR``。写入后直接 ``handle.read()``（无额外 sleep，靠 GPIB 硬件握手等待
+        EOI），既清掉响应缓冲、同步等待仪表处理完当前命令，又能立即捕获 ``ERROR``
+        或错位响应。
         """
 
-        reply = str(self.handle.query(command)).strip()
+        self.handle.write(command)
+        reply = str(self.handle.read()).strip()
         if not reply:
             return
         if reply.casefold() == "error":
@@ -460,9 +461,9 @@ def parse_overloads(reply: str) -> int:
 
 
 __all__ = [
-    "LR700_QUERY_DELAY_SECONDS",
     "LR700_READ_TERMINATION",
     "LR700_WRITE_TERMINATION",
+    "LR700_RECONNECT_DELAY_SECONDS",
     "LR700CommandRejectedError",
     "LR700VisaTransport",
     "Transport",

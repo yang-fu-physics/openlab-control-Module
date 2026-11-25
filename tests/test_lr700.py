@@ -1495,7 +1495,7 @@ class LR700BackendTests(unittest.TestCase):
             ),
             2,
         )
-        self.assertIn(0.2, waits)
+        self.assertIn(5.0, waits)
         warning_codes = [
             payload.get("code")
             for kind, payload in messages
@@ -1743,10 +1743,11 @@ class LR700BackendTests(unittest.TestCase):
         self,
     ) -> None:
         state = _FakeVisaState()
+        waits: list[float] = []
         messages: list[tuple[str, dict]] = []
         settings = default_settings()
         settings["resource"] = "GPIB0::18::INSTR"
-        backend = self._backend(state)
+        backend = self._backend(state, waits)
         context = self._context(messages)
         open_module(backend, context)
         backend.configure(settings, context)
@@ -1758,6 +1759,7 @@ class LR700BackendTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(state.opened), 2)
         self.assertGreaterEqual(state.closed, 1)
+        self.assertIn(5.0, waits)
         self.assertEqual(state.excitation_index, 0)
         self.assertEqual(state.excitation_percent, 5)
         self.assertIn(
@@ -1909,7 +1911,7 @@ class LR700BackendTests(unittest.TestCase):
         )
         self.assertEqual(normalized["channels"]["r1"]["range_mode"], "fixed")
 
-    def test_lr700_visa_transport_sets_eoi_and_query_delay_without_touching_core_defaults(
+    def test_lr700_visa_transport_sets_eoi_without_query_delay_or_touching_core_defaults(
         self,
     ) -> None:
         from labcontrol.measurement.visa import VisaSession
@@ -1947,7 +1949,7 @@ class LR700BackendTests(unittest.TestCase):
         lr_handle, core_handle = created_handles
         self.assertIsNone(lr_handle.read_termination)
         self.assertEqual(lr_handle.write_termination, "\n")
-        self.assertAlmostEqual(lr_handle.query_delay, 0.2)
+        self.assertIsNone(lr_handle.query_delay)
         # 框架通用 VisaSession 默认值保持不变。
         self.assertEqual(core_handle.read_termination, "\n")
         self.assertEqual(core_handle.write_termination, "\n")
@@ -1966,8 +1968,8 @@ class LR700BackendTests(unittest.TestCase):
                 self.read_termination = "UNSET"
                 self.write_termination = "UNSET"
                 self.query_delay = None
-                self.writes: list[str] = []
-                self.queries: list[str] = []
+                self.ops: list[tuple[str, str]] = []
+                self._pending_reply = "\n"
                 self.reply_map: dict[str, str] = {
                     "RANGE 2": "\n",
                     "BOGUS": "ERROR\n",
@@ -1975,10 +1977,15 @@ class LR700BackendTests(unittest.TestCase):
                 }
 
             def write(self, command: str) -> None:
-                self.writes.append(command)
+                self.ops.append(("write", command))
+                self._pending_reply = self.reply_map.get(command, "\n")
+
+            def read(self) -> str:
+                self.ops.append(("read", ""))
+                return self._pending_reply
 
             def query(self, command: str) -> str:
-                self.queries.append(command)
+                self.ops.append(("query", command))
                 return self.reply_map.get(command, "\n")
 
             def close(self) -> None:
@@ -2009,10 +2016,18 @@ class LR700BackendTests(unittest.TestCase):
             core_session.close()
 
         lr_handle, core_handle = created_handles
-        self.assertEqual(lr_handle.writes, [])
-        self.assertEqual(lr_handle.queries, ["RANGE 2", "BOGUS", "SELECT S=01"])
-        self.assertEqual(core_handle.writes, ["RANGE 2"])
-        self.assertEqual(core_handle.queries, [])
+        self.assertEqual(
+            lr_handle.ops,
+            [
+                ("write", "RANGE 2"),
+                ("read", ""),
+                ("write", "BOGUS"),
+                ("read", ""),
+                ("write", "SELECT S=01"),
+                ("read", ""),
+            ],
+        )
+        self.assertEqual(core_handle.ops, [("write", "RANGE 2")])
 
     def test_write_readback_rejected_and_unexpected_reply_in_backend(
         self,
@@ -2023,6 +2038,7 @@ class LR700BackendTests(unittest.TestCase):
         ):
             with self.subTest(expected_code=expected_code):
                 state = _FakeVisaState()
+                waits: list[float] = []
                 opened_count = 0
                 fail_once = {"armed": True}
 
@@ -2031,17 +2047,23 @@ class LR700BackendTests(unittest.TestCase):
                         self.timeout = None
                         self.read_termination = None
                         self.write_termination = "\n"
-                        self.query_delay = 0.2
+                        self.query_delay = None
+                        self._pending_reply = "\n"
                         self._delegate = _FakeTransport(state)
 
-                    def query(self, command: str) -> str:
-                        if command.upper().startswith("GET "):
-                            return self._delegate.query(command)
+                    def write(self, command: str) -> None:
                         if command == "SELECT S=01" and fail_once["armed"]:
                             fail_once["armed"] = False
-                            return fault_reply
+                            self._pending_reply = fault_reply
+                            return
                         self._delegate.write(command)
-                        return "\n"
+                        self._pending_reply = "\n"
+
+                    def read(self) -> str:
+                        return self._pending_reply
+
+                    def query(self, command: str) -> str:
+                        return self._delegate.query(command)
 
                     def close(self) -> None:
                         self._delegate.close()
@@ -2061,7 +2083,7 @@ class LR700BackendTests(unittest.TestCase):
                 context = self._context(messages, _samples(1))
                 with patch.dict(sys.modules, {"pyvisa": fake_pyvisa}):
                     backend = LR700Backend(
-                        waiter=lambda _api, _seconds: None,
+                        waiter=lambda _api, seconds: waits.append(seconds),
                     )
                     open_module(backend, context)
                     backend.configure(settings, context)
@@ -2072,6 +2094,10 @@ class LR700BackendTests(unittest.TestCase):
 
                 self.assertEqual(captured.exception.code, expected_code)
                 self.assertEqual(opened_count, 2 if expect_reopen else 1)
+                if expect_reopen:
+                    self.assertIn(5.0, waits)
+                else:
+                    self.assertNotIn(5.0, waits)
                 self.assertEqual(state.excitation_index, 0)
                 self.assertEqual(state.excitation_percent, 5)
 
