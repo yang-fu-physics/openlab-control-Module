@@ -2002,7 +2002,7 @@ class LR700BackendTests(unittest.TestCase):
         )
         self.assertEqual(normalized["channels"]["r1"]["range_mode"], "fixed")
 
-    def test_lr700_visa_transport_sets_eoi_without_query_delay_or_touching_core_defaults(
+    def test_lr700_visa_transport_sets_eoi_and_100ms_query_delay_without_touching_core_defaults(
         self,
     ) -> None:
         from labcontrol.measurement.visa import VisaSession
@@ -2033,14 +2033,25 @@ class LR700BackendTests(unittest.TestCase):
 
         with patch.dict(sys.modules, {"pyvisa": fake_pyvisa}):
             lr_session = LR700VisaTransport("GPIB0::18::INSTR", 3.0)
+            lr_override = LR700VisaTransport(
+                "GPIB0::18::INSTR",
+                3.0,
+                query_delay=0.2,
+            )
             core_session = VisaSession("GPIB0::10::INSTR", 3.0)
             lr_session.close()
+            lr_override.close()
             core_session.close()
 
-        lr_handle, core_handle = created_handles
+        lr_handle, override_handle, core_handle = created_handles
         self.assertIsNone(lr_handle.read_termination)
         self.assertEqual(lr_handle.write_termination, "\n")
-        self.assertIsNone(lr_handle.query_delay)
+        self.assertEqual(
+            lr_handle.query_delay,
+            sys.modules[LR700VisaTransport.__module__].LR700_QUERY_DELAY_SECONDS,
+        )
+        self.assertEqual(lr_handle.query_delay, 0.1)
+        self.assertEqual(override_handle.query_delay, 0.2)
         # 框架通用 VisaSession 默认值保持不变。
         self.assertEqual(core_handle.read_termination, "\n")
         self.assertEqual(core_handle.write_termination, "\n")
@@ -2110,12 +2121,9 @@ class LR700BackendTests(unittest.TestCase):
         self.assertEqual(
             lr_handle.ops,
             [
-                ("write", "RANGE 2"),
-                ("read", ""),
-                ("write", "BOGUS"),
-                ("read", ""),
-                ("write", "SELECT S=01"),
-                ("read", ""),
+                ("query", "RANGE 2"),
+                ("query", "BOGUS"),
+                ("query", "SELECT S=01"),
             ],
         )
         self.assertEqual(core_handle.ops, [("write", "RANGE 2")])
@@ -2154,7 +2162,13 @@ class LR700BackendTests(unittest.TestCase):
                         return self._pending_reply
 
                     def query(self, command: str) -> str:
-                        return self._delegate.query(command)
+                        if command.startswith("GET "):
+                            return self._delegate.query(command)
+                        if command == "SELECT S=01" and fail_once["armed"]:
+                            fail_once["armed"] = False
+                            return fault_reply
+                        self._delegate.write(command)
+                        return "\n"
 
                     def close(self) -> None:
                         self._delegate.close()
