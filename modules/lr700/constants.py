@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Any
 
 
@@ -81,6 +83,9 @@ RANGE_MODES: tuple[tuple[str, str], ...] = (
 
 AUTORANGE_MIN_RANGE_INDEX = 1
 AUTORANGE_MAX_RANGE_INDEX = 9
+# 手册 p. 2-4：LR-700 自动换挡迟滞阈值（< 10,000 / 200,000 = 5% 降档，> 180,000 / 200,000 = 90% 升档）。
+AUTORANGE_DOWN_FRACTION = 0.05
+AUTORANGE_UP_FRACTION = 0.90
 
 # 默认 3 mA 上限对应的非标自定义 10 档激励映射（U=0135666666，T=4）；
 # 本模块自动量程仅允许 20 mOhm (1) 及以上量程，索引 0 (2 mOhm) 仅作 10 位协议占位。
@@ -238,6 +243,101 @@ def common_defaults() -> dict[str, Any]:
     }
 
 
+_CURRENT_TEXT_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([pnuµμm]?)\s*[aA]?\s*$"
+)
+_CURRENT_SI_SCALE: dict[str, float] = {
+    "": 1.0,
+    "p": 1.0e-12,
+    "n": 1.0e-9,
+    "u": 1.0e-6,
+    "µ": 1.0e-6,
+    "μ": 1.0e-6,
+    "m": 1.0e-3,
+}
+
+
+def parse_current_a(value: Any) -> float:
+    """解析数值（A）或带 SI 前缀的电流文本（如 '300uA'、'0.3mA'、'30u'）为正有限安培值。"""
+
+    if isinstance(value, bool):
+        raise ValueError("Expected current in amperes or SI text (for example 300uA)")
+    if isinstance(value, (int, float)):
+        result = float(value)
+    else:
+        match = _CURRENT_TEXT_RE.fullmatch(str(value))
+        if match is None:
+            raise ValueError(
+                f"Expected current (for example 300uA or 0.3mA); got {value!r}"
+            )
+        result = float(match.group(1)) * _CURRENT_SI_SCALE[match.group(2)]
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"Current must be a positive finite number; got {value!r}")
+    return result
+
+
+def plan_autorange(limit_a: float, lo: int, hi: int) -> dict[str, Any]:
+    """按电流上限规划自动量程：100% 可满足的高阻档走硬件 AUTORANGE，下方需要 % 的低阻档走软件接管。
+
+    - 硬件 100% 段需至少 2 档才能开启仪表 ``AUTORANGE L=<hw_lo><hw_hi>``；若仅 1 档满足 100%，
+      则并入 ``sw_ranges`` 统一由软件在安全态下分档步进。
+    - ``2 mOhm`` (0) 始终排除在自动量程之外（仅作 10 位 ``U=`` 协议占位）。
+    """
+
+    trace: list[int] = []
+    hw_ranges: list[int] = []
+    sw_ranges: dict[int, dict[str, Any]] = {}
+    for r in range(10):
+        allowed = valid_excitation_indices(r)
+        candidates_100 = [
+            e for e in allowed if excitation_current_a(r, e, 100) <= limit_a * (1.0 + 1.0e-12)
+        ]
+        trace.append(candidates_100[-1] if candidates_100 else allowed[0])
+        if lo <= r <= hi:
+            if candidates_100:
+                hw_ranges.append(r)
+            elif (
+                excitation_current_a(r, allowed[0], SAFE_EXCITATION_PERCENT)
+                <= limit_a * (1.0 + 1.0e-12)
+            ):
+                e_idx, pct, actual = fixed_current_settings(r, limit_a)
+                sw_ranges[r] = {
+                    "range_index": r,
+                    "excitation_index": e_idx,
+                    "excitation_percent": pct,
+                    "current_a": actual,
+                }
+    usable = sorted(set(hw_ranges) | set(sw_ranges))
+    if len(usable) < 2:
+        raise ValueError("Current limit leaves fewer than two autorange ranges")
+    if len(hw_ranges) >= 2:
+        hw_autorange_enabled = True
+        hw_min_range = hw_ranges[0]
+        hw_max_range = hw_ranges[-1]
+    else:
+        hw_autorange_enabled = False
+        for r in hw_ranges:
+            e_idx = trace[r]
+            sw_ranges[r] = {
+                "range_index": r,
+                "excitation_index": e_idx,
+                "excitation_percent": 100,
+                "current_a": excitation_current_a(r, e_idx, 100),
+            }
+        hw_min_range = usable[0]
+        hw_max_range = usable[-1]
+    return {
+        "trace": trace,
+        "hw_autorange_enabled": hw_autorange_enabled,
+        "hw_min_range": hw_min_range,
+        "hw_max_range": hw_max_range,
+        "sw_ranges": {r: sw_ranges[r] for r in sorted(sw_ranges)},
+        "usable_ranges": usable,
+        "effective_min_range": usable[0],
+        "effective_max_range": usable[-1],
+    }
+
+
 def generate_trace(limit_a: float, lo: int, hi: int) -> tuple[list[int], int, int]:
     """Trace uses 100%; exclude ranges whose minimum excitation exceeds the limit."""
     trace: list[int] = []
@@ -275,6 +375,51 @@ def fixed_current_settings(range_index: int, current_a: float) -> tuple[int, int
         raise ValueError(f"Requested current is below the minimum on {range_label(range_index)}")
     _dec, percent, neg_e, actual = max(candidates, key=lambda item: (item[0], item[1], item[2]))
     return -neg_e, percent, actual
+
+
+def nearest_fixed_current_settings(
+    range_index: int,
+    current_a: float,
+    *,
+    max_current_a: float | None = None,
+) -> tuple[int, int, float]:
+    """选择最接近 ``current_a`` 且硬件合法（并可选满足 ``<= max_current_a``）的固定量程激励档。
+
+    若 ``max_current_a`` 给定，绝不会向上吸附超过上限；等价距离时按手册 p. 2-6 优先更高
+    ``VAREXC`` 百分比（更低 ``EXCITATION`` 档），再优先不高于请求值的档位。
+    """
+    from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+
+    requested = Decimal(str(current_a))
+    cap = None if max_current_a is None else Decimal(str(max_current_a)) * (Decimal(1) + Decimal("1e-12"))
+    r_ohms = Decimal(str(range_ohms(range_index)))
+    candidates: list[tuple[Decimal, int, int, Decimal, int, int, float]] = []
+    for e in valid_excitation_indices(range_index):
+        full = Decimal(str(excitation_volts(e))) / r_ohms
+        pct_exact = (requested / full) * Decimal(100)
+        pct_candidates = {
+            5,
+            100,
+            max(5, min(100, int(pct_exact.to_integral_value(rounding=ROUND_FLOOR)))),
+            max(5, min(100, int(pct_exact.to_integral_value(rounding=ROUND_CEILING)))),
+        }
+        if cap is not None:
+            cap_pct = int(((cap / full) * Decimal(100)).to_integral_value(rounding=ROUND_FLOOR))
+            if 5 <= cap_pct <= 100:
+                pct_candidates.add(cap_pct)
+        for percent in pct_candidates:
+            actual_dec = full * Decimal(percent) / Decimal(100)
+            if cap is not None and actual_dec > cap:
+                continue
+            dist = abs(actual_dec - requested)
+            # 排序键：距离最小 -> 更高百分比 -> 更低激励档 -> 更小电流
+            candidates.append((dist, -percent, e, actual_dec, e, percent, float(actual_dec)))
+    if not candidates:
+        raise ValueError(
+            f"No valid excitation on {range_label(range_index)} fits within current limit"
+        )
+    best = min(candidates, key=lambda item: (item[0], item[1], item[2], item[3]))
+    return best[4], best[5], best[6]
 
 
 def default_channel(slot: int) -> dict[str, Any]:
@@ -318,8 +463,10 @@ def default_settings() -> dict[str, Any]:
 
 
 __all__ = [
+    "AUTORANGE_DOWN_FRACTION",
     "AUTORANGE_MAX_RANGE_INDEX",
     "AUTORANGE_MIN_RANGE_INDEX",
+    "AUTORANGE_UP_FRACTION",
     "AUTORANGE_USER_TRACE_EXCITATIONS",
     "COMMON_MODE_OVERLOAD_HINT",
     "COMMON_MODE_OVERLOAD_MASK",
@@ -350,6 +497,9 @@ __all__ = [
     "generate_trace",
     "is_valid_range_excitation",
     "minimum_excitation_index",
+    "nearest_fixed_current_settings",
+    "parse_current_a",
+    "plan_autorange",
     "range_label",
     "range_ohms",
     "valid_excitation_indices",
