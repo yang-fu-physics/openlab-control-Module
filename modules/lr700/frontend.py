@@ -12,8 +12,8 @@ from labcontrol.measurement.frontend_api import ModuleUIAPI
 from labcontrol.ui.widgets import PrecisionDoubleSpinBox as QDoubleSpinBox
 from .constants import (
     default_settings, common_defaults, RANGE_MODES, RESISTANCE_RANGES, FILTERS,
-    autorange_trace_excitation_index, generate_trace, fixed_current_settings,
-    excitation_current_a, format_current, range_label,
+    autorange_trace_excitation_index, plan_autorange, fixed_current_settings,
+    nearest_fixed_current_settings, excitation_current_a, format_current, range_label,
 )
 from .lr700 import range_transition_peak_current_a
 
@@ -123,8 +123,10 @@ class LR700Frontend(QWidget):
                 self.channel_table.setCellWidget(row, column, widgets[name])
         layout.addWidget(self.channel_table)
         note = QLabel(
-            "Apply writes custom non-standard Trace T=4 from the current limit (not factory T=1/2/3). "
-            "Fixed currents are rounded down to a supported value; the actual value is shown above. "
+            "Apply writes custom non-standard Trace T=4 for 100%-feasible ranges (not factory T=1/2/3); "
+            "lower ranges that require VAREXC % are handled automatically by software and cached for the next measurement without re-measuring. "
+            "Fixed current inputs snap to the nearest supported value within the limit after editing; "
+            "you can also adjust runtime excitation in SEQ with Set Current (capped by Maximum excitation current). "
             "Same range/current: SELECT only. Different configuration: lower excitation, then restore. "
             "Settle must be at least 3x the digital filter. Run end/Stop/Error/Disable restores minimum "
             "excitation at 5%; LR700 has no excitation-off command. Front panel GPIB requires SPECIAL 4 1 "
@@ -141,7 +143,55 @@ class LR700Frontend(QWidget):
                 widget.toggled.connect(self._update_preview)
             elif widget is not self.resource:
                 widget.valueChanged.connect(self._update_preview)
+        self.common_widgets["current_a"].editingFinished.connect(
+            lambda: self._snap_fixed_current(
+                self.common_widgets["range_index"],
+                self.common_widgets["current_a"],
+            )
+        )
+        self.common_widgets["range_index"].activated.connect(
+            lambda _index: self._snap_fixed_current(
+                self.common_widgets["range_index"],
+                self.common_widgets["current_a"],
+            )
+        )
+        for channel_widgets in self.channel_widgets.values():
+            range_combo = channel_widgets["range_index"]
+            current_spin = channel_widgets["current_a"]
+            current_spin.editingFinished.connect(
+                lambda rc=range_combo, cs=current_spin: self._snap_fixed_current(rc, cs)
+            )
+            range_combo.activated.connect(
+                lambda _index, rc=range_combo, cs=current_spin: self._snap_fixed_current(rc, cs)
+            )
         return scroll
+
+    def _snap_fixed_current(
+        self,
+        range_combo: QComboBox,
+        current_spin: QDoubleSpinBox,
+    ) -> None:
+        """用户完成固定电流输入或切换量程后，吸附到不超上限的最近硬件合法电流档。"""
+        range_data = range_combo.currentData()
+        if range_data is None:
+            return
+        range_index = int(range_data)
+        requested_a = current_spin.value() / 1000.0
+        limit_a = self.common_widgets["current_limit_a"].value() / 1000.0
+        try:
+            _, _, snapped_a = nearest_fixed_current_settings(
+                range_index,
+                requested_a,
+                max_current_a=limit_a,
+            )
+        except ValueError:
+            snapped_a = nearest_fixed_current_settings(range_index, requested_a)[2]
+        snapped_ma = round(snapped_a * 1000.0, 9)
+        if abs(snapped_ma - current_spin.value()) > 1.0e-12:
+            blocker = QSignalBlocker(current_spin)
+            current_spin.setValue(snapped_ma)
+            del blocker
+            self._update_preview()
 
     def dump(self) -> dict[str, Any]:
         common = {}
@@ -268,20 +318,42 @@ class LR700Frontend(QWidget):
             self.trace_preview.setText("Autorange maximum must exceed minimum")
         else:
             try:
-                trace, lo, hi = generate_trace(
+                plan = plan_autorange(
                     common["current_limit_a"],
                     common["autorange_min_range"],
                     common["autorange_max_range"],
                 )
-                self.trace_preview.setText(
-                    f"Effective autorange: {range_label(lo)} - {range_label(hi)}; T=4, U="
-                    + "".join(map(str, trace))
-                    + "\n"
-                    + " | ".join(
-                        f"{range_label(r)}: {format_current(excitation_current_a(r, trace[r]))}"
-                        for r in range(lo, hi + 1)
+                trace = plan["trace"]
+                eff_lo = plan["effective_min_range"]
+                eff_hi = plan["effective_max_range"]
+                hw_lo = plan["hw_min_range"]
+                hw_hi = plan["hw_max_range"]
+                sw_ranges = plan["sw_ranges"]
+                if plan["hw_autorange_enabled"]:
+                    if sw_ranges:
+                        header = (
+                            f"Effective autorange: {range_label(eff_lo)} - {range_label(eff_hi)}; "
+                            f"HW L={hw_lo}{hw_hi}, T=4, U={''.join(map(str, trace))} + SW % low-range"
+                        )
+                    else:
+                        header = (
+                            f"Effective autorange: {range_label(eff_lo)} - {range_label(eff_hi)}; "
+                            f"T=4, U={''.join(map(str, trace))}"
+                        )
+                else:
+                    header = (
+                        f"Effective autorange (SW stepped): {range_label(eff_lo)} - {range_label(eff_hi)}"
                     )
-                )
+                entries = [
+                    (
+                        f"{range_label(r)}: {format_current(sw_ranges[r]['current_a'])} "
+                        f"({sw_ranges[r]['excitation_percent']}% SW)"
+                        if r in sw_ranges
+                        else f"{range_label(r)}: {format_current(excitation_current_a(r, trace[r]))}"
+                    )
+                    for r in plan["usable_ranges"]
+                ]
+                self.trace_preview.setText(header + "\n" + " | ".join(entries))
             except ValueError as exc:
                 self.trace_preview.setText(str(exc))
         for key, channel in settings["channels"].items():
@@ -294,8 +366,8 @@ class LR700Frontend(QWidget):
                 w["actual"].setText("Trace / automatic")
                 continue
             try:
-                _, _, actual = fixed_current_settings(target["range_index"], target["current_a"])
-                text = format_current(actual)
+                _, pct, actual = fixed_current_settings(target["range_index"], target["current_a"])
+                text = f"{format_current(actual)} ({pct}%)" if pct < 100 else format_current(actual)
                 if target["current_a"] > common["current_limit_a"]:
                     text += " (exceeds limit)"
                 w["actual"].setText(text)

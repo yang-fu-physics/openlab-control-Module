@@ -43,12 +43,16 @@ all rows share the common digital filter and common current limit.
 Currents in settings files are amperes; the UI uses mA. A fixed current is
 converted to a hardware-valid `EXCITATION` and integer `VAREXC` percentage
 (`5%–100%`), selecting the closest representable value at or below the requested
-current and displaying the actual value in the channel table (if the requested
-current exceeds the chosen range's hardware maximum, e.g., `3 mA` on `2 MOhm`,
-it clamps down to that range's maximum). A current below the range minimum or
-above `current_limit_a` rejects Apply before opening VISA.
+current and displaying the actual value (with `%` whenever `VAREXC < 100%`) in
+the channel table (if the requested current exceeds the chosen range's hardware
+maximum, e.g., `3 mA` on `2 MOhm`, it clamps down to that range's maximum). When
+editing a fixed current or switching its fixed resistance range in the UI, the
+input automatically snaps to the nearest hardware-representable value that does
+not exceed `current_limit_a` (saved files loaded via `load()` are not silently
+mutated). A current below the range minimum or above `current_limit_a` rejects
+Apply before opening VISA.
 
-### Generated Non-Standard Autorange Trace (`AUTORANGE T=4`)
+### Generated Non-Standard Autorange Trace (`AUTORANGE T=4`) and Low-Range `%` Extension
 
 > **Important (Non-Standard Trace)**: This module does **not** use the LR-700's
 > common factory autorange traces (`T=1` Default / `T=2` Minimum Power / `T=3`
@@ -59,11 +63,34 @@ above `current_limit_a` rejects Apply before opening VISA.
 > autorange).
 
 For each range `0–9`, Apply selects the largest hardware-valid excitation whose
-full-scale current at `100%` does not exceed `current_limit_a`. Ranges whose
-minimum full-scale excitation exceeds `current_limit_a` are automatically
-excluded by tightening the effective `AUTORANGE L=<min><max>` bounds (at least
-two usable ranges are required). The UI previews the effective bounds, the
-generated `U=` string, and each active range's full-scale current.
+full-scale current at `100%` does not exceed `current_limit_a`. Because the
+LR-700's hardware `AUTORANGE U=` table encodes only `100%` excitation steps (no
+per-range `VAREXC %`), ranges that satisfy `current_limit_a` at `100%` run inside
+hardware `AUTORANGE L=<hw_lo><hw_hi>, T=4`, while any lower requested range(s)
+that satisfy `current_limit_a` at `5%–99%` are automatically handled by a
+**zero-overshoot software `%` low-range extension** (at least two usable ranges
+total are required; if fewer than two ranges satisfy `100%`, all usable ranges
+step in software).
+
+For example, with **`current_limit_a = 0.3 mA`** (`300 uA`) over `20 mOhm`–`2 MOhm`:
+- Hardware `AUTORANGE` covers **`200 mOhm`–`2 MOhm`** (`L=29`, `U=0013566666`,
+  all at `100%` excitation `<= 300 uA`, preserving full ADC reference accuracy);
+- **`20 mOhm`** (`1R`) is managed by software at **`20 uV x 30% = 300 uA`**
+  (`VAREXC =30`, `VAREXC 1`).
+- **No re-measure on boundary crossing**: when a hardware `200 mOhm` reading
+  settles normally with `max(|R|, |X|) < 5%` of full scale (`< 10 mOhm`, matching
+  the LR-700 v1.3 manual p. 2-4 `10,000 / 200,000` count down-range threshold),
+  that valid row is recorded as-is and `20 mOhm` is cached for that physical
+  sensor so the **next** measurement switches directly into `20 mOhm @ 30%`.
+  While in software low-range mode, consecutive sensors using the same range,
+  excitation, percentage, and filter still switch via `SELECT S=nn` only. When a
+  software low-range reading exceeds `90%` of full scale (`> 180,000 / 200,000`
+  counts) or reports `OVER_RANGE` / `OVERLOAD`, the row is recorded and the
+  sensor's cached range resets upward to `hw_lo` (`200 mOhm`) so the next
+  measurement returns to hardware `AUTORANGE`.
+
+The UI previews the effective bounds, hardware `L=` / `U=` string, and every
+hardware or software `%` range's full-scale current.
 
 For the default **`3 mA`** current limit, the generated trace is
 `AUTORANGE U=0135666666` with effective bounds `L=19`:
@@ -188,10 +215,30 @@ and `close` also confirm `MODE 0`). If the safe state cannot be read back, the
 module reports an Error rather than claiming the bridge is safe. Hardware
 interlocks and the laboratory's manual emergency procedure remain necessary.
 
-## Fixed-reference 10x SEQ commands (0.1.0b9)
+## SEQ commands (`10x Delta R` & `Set Current`)
 
-`LR700Backend.sequence_commands` exposes two parameterless SEQ commands:
-`x10_on` (**10x Delta R On**) and `x10_off` (**10x Delta R Off**).
+`LR700Backend.sequence_commands` exposes three SEQ commands:
+`x10_on` (**10x Delta R On**), `x10_off` (**10x Delta R Off**), and
+`set_current` (**Set Current**).
+
+- **`set_current` (Set Current)**: accepts `slot` (`All`, `R1`, `R2`, `R3`, `R4`)
+  and `current` (amperes or SI text such as `300uA`, `0.3mA`, `30uA`), and
+  dynamically updates subsequent `Measure` steps within the active Run:
+  - **Hard safety ceiling**: any requested current above the applied
+    `common.current_limit_a` is rejected (`LR700_CURRENT_OVER_LIMIT`) before
+    changing hardware state.
+  - **Autorange channels**: recomputes the `T=4` hardware trace (`U=` / `L=`)
+    and software `%` low-range band for the new ceiling, clears cached sensor
+    ranges for the affected slot(s), and writes the updated trace safely at `5%`
+    excitation.
+  - **Fixed channels**: computes the hardware-valid `(EXCITATION, VAREXC %)` at
+    or below the requested current on that slot's fixed range (rejecting values
+    below the range's `5%` floor).
+  - **10x interlock & lifecycle**: rejected while `10x` mode is active
+    (`LR700_10X_ACTIVE` — run `x10_off` first). Runtime overrides are cleared
+    automatically on `run_end` (completed/Stop/Error), re-Apply (`configure`),
+    or `close`, so the next Run automatically restores the applied Settings and
+    original `T=4` trace.
 
 - **`x10_on` (10x Delta R On)**: confirms `MODE 0`, clears both `RSET` and any
   stale `XSET` via `OFFSET =0` before switching/autorange capture, captures the
@@ -248,7 +295,8 @@ replies in `3/3` mixed `GET 6/0/1/4/7` runs (both LF and CR), whereas `100 ms`
 (`query_delay = 0.1`) passed `300/300` long `GET 6` reads and `250/250` mixed `GET`
 queries. `100 ms` is still a bounded-sample verification and has not yet been long-run
 verified across full measurement and channel-switching workflows. The common-configuration
-refactor, generated `T=4` trace table, fixed/auto mixed switching, and
+refactor, generated `T=4` trace table, software `%` low-range autorange extension,
+`Set Current` SEQ command, fixed/auto mixed switching, and
 `OFFSET`/`GET 4`/`MODE 1` 10x commands are verified **offline only** via protocol
 simulation and have not yet been retested on connected samples. Verify with a noncritical
 dummy load before connecting sensitive samples.

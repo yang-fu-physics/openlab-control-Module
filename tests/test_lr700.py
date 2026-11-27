@@ -84,6 +84,21 @@ excitation_current_a = load_source_object(
     "constants:excitation_current_a",
     "test_lr700_constants_current",
 )
+plan_autorange = load_source_object(
+    MODULE,
+    "constants:plan_autorange",
+    "test_lr700_constants_plan",
+)
+nearest_fixed_current_settings = load_source_object(
+    MODULE,
+    "constants:nearest_fixed_current_settings",
+    "test_lr700_constants_nearest",
+)
+parse_current_a = load_source_object(
+    MODULE,
+    "constants:parse_current_a",
+    "test_lr700_constants_parse_current",
+)
 LR700Frontend = load_source_object(
     MODULE,
     "frontend:LR700Frontend",
@@ -834,15 +849,269 @@ class LR700BackendTests(unittest.TestCase):
                 backend.close(context)
 
     def test_x10_command_metadata_and_sequence_round_trip(self):
-        from labcontrol.module_commands import normalize_module_commands
+        from labcontrol.module_commands import (
+            normalize_module_commands,
+            resolve_module_point_bounds,
+            validate_module_command_parameters,
+        )
         from labcontrol.sequence.model import Command, CommandType, SequenceDocument
         from labcontrol.sequence.parser import parse_sequence, serialize_sequence
         commands = normalize_module_commands("lr700", LR700Backend.sequence_commands)
-        self.assertEqual([command.command_id for command in commands], ["x10_on", "x10_off"])
-        document = SequenceDocument([Command(CommandType.MODULE_COMMAND, {}, module_id="lr700", module_command_id=command.command_id) for command in commands])
+        self.assertEqual([command.command_id for command in commands], ["x10_on", "x10_off", "set_current"])
+        by_id = {command.command_id: command for command in commands}
+        set_current_spec = by_id["set_current"]
+        self.assertEqual(validate_module_command_parameters(set_current_spec, {"slot": "All", "current": "300uA"}), ())
+        self.assertEqual(validate_module_command_parameters(set_current_spec, {"slot": "R1", "current": "0.15mA"}), ())
+        self.assertTrue(validate_module_command_parameters(set_current_spec, {"slot": "All", "current": "50mA"}))
+        self.assertTrue(validate_module_command_parameters(set_current_spec, {"slot": "All", "current": "1pA"}))
+        low, high, _desc = resolve_module_point_bounds(set_current_spec, {})
+        self.assertAlmostEqual(low, 5.0e-11)
+        self.assertAlmostEqual(high, 0.03)
+        document = SequenceDocument([
+            Command(CommandType.MODULE_COMMAND, {}, module_id="lr700", module_command_id="x10_on"),
+            Command(CommandType.MODULE_COMMAND, {}, module_id="lr700", module_command_id="x10_off"),
+            Command(
+                CommandType.MODULE_COMMAND,
+                {"slot": "All", "current": "300uA"},
+                module_id="lr700",
+                module_command_id="set_current",
+            ),
+        ])
         result = parse_sequence(serialize_sequence(document))
         self.assertFalse(result.has_errors)
-        self.assertEqual([command.module_command_id for command in result.document.commands], ["x10_on", "x10_off"])
+        self.assertEqual(
+            [command.module_command_id for command in result.document.commands],
+            ["x10_on", "x10_off", "set_current"],
+        )
+        self.assertEqual(result.document.commands[2].params, {"slot": "All", "current": "300uA"})
+
+    def test_plan_autorange_and_nearest_fixed_current_helpers(self):
+        plan_300u = plan_autorange(0.0003, 1, 9)
+        self.assertTrue(plan_300u["hw_autorange_enabled"])
+        self.assertEqual((plan_300u["hw_min_range"], plan_300u["hw_max_range"]), (2, 9))
+        self.assertEqual(plan_300u["trace"], [0, 0, 1, 3, 5, 6, 6, 6, 6, 6])
+        self.assertEqual(list(plan_300u["sw_ranges"]), [1])
+        self.assertEqual(plan_300u["sw_ranges"][1]["excitation_index"], 0)
+        self.assertEqual(plan_300u["sw_ranges"][1]["excitation_percent"], 30)
+        self.assertAlmostEqual(plan_300u["sw_ranges"][1]["current_a"], 0.0003)
+        self.assertEqual((plan_300u["effective_min_range"], plan_300u["effective_max_range"]), (1, 9))
+
+        plan_sw_only = plan_autorange(0.0003, 1, 2)
+        self.assertFalse(plan_sw_only["hw_autorange_enabled"])
+        self.assertEqual(list(plan_sw_only["sw_ranges"]), [1, 2])
+        self.assertEqual(plan_sw_only["sw_ranges"][1]["excitation_percent"], 30)
+        self.assertEqual(plan_sw_only["sw_ranges"][2]["excitation_percent"], 100)
+
+        # Auto-snap helper never exceeds max_current_a and prefers higher VAREXC % on ties.
+        self.assertEqual(nearest_fixed_current_settings(1, 0.000296, max_current_a=0.0003)[:2], (0, 30))
+        self.assertEqual(nearest_fixed_current_settings(1, 0.000304, max_current_a=0.0003)[:2], (0, 30))
+        self.assertEqual(nearest_fixed_current_settings(5, 0.0003, max_current_a=0.0003)[:2], (6, 100))
+        self.assertAlmostEqual(parse_current_a("300uA"), 0.0003)
+        self.assertAlmostEqual(parse_current_a("0.3mA"), 0.0003)
+        self.assertAlmostEqual(parse_current_a("30u"), 3.0e-5)
+
+    def test_hybrid_low_range_autorange_zero_overshoot_no_remeasure_and_recovery(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        # Both sensors start on 200 mOhm (2R) with readings < 5% of 200 mOhm (< 10 mOhm).
+        state.resistance_reply_by_sensor[1] = "+005.00 M OHMR"
+        state.reactance_reply_by_sensor[1] = "+000.10 M OHMX"
+        state.resistance_reply_by_sensor[2] = "+004.00 M OHMR"
+        state.reactance_reply_by_sensor[2] = "+000.10 M OHMX"
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state, [])
+        context = self._context(messages, _samples(8))
+        settings = self._common_settings(mode="autorange", limit=0.0003)
+
+        open_module(backend, context)
+        backend.configure(settings, context)
+        self.assertEqual(backend.applied_settings["effective_autorange_min_range"], 2)
+        self.assertEqual(backend.applied_settings["effective_low_range"], 1)
+        self.assertEqual(list(backend.applied_settings["autorange_sw_ranges"]), [1])
+
+        run_start(backend, context)
+        self.assertEqual(state.autorange_limits, (2, 9))
+        self.assertEqual(state.autorange, 1)
+
+        # Pass 1: S1 & S2 measure in HW AUTORANGE 200 mOhm; < 10 mOhm returns valid row
+        # immediately (no re-measure) and caches 20 mOhm (1R) for the next measurement.
+        measure_module(backend, context, 1)
+        measure_module(backend, context, 2)
+        rows = [payload["values"] for kind, payload in messages if kind == "row"]
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[0]["R1"], 0.005)
+        self.assertEqual(rows[0]["StatusCode"], 0)
+        self.assertEqual(backend._autorange_last_range[1], 1)
+        self.assertEqual(backend._autorange_last_range[2], 1)
+
+        # Pass 2: S1 switches safely to Fixed 20 mOhm @ 30% (300 uA), and S2 uses SELECT-only!
+        measure_module(backend, context, 1)
+        self.assertEqual((state.autorange, state.range_index, state.excitation_index, state.excitation_percent), (0, 1, 0, 30))
+        start_s2 = len(state.commands)
+        measure_module(backend, context, 2)
+        self.assertEqual([c for a, c in state.commands[start_s2:] if a == "write"], ["SELECT S=02"])
+
+        # Pass 3: S1 rises above 90% of 20 mOhm (> 18 mOhm), S2 hits R overrange;
+        # both record their rows and reset cache upward to 200 mOhm (2R).
+        state.resistance_reply_by_sensor[1] = "+019.00 M OHMR"
+        state.overloads[2] = 64
+        measure_module(backend, context, 1)
+        measure_module(backend, context, 2)
+        rows = [payload["values"] for kind, payload in messages if kind == "row"]
+        self.assertAlmostEqual(rows[4]["R1"], 0.019)
+        self.assertEqual(rows[4]["StatusCode"], 0)
+        self.assertEqual(rows[5]["StatusCode"], 1)
+        self.assertNotIn("R2", rows[5])
+        self.assertEqual(backend._autorange_last_range[1], 2)
+        self.assertEqual(backend._autorange_last_range[2], 2)
+
+        # Pass 4: Both sensors return cleanly to HW AUTORANGE L=29 @ 100%.
+        state.overloads.pop(2, None)
+        state.resistance_reply_by_sensor[1] = "+050.00 M OHMR"
+        state.resistance_reply_by_sensor[2] = "+060.00 M OHMR"
+        measure_module(backend, context, 1)
+        self.assertEqual((state.autorange, state.autorange_limits, state.range_index, state.excitation_percent), (1, (2, 9), 2, 100))
+        measure_module(backend, context, 2)
+
+        run_end(backend, "completed", context)
+        self.assertEqual((state.autorange, state.excitation_percent), (0, 5))
+        # Strict safety invariant: excitation current NEVER exceeded 300 uA anywhere.
+        peak_current = max(current for _cmd, current in state.current_trace)
+        self.assertLessEqual(peak_current, 0.0003 * (1.0 + 1.0e-12))
+        backend.close(context)
+
+    def test_hybrid_autorange_sw_only_two_range_stepping(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        state.resistance_reply_by_sensor[1] = "+005.00 M OHMR"
+        state.reactance_reply_by_sensor[1] = "+000.00 M OHMX"
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state, [])
+        context = self._context(messages, _samples(3))
+        settings = self._common_settings(mode="autorange", limit=0.0003)
+        settings["common"].update(autorange_min_range=1, autorange_max_range=2)
+        settings["channels"]["r2"]["enabled"] = False
+
+        open_module(backend, context)
+        backend.configure(settings, context)
+        self.assertFalse(backend.applied_settings["autorange_hw_enabled"])
+        self.assertFalse(any(c.startswith("AUTORANGE U=") for a, c in state.commands if a == "write"))
+
+        run_start(backend, context)
+        self.assertEqual(state.autorange, 0)
+        # Starts at highest SW range (200 mOhm @ 100%), sees 5 mOhm (< 5%), caches 20 mOhm.
+        measure_module(backend, context, 1)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (2, 1, 100))
+        self.assertEqual(backend._autorange_last_range[1], 1)
+        # Next measurement steps down to 20 mOhm @ 30%, sees overload, caches back to 200 mOhm.
+        state.overloads[1] = 64
+        measure_module(backend, context, 1)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (1, 0, 30))
+        self.assertEqual(backend._autorange_last_range[1], 2)
+        state.overloads.pop(1, None)
+        state.resistance_reply_by_sensor[1] = "+050.00 M OHMR"
+        measure_module(backend, context, 1)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (2, 1, 100))
+        run_end(backend, "completed", context)
+        self.assertLessEqual(max(c for _, c in state.current_trace), 0.0003 * (1.0 + 1.0e-12))
+        backend.close(context)
+
+    def test_set_current_seq_command_autorange_per_slot_reset_and_guards(self):
+        state = _FakeVisaState()
+        state.range_index = 3
+        state.resistance_reply_by_sensor[1] = "+0.50000 OHMR"
+        state.reactance_reply_by_sensor[1] = "+0.00100 OHMX"
+        state.resistance_reply_by_sensor[2] = "+0.60000 OHMR"
+        state.reactance_reply_by_sensor[2] = "+0.00100 OHMX"
+        messages: list[tuple[str, dict]] = []
+        backend = self._backend(state, [])
+        context = self._context(messages, _samples(6))
+        settings = self._common_settings(mode="autorange", limit=0.0003)
+
+        open_module(backend, context)
+        backend.configure(settings, context)
+        original_trace = state.autorange_user_trace
+        self.assertEqual(original_trace, (0, 0, 1, 3, 5, 6, 6, 6, 6, 6))
+        run_start(backend, context)
+
+        # Reject current above configured Maximum excitation current without touching hardware.
+        writes_before = len(state.commands)
+        with self.assertRaises(ModuleError) as over_ctx:
+            backend.execute_sequence_command("set_current", {"slot": "All", "current": "500uA"}, context)
+        self.assertEqual(over_ctx.exception.code, "LR700_CURRENT_OVER_LIMIT")
+        self.assertEqual(len(state.commands), writes_before)
+
+        # Reject disabled slot.
+        with self.assertRaises(ModuleError) as disabled_ctx:
+            backend.execute_sequence_command("set_current", {"slot": "R3", "current": "100uA"}, context)
+        self.assertEqual(disabled_ctx.exception.code, "LR700_LOGICAL_SLOT_DISABLED")
+
+        # Lower All autorange ceiling from 300 uA -> 30 uA: rewrites T=4 trace and tightens L=39.
+        result = backend.execute_sequence_command("set_current", {"slot": "All", "current": "30uA"}, context)
+        self.assertIn("Set Current:", result["Last Action"])
+        self.assertEqual(state.autorange_user_trace, (0, 0, 0, 1, 3, 5, 6, 6, 6, 6))
+        self.assertEqual(state.excitation_percent, 5)
+        measure_module(backend, context, 1)
+        self.assertEqual(state.autorange_limits, (3, 9))
+        self.assertEqual((state.range_index, state.excitation_index), (3, 1))
+
+        # Per-slot override on R1 only back to 300 uA while R2 remains at 30 uA.
+        backend.execute_sequence_command("set_current", {"slot": "R1", "current": "300uA"}, context)
+        measure_module(backend, context, 1)
+        self.assertEqual(state.autorange_user_trace, original_trace)
+        self.assertEqual(state.autorange_limits, (2, 9))
+        measure_module(backend, context, 2)
+        self.assertEqual(state.autorange_user_trace, (0, 0, 0, 1, 3, 5, 6, 6, 6, 6))
+        self.assertEqual(state.autorange_limits, (3, 9))
+
+        # Reject Set Current while 10x mode is active.
+        backend.execute_sequence_command("x10_on", {}, context)
+        with self.assertRaises(ModuleError) as x10_ctx:
+            backend.execute_sequence_command("set_current", {"slot": "All", "current": "100uA"}, context)
+        self.assertEqual(x10_ctx.exception.code, "LR700_10X_ACTIVE")
+
+        # Run end clears runtime overrides; next Run restores applied 300 uA trace automatically.
+        run_end(backend, "completed", context)
+        self.assertEqual(backend._runtime_channels, {})
+        run_start(backend, context)
+        self.assertEqual(state.autorange_user_trace, original_trace)
+        self.assertEqual(state.autorange_limits, (2, 9))
+        run_end(backend, "completed", context)
+        self.assertLessEqual(max(c for _, c in state.current_trace), 0.0003 * (1.0 + 1.0e-12))
+        backend.close(context)
+
+    def test_set_current_seq_command_fixed_mode_and_floor_validation(self):
+        state = _FakeVisaState()
+        state.range_index = 2
+        state.resistance_reply_by_sensor[1] = "+050.00 M OHMR"
+        state.reactance_reply_by_sensor[1] = "+000.00 M OHMX"
+        state.resistance_reply_by_sensor[2] = "+060.00 M OHMR"
+        state.reactance_reply_by_sensor[2] = "+000.00 M OHMX"
+        backend = self._backend(state, [])
+        context = self._context([], _samples(4))
+        settings = self._common_settings(mode="fixed", limit=0.0003)
+        settings["common"].update(range_index=1, current_a=0.0003)
+
+        open_module(backend, context)
+        backend.configure(settings, context)
+        run_start(backend, context)
+        measure_module(backend, context, 1)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (1, 0, 30))
+
+        # Reject current below 20 mOhm 5% floor (50 uA).
+        with self.assertRaises(ModuleError) as low_ctx:
+            backend.execute_sequence_command("set_current", {"slot": "R1", "current": "10uA"}, context)
+        self.assertEqual(low_ctx.exception.code, "LR700_INVALID_SETTINGS")
+
+        # Lower R1 to 100 uA (10%), leaving R2 at 300 uA (30%).
+        backend.execute_sequence_command("set_current", {"slot": "R1", "current": "100uA"}, context)
+        measure_module(backend, context, 1)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (1, 0, 10))
+        measure_module(backend, context, 2)
+        self.assertEqual((state.range_index, state.excitation_index, state.excitation_percent), (1, 0, 30))
+        run_end(backend, "completed", context)
+        self.assertLessEqual(max(c for _, c in state.current_trace), 0.0003 * (1.0 + 1.0e-12))
+        backend.close(context)
 
     def test_open_reads_registry_without_connecting_or_writing(
         self,
@@ -2337,6 +2606,54 @@ class LR700FrontendTests(unittest.TestCase):
             path = Path(temp) / "settings.toml"
             save_settings(path, frontend.dump())
             self.assertEqual(load_settings(path), frontend.dump())
+        frontend.deleteLater()
+        frontend.status_widget.deleteLater()
+        self.application.processEvents()
+
+    def test_frontend_hybrid_autorange_preview_and_auto_snap_fixed_current(self) -> None:
+        context = ModuleUIAPI(resources=measurement_resources({"bridge-lr700": "GPIB0::18::INSTR"}))
+        frontend = LR700Frontend(context)
+        frontend.common_widgets["current_limit_a"].setValue(0.3)
+        preview = frontend.trace_preview.text()
+        self.assertIn("20 mOhm - 2 MOhm", preview)
+        self.assertIn("HW L=29", preview)
+        self.assertIn("U=0013566666", preview)
+        self.assertIn("20 mOhm: 300 uA (30% SW)", preview)
+
+        # Two-range SW-only autorange preview (20 mOhm - 200 mOhm at 0.3 mA).
+        frontend._select_data(frontend.common_widgets["autorange_max_range"], 2)
+        self.assertIn("SW stepped", frontend.trace_preview.text())
+        self.assertIn("20 mOhm: 300 uA (30% SW)", frontend.trace_preview.text())
+        self.assertIn("200 mOhm: 300 uA (100% SW)", frontend.trace_preview.text())
+
+        # Fixed current editingFinished snaps to nearest supported value <= current_limit_a.
+        r2 = frontend.channel_widgets["r2"]
+        r2["independent"].setChecked(True)
+        frontend._select_data(r2["range_index"], 1)  # 20 mOhm (step = 10 uA at 20 uV)
+        r2["current_a"].setValue(0.296)
+        r2["current_a"].editingFinished.emit()
+        self.assertAlmostEqual(r2["current_a"].value(), 0.3)
+        self.assertIn("300 uA (30%)", r2["actual"].text())
+
+        # Value above current_limit_a snaps downward to <= limit (never overshoots limit).
+        r2["current_a"].setValue(0.304)
+        r2["current_a"].editingFinished.emit()
+        self.assertAlmostEqual(r2["current_a"].value(), 0.3)
+
+        # Range change via user activated signal snaps to nearest valid value on the new range.
+        idx_200_ohm = r2["range_index"].findData(5)  # 200 Ohm max = 100 uA
+        r2["range_index"].setCurrentIndex(idx_200_ohm)
+        r2["range_index"].activated.emit(idx_200_ohm)
+        self.assertAlmostEqual(r2["current_a"].value(), 0.1)
+        self.assertEqual(r2["actual"].text(), "100 uA")
+
+        # load() preserves saved unrounded values without mutating them.
+        saved = frontend.dump()
+        saved["channels"]["r2"]["range_index"] = 1
+        saved["channels"]["r2"]["current_a"] = 0.000296
+        frontend.load(saved)
+        self.assertAlmostEqual(frontend.dump()["channels"]["r2"]["current_a"], 0.000296)
+
         frontend.deleteLater()
         frontend.status_widget.deleteLater()
         self.application.processEvents()

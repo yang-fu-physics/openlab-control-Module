@@ -30,8 +30,10 @@ from labcontrol.module_api import (
 )
 
 from .constants import (
+    AUTORANGE_DOWN_FRACTION,
     AUTORANGE_MAX_RANGE_INDEX,
     AUTORANGE_MIN_RANGE_INDEX,
+    AUTORANGE_UP_FRACTION,
     COMMON_MODE_OVERLOAD_HINT,
     COMMON_MODE_OVERLOAD_MASK,
     FILTERS,
@@ -52,6 +54,8 @@ from .constants import (
     format_current,
     is_valid_range_excitation,
     minimum_excitation_index,
+    parse_current_a,
+    plan_autorange,
     range_label,
     range_ohms,
     valid_excitation_indices,
@@ -101,6 +105,36 @@ class LR700Backend:
          "description": "Capture fixed R Set references for every enabled sensor, freeze their settled range/excitation and enable 10x. Restore each sensor's reference during the field sweep.", "fields": []},
         {"id": "x10_off", "label": "10x Delta R Off", "kind": "command",
          "description": "Return to 1x difference gain, keeping R Set unchanged.", "fields": []},
+        {
+            "id": "set_current",
+            "label": "Set Current",
+            "kind": "command",
+            "description": (
+                "Update LR-700 excitation current (or autorange current ceiling) for subsequent "
+                "Measure steps without exceeding the applied Maximum excitation current."
+            ),
+            "point_unit": "A",
+            "point_limits": {
+                "field": "current",
+                "minimum": 5.0e-11,
+                "maximum": 0.03,
+            },
+            "fields": [
+                {
+                    "name": "slot",
+                    "label": "Channel",
+                    "type": "choice",
+                    "default": "All",
+                    "choices": ["All", "R1", "R2", "R3", "R4"],
+                },
+                {
+                    "name": "current",
+                    "label": "Excitation current (A)",
+                    "type": "text",
+                    "default": "300uA",
+                },
+            ],
+        },
     ]
 
     def __init__(
@@ -128,6 +162,8 @@ class LR700Backend:
         self._last_safe_bridge: dict[str, int] | None = None
         self._measurement_mode = 0
         self._x10_channels: dict[int, dict[str, Any]] = {}
+        self._runtime_channels: dict[str, dict[str, Any]] = {}
+        self._programmed_trace: tuple[int, ...] | None = None
         self._autorange_running = False
         self._autorange_active_limits: tuple[int, int] | None = None
         self._autorange_active_filter: int | None = None
@@ -224,17 +260,28 @@ class LR700Backend:
                             limit_a,
                         )
                     else:
-                        lo = int(channel["autorange_min_range"])
-                        hi = int(channel["autorange_max_range"])
-                        clamped = max(lo, min(hi, current_range))
-                        self._require_safe_range_transition(
-                            current_range,
-                            clamped,
-                            limit_a,
-                        )
-            if "common" in desired and any(
-                c["enabled"] and c["range_mode"] == "autorange"
-                for c in desired["channels"].values()
+                        if channel.get("autorange_hw_enabled", True):
+                            lo = int(channel["autorange_min_range"])
+                            hi = int(channel["autorange_max_range"])
+                            clamped = max(lo, min(hi, current_range))
+                            self._require_safe_range_transition(
+                                current_range,
+                                clamped,
+                                limit_a,
+                            )
+                        for sw_r in channel.get("autorange_sw_ranges", ()):
+                            self._require_safe_range_transition(
+                                current_range,
+                                int(sw_r),
+                                limit_a,
+                            )
+            if (
+                "common" in desired
+                and desired.get("autorange_hw_enabled", True)
+                and any(
+                    c["enabled"] and c["range_mode"] == "autorange"
+                    for c in desired["channels"].values()
+                )
             ):
                 for trace_cmd in instrument.autorange_trace_commands(
                     desired["autorange_trace"]
@@ -242,6 +289,7 @@ class LR700Backend:
                     self._write_absolute(trace_cmd, api)
                 safe_bridge = self._query_bridge_settings(api)
                 self._verify_safe_state(safe_bridge)
+                self._programmed_trace = tuple(int(e) for e in desired["autorange_trace"])
         except Exception as failure:
             cleanup_error = (
                 self._best_effort_safe_state(api, reset_mode=True)
@@ -250,6 +298,7 @@ class LR700Backend:
             )
             self._close_transport()
             self.applied_settings = {}
+            self._runtime_channels.clear()
             self.sequence_active = False
             if cleanup_error is not None:
                 raise ModuleError(
@@ -260,6 +309,7 @@ class LR700Backend:
                 ) from failure
             raise
         self.applied_settings = deepcopy(desired)
+        self._runtime_channels.clear()
         self._x10_channels.clear()
         self._measurement_mode = 0
         self._autorange_last_range.clear()
@@ -303,9 +353,17 @@ class LR700Backend:
             self._waiter(api, settle)
             status = {**self._bridge_status_fields(bridge), "10x References": "Inactive",
                       "Last Action": "10x off; R Set retained; normal channel settings resume on Measure"}
+        elif command_id == "set_current":
+            status = self._execute_set_current(parameters, api)
         elif command_id == "x10_on":
             attempts = sum(
-                self._slot_measure_attempts(settings["channels"][f"r{slot}"], settings)
+                self._slot_measure_attempts(
+                    self._resolve_autorange_execution(
+                        int(self._active_channel(slot)["input_channel"]),
+                        self._active_channel(slot),
+                    )[0],
+                    settings,
+                )
                 for slot in self.slots
             )
             estimate = attempts * (settle + 2.0) + settle + io_margin
@@ -326,35 +384,49 @@ class LR700Backend:
                 last_sensor: int | None = None
                 last_frozen: dict[str, Any] | None = None
                 for slot in self.slots:
-                    channel = settings["channels"][f"r{slot}"]
+                    channel = self._active_channel(slot)
                     sensor = int(channel["input_channel"])
+                    effective_channel, using_sw_low = self._resolve_autorange_execution(
+                        sensor, channel
+                    )
                     # Clear both RSET and any stale XSET BEFORE switching/autorange starts
                     # so AUTORANGE 1 never sees a leftover offset from a prior channel.
                     self._write_absolute(instrument.OFFSET_CLEAR_ALL, api)
-                    self._prepare_sensor(sensor, channel, settings, api)
-                    for _attempt in range(self._slot_measure_attempts(channel, settings)):
-                        if channel["range_mode"] == "autorange":
+                    self._prepare_sensor(sensor, effective_channel, settings, api)
+                    for _attempt in range(self._slot_measure_attempts(effective_channel, settings)):
+                        if effective_channel["range_mode"] == "autorange":
                             self._waiter(api, settle / 4)
                             mid = self._query_bridge_settings(api)
-                            self._verify_channel_readback(sensor, channel, mid)
+                            self._verify_channel_readback(sensor, effective_channel, mid)
                             self._waiter(api, settle * 3 / 4)
                             before = self._query_bridge_settings(api)
-                            self._verify_channel_readback(sensor, channel, before)
+                            self._verify_channel_readback(sensor, effective_channel, before)
                             if not self._same_bridge_range_state(mid, before):
                                 continue
                         else:
                             self._waiter(api, settle)
                             before = self._query_bridge_settings(api)
-                            self._verify_channel_readback(sensor, channel, before)
+                            self._verify_channel_readback(sensor, effective_channel, before)
                         resistance = self._query_measurement(
                             instrument.GET_RESISTANCE, "R", before["range_index"], api
                         )
                         bits = self._query_overloads(api)
                         after = self._query_bridge_settings(api)
-                        self._verify_channel_readback(sensor, channel, after)
+                        self._verify_channel_readback(sensor, effective_channel, after)
                         if not self._same_bridge_range_state(before, after):
                             continue
                         if bits:
+                            if using_sw_low:
+                                if channel.get("autorange_hw_enabled", True):
+                                    self._autorange_last_range[sensor] = int(
+                                        channel["autorange_min_range"]
+                                    )
+                                elif (int(effective_channel["range_index"]) + 1) in (
+                                    channel.get("autorange_sw_ranges") or {}
+                                ):
+                                    self._autorange_last_range[sensor] = (
+                                        int(effective_channel["range_index"]) + 1
+                                    )
                             raise ModuleWarning(
                                 f"Cannot capture R{slot}/S{sensor} reference while the bridge reports overload",
                                 "LR700_REFERENCE_OVERLOAD",
@@ -367,7 +439,7 @@ class LR700Backend:
                         )
                     self._write_absolute(instrument.AUTORANGE_OFF, api)
                     self._reset_autorange_session()
-                    frozen = {**channel, "range_mode": "fixed", **{name: after[name] for name in (
+                    frozen = {**effective_channel, "range_mode": "fixed", **{name: after[name] for name in (
                         "range_index", "excitation_index", "excitation_percent", "filter_index")}}
                     full_scale = range_ohms(after["range_index"])
                     counts = round(resistance / full_scale * 200000)
@@ -428,6 +500,335 @@ class LR700Backend:
         api.status(status)
         return status
 
+    def _active_channel(self, slot: int) -> dict[str, Any]:
+        key = f"r{slot}"
+        override = self._runtime_channels.get(key)
+        if override is not None:
+            return override
+        return self.applied_settings["channels"][key]
+
+    def _hard_current_limit_a(self) -> float:
+        settings = self.applied_settings
+        if "common" in settings:
+            return float(settings["common"]["current_limit_a"])
+        candidates: list[float] = []
+        for slot in self.slots:
+            ch = settings["channels"][f"r{slot}"]
+            if ch["range_mode"] == "fixed":
+                candidates.append(
+                    excitation_current_a(
+                        int(ch["range_index"]),
+                        int(ch["excitation_index"]),
+                        int(ch["excitation_percent"]),
+                    )
+                )
+            else:
+                lo = int(ch["autorange_min_range"])
+                hi = int(ch["autorange_max_range"])
+                trace = ch.get("autorange_trace")
+                for r in range(lo, hi + 1):
+                    e = int(trace[r]) if trace is not None else autorange_trace_excitation_index(r)
+                    candidates.append(excitation_current_a(r, e, 100))
+        return max(candidates) if candidates else 0.03
+
+    def _resolve_autorange_execution(
+        self,
+        input_channel: int,
+        channel: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """将自动量程槽位解析为本轮实际执行的硬件自动量程或软件低阻 % 固定量程。"""
+
+        if str(channel.get("range_mode", "fixed")).strip().casefold() != "autorange":
+            return dict(channel), False
+        sw_ranges = channel.get("autorange_sw_ranges") or {}
+        hw_enabled = bool(channel.get("autorange_hw_enabled", True))
+        cached = self._autorange_last_range.get(input_channel)
+        if cached in sw_ranges:
+            sw_cfg = sw_ranges[cached]
+            return (
+                {
+                    **channel,
+                    "range_mode": "fixed",
+                    "range_index": int(sw_cfg["range_index"]),
+                    "excitation_index": int(sw_cfg["excitation_index"]),
+                    "excitation_percent": int(sw_cfg["excitation_percent"]),
+                },
+                True,
+            )
+        if not hw_enabled and sw_ranges:
+            start_r = max(int(r) for r in sw_ranges)
+            sw_cfg = sw_ranges[start_r]
+            return (
+                {
+                    **channel,
+                    "range_mode": "fixed",
+                    "range_index": int(sw_cfg["range_index"]),
+                    "excitation_index": int(sw_cfg["excitation_index"]),
+                    "excitation_percent": int(sw_cfg["excitation_percent"]),
+                },
+                True,
+            )
+        return dict(channel), False
+
+    def _ensure_autorange_trace(
+        self,
+        channel: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> None:
+        """在 5% 安全态下按需同步仪表 T=4 自定义 trace 表（U=）。"""
+
+        raw_trace = channel.get("autorange_trace")
+        if raw_trace is None or not channel.get("autorange_hw_enabled", True):
+            return
+        desired_trace = tuple(int(e) for e in raw_trace)
+        if desired_trace == self._programmed_trace:
+            return
+        for trace_cmd in instrument.autorange_trace_commands(desired_trace):
+            self._write_absolute(trace_cmd, api)
+        safe_bridge = self._query_bridge_settings(api)
+        self._verify_safe_state(safe_bridge)
+        self._programmed_trace = desired_trace
+
+    def _trace_matches_programmed(self, channel: Mapping[str, Any]) -> bool:
+        raw_trace = channel.get("autorange_trace")
+        if raw_trace is None:
+            return True
+        return tuple(int(e) for e in raw_trace) == self._programmed_trace
+
+    def _update_autorange_range_cache(
+        self,
+        channel: Mapping[str, Any],
+        input_channel: int,
+        settled_bridge: Mapping[str, int],
+        resistance: float,
+        reactance: float,
+        status_code: int,
+        *,
+        using_sw_low_range: bool,
+    ) -> None:
+        """不补测本点，直接按 5%/90% 迟滞阈值和过载状态缓存下一轮测量应切入的量程。"""
+
+        if str(channel.get("range_mode", "fixed")).strip().casefold() != "autorange":
+            return
+        settled_r = int(settled_bridge["range_index"])
+        sw_ranges = channel.get("autorange_sw_ranges") or {}
+        hw_enabled = bool(channel.get("autorange_hw_enabled", True))
+        hw_lo = int(channel["autorange_min_range"])
+        hw_hi = int(channel["autorange_max_range"])
+
+        if status_code == STATUS_CODE_NORMAL:
+            magnitude = max(abs(resistance), abs(reactance))
+            full_scale = range_ohms(settled_r)
+            if (
+                magnitude < AUTORANGE_DOWN_FRACTION * full_scale
+                and (settled_r - 1) in sw_ranges
+            ):
+                next_range = settled_r - 1
+            elif using_sw_low_range and magnitude > AUTORANGE_UP_FRACTION * full_scale:
+                if (settled_r + 1) in sw_ranges:
+                    next_range = settled_r + 1
+                elif hw_enabled and hw_lo <= settled_r + 1 <= hw_hi:
+                    next_range = hw_lo
+                else:
+                    next_range = settled_r
+            else:
+                next_range = settled_r
+            self._autorange_last_range[input_channel] = next_range
+        elif using_sw_low_range and status_code in {
+            STATUS_CODE_OVER_RANGE,
+            STATUS_CODE_OVERLOAD,
+        }:
+            # 低阻 % 接管态发生超量程/过载时，下次测量立即升回硬件自动量程或更高一档软件档。
+            if hw_enabled:
+                self._autorange_last_range[input_channel] = hw_lo
+            elif (settled_r + 1) in sw_ranges:
+                self._autorange_last_range[input_channel] = settled_r + 1
+
+    def _execute_set_current(
+        self,
+        parameters: Mapping[str, Any],
+        api: ModuleAPI,
+    ) -> dict[str, Any]:
+        """在 SEQ 中动态调整运行期激励电流（固定量程）或自动量程电流上限，绝不超过已应用上限。"""
+
+        if self._x10_channels or self._measurement_mode != 0:
+            raise ModuleError(
+                "Disable 10x Delta R (x10_off) before changing LR-700 excitation current",
+                "LR700_10X_ACTIVE",
+                "set_current",
+            )
+        settings = self.applied_settings
+        io_margin = self._io_retry_margin(settings)
+        if io_margin > api.timeout - 2.0:
+            raise ModuleError(
+                f"Updating LR-700 excitation current requires {io_margin:.1f} s I/O margin; "
+                "increase the module operation timeout",
+                "LR700_MEASURE_TIMEOUT_UNSAFE",
+                "set_current",
+            )
+        raw_slot = str(parameters.get("slot", "All")).strip()
+        normalized_slot = raw_slot.upper()
+        if normalized_slot == "ALL":
+            target_slots = list(self.slots)
+        elif normalized_slot in {"R1", "R2", "R3", "R4"}:
+            slot_num = int(normalized_slot[1])
+            if slot_num not in self.slots:
+                raise ModuleError(
+                    f"R{slot_num} is not enabled for this sequence",
+                    "LR700_LOGICAL_SLOT_DISABLED",
+                    f"r{slot_num}",
+                )
+            target_slots = [slot_num]
+        else:
+            raise ModuleError(
+                f"Invalid LR-700 channel selector {raw_slot!r}; expected All or R1-R4",
+                "LR700_INVALID_SETTINGS",
+                "slot",
+            )
+
+        if "current" not in parameters:
+            raise ModuleError(
+                "Set Current requires a 'current' parameter",
+                "LR700_INVALID_SETTINGS",
+                "current",
+            )
+        try:
+            requested_a = parse_current_a(parameters["current"])
+        except ValueError as exc:
+            raise ModuleError(str(exc), "LR700_INVALID_SETTINGS", "current") from exc
+
+        hard_limit_a = self._hard_current_limit_a()
+        if requested_a > hard_limit_a * (1.0 + 1.0e-12):
+            raise ModuleError(
+                f"Requested current {format_current(requested_a)} exceeds configured "
+                f"Maximum excitation current {format_current(hard_limit_a)}",
+                "LR700_CURRENT_OVER_LIMIT",
+                "current",
+            )
+
+        # 在触碰硬件前完整校验并预生成所有目标槽位的新配置（fail-closed）。
+        staged_updates: dict[str, dict[str, Any]] = {}
+        summary_parts: list[str] = []
+        for slot in target_slots:
+            key = f"r{slot}"
+            base = deepcopy(settings["channels"][key])
+            if base["range_mode"] == "autorange":
+                req_lo = int(
+                    base.get(
+                        "requested_autorange_min_range",
+                        settings["common"]["autorange_min_range"]
+                        if "common" in settings
+                        else base["autorange_min_range"],
+                    )
+                )
+                req_hi = int(
+                    base.get(
+                        "requested_autorange_max_range",
+                        settings["common"]["autorange_max_range"]
+                        if "common" in settings
+                        else base["autorange_max_range"],
+                    )
+                )
+                try:
+                    plan = plan_autorange(requested_a, req_lo, req_hi)
+                except ValueError as exc:
+                    raise ModuleError(
+                        f"R{slot}: {exc} at {format_current(requested_a)}",
+                        "LR700_INVALID_SETTINGS",
+                        key,
+                    ) from exc
+                for r_from in plan["usable_ranges"]:
+                    for r_to in plan["usable_ranges"]:
+                        self._require_safe_range_transition(r_from, r_to, requested_a)
+                base.update(
+                    autorange_trace=plan["trace"],
+                    autorange_min_range=plan["hw_min_range"],
+                    autorange_max_range=plan["hw_max_range"],
+                    autorange_hw_enabled=plan["hw_autorange_enabled"],
+                    autorange_sw_ranges=plan["sw_ranges"],
+                    requested_autorange_min_range=req_lo,
+                    requested_autorange_max_range=req_hi,
+                    effective_low_range=plan["effective_min_range"],
+                    effective_high_range=plan["effective_max_range"],
+                    current_limit_a=requested_a,
+                )
+                lo_label = range_label(plan["effective_min_range"])
+                hi_label = range_label(plan["effective_max_range"])
+                summary_parts.append(
+                    f"R{slot} auto <= {format_current(requested_a)} ({lo_label}-{hi_label})"
+                )
+            else:
+                r_idx = int(base["range_index"])
+                try:
+                    e_idx, pct, actual = fixed_current_settings(r_idx, requested_a)
+                except ValueError as exc:
+                    raise ModuleError(
+                        f"R{slot}: {exc}",
+                        "LR700_INVALID_SETTINGS",
+                        key,
+                    ) from exc
+                base.update(
+                    excitation_index=e_idx,
+                    excitation_percent=pct,
+                    current_a=actual,
+                    current_limit_a=requested_a,
+                )
+                summary_parts.append(
+                    f"R{slot} fixed {range_label(r_idx)} -> {format_current(actual)} ({pct}%)"
+                )
+            staged_updates[key] = base
+
+        # 切换到安全态后校验当前桥量程到目标量程的中间态电流，再提交运行期配置。
+        safe_bridge = self._set_safe_state(api)
+        current_bridge_range = int(safe_bridge["range_index"])
+        for ch in staged_updates.values():
+            if ch["range_mode"] == "fixed":
+                self._require_safe_range_transition(
+                    current_bridge_range,
+                    int(ch["range_index"]),
+                    requested_a,
+                )
+            else:
+                if ch.get("autorange_hw_enabled", True):
+                    clamped = max(
+                        int(ch["autorange_min_range"]),
+                        min(int(ch["autorange_max_range"]), current_bridge_range),
+                    )
+                    self._require_safe_range_transition(
+                        current_bridge_range, clamped, requested_a
+                    )
+                for sw_r in ch.get("autorange_sw_ranges", ()):
+                    self._require_safe_range_transition(
+                        current_bridge_range, int(sw_r), requested_a
+                    )
+
+        # 若所有启用中的硬件自动量程槽位共享同一份 trace，先原子写入仪表并复核安全态，再提交运行期配置。
+        staged_hw_traces = {
+            tuple(int(e) for e in candidate["autorange_trace"])
+            for s in self.slots
+            for candidate in (staged_updates.get(f"r{s}", self._active_channel(s)),)
+            if candidate["range_mode"] == "autorange"
+            and candidate.get("autorange_hw_enabled", True)
+            and candidate.get("autorange_trace") is not None
+        }
+        if len(staged_hw_traces) == 1:
+            only_trace = next(iter(staged_hw_traces))
+            self._ensure_autorange_trace(
+                {"autorange_trace": list(only_trace), "autorange_hw_enabled": True},
+                api,
+            )
+            safe_bridge = self._query_bridge_settings(api)
+
+        for key, updated in staged_updates.items():
+            self._runtime_channels[key] = updated
+            self._autorange_last_range.pop(int(updated["input_channel"]), None)
+
+        return {
+            **self._bridge_status_fields(safe_bridge),
+            "Excitation Safety": self._safe_state_text(safe_bridge),
+            "Last Action": "Set Current: " + "; ".join(summary_parts),
+        }
+
     def _set_reference(self, counts: int, range_index: int, api: ModuleAPI) -> float:
         self._write_absolute(instrument.offset_r_command(counts), api)
         reference = self._query_measurement(instrument.GET_RSET, "RSET", range_index, api)
@@ -467,20 +868,25 @@ class LR700Backend:
 
         self._require_ready()
         first_slot = self.slots[0]
-        first_channel = self.applied_settings["channels"][f"r{first_slot}"]
-        first_is_autorange = (
-            str(first_channel.get("range_mode", "fixed")).strip().casefold()
+        first_channel = self._active_channel(first_slot)
+        first_input = int(first_channel["input_channel"])
+        effective_first, first_using_sw = self._resolve_autorange_execution(
+            first_input, first_channel
+        )
+        first_is_hw_autorange = (
+            not first_using_sw
+            and str(effective_first.get("range_mode", "fixed")).strip().casefold()
             == "autorange"
         )
         try:
             safe_bridge = self._set_safe_state(api)
             active_bridge = safe_bridge
             safety_text = self._safe_state_text(safe_bridge)
-            if first_is_autorange:
-                first_input = int(first_channel["input_channel"])
+            if first_is_hw_autorange:
+                self._ensure_autorange_trace(effective_first, api)
                 active_bridge = self._start_autorange_session(
                     first_input,
-                    first_channel,
+                    effective_first,
                     api,
                     current_range_index=int(safe_bridge["range_index"]),
                     target_range_index=self._autorange_last_range.get(first_input),
@@ -525,7 +931,7 @@ class LR700Backend:
                 "LR-700 received an invalid logical slot",
                 "LR700_LOGICAL_SLOT_INVALID",
             )
-        channel = settings["channels"][f"r{slot}"]
+        channel = self._active_channel(slot)
         if not channel["enabled"]:
             raise ModuleError(
                 f"R{slot} is not enabled for this sequence",
@@ -559,7 +965,7 @@ class LR700Backend:
 
     def _prepare_sensor(self, input_channel, channel, settings, api):
         is_autorange = channel["range_mode"] == "autorange"
-        if is_autorange and self._autorange_running:
+        if is_autorange and self._autorange_running and self._trace_matches_programmed(channel):
             configured_bridge = self._switch_autorange_sensor(
                 input_channel,
                 channel,
@@ -567,6 +973,7 @@ class LR700Backend:
             )
         elif is_autorange:
             safe_bridge = self._set_safe_state(api)
+            self._ensure_autorange_trace(channel, api)
             configured_bridge = self._start_autorange_session(
                 input_channel,
                 channel,
@@ -613,35 +1020,47 @@ class LR700Backend:
 
         固定量程槽位每次测量前后都恢复并确认最低激励；连续自动量程 Run 期间
         保持 ``AUTORANGE 1``，切通道只下发 ``SELECT S=nn``（及发生变化的 ``L=``
-        与 ``FILTER``）。运行中触发可恢复的量程未稳警告（``LR700_AUTORANGE_UNSTABLE``）
-        不退出自动量程也不发额外清理命令，仅在 Run 结束、Stop、Error、Disable 或
-        其他异常时恢复 ``AUTORANGE 0`` + 5% 最低激励。
+        与 ``FILTER``）。若自动量程通道命中软件低阻 ``%`` 扩展档缓存（例如
+        ``20 mOhm @ 30%``），本轮直接以对应固定 ``%`` 配置测量，并根据读数迟滞
+        阈值（5% / 90%）或过载结果更新下一轮缓存（不补测）。
         """
 
+        if self._x10_channels:
+            effective_channel, using_sw_low_range = dict(channel), False
+        else:
+            effective_channel, using_sw_low_range = self._resolve_autorange_execution(
+                input_channel, channel
+            )
         is_autorange = (
-            str(channel.get("range_mode", "fixed")).strip().casefold()
+            str(effective_channel.get("range_mode", "fixed")).strip().casefold()
             == "autorange"
         )
         failure: BaseException | None = None
         try:
             if self._x10_channels:
-                configured_bridge = self._prepare_x10_sensor(slot, input_channel, channel, settings, api)
+                configured_bridge = self._prepare_x10_sensor(slot, input_channel, effective_channel, settings, api)
             else:
-                configured_bridge = self._prepare_sensor(input_channel, channel, settings, api)
+                configured_bridge = self._prepare_sensor(input_channel, effective_channel, settings, api)
+            if using_sw_low_range and self.sequence_active:
+                safety_status = (
+                    f"Autorange low-range ({range_label(int(effective_channel['range_index']))} @ "
+                    f"{int(effective_channel['excitation_percent'])}%) active on R{slot} / S{input_channel}; "
+                    "minimum excitation will be restored on Run end/Stop/Error/Disable"
+                )
+            elif is_autorange and self.sequence_active:
+                safety_status = (
+                    f"Autorange active on R{slot} / S{input_channel}; "
+                    "minimum excitation will be restored on "
+                    "Run end/Stop/Error/Disable"
+                )
+            else:
+                safety_status = (
+                    "Measurement excitation active on "
+                    f"R{slot} / sensor {input_channel}"
+                )
             api.status({
                 **self._bridge_status_fields(configured_bridge),
-                "Excitation Safety": (
-                    (
-                        f"Autorange active on R{slot} / S{input_channel}; "
-                        "minimum excitation will be restored on "
-                        "Run end/Stop/Error/Disable"
-                    )
-                    if is_autorange and self.sequence_active
-                    else (
-                        "Measurement excitation active on "
-                        f"R{slot} / sensor {input_channel}"
-                    )
-                ),
+                "Excitation Safety": safety_status,
                 "Last Slot / Sensor": (
                     f"R{slot} / S{input_channel}"
                 ),
@@ -651,7 +1070,7 @@ class LR700Backend:
             # 操作者仍可使用前面板；两次读回可避免把中途改变后的值写入错误通道。
             # 自动量程模式下把等待拆为 1/4 与结束两次 GET 6 核对：不一致则直接
             # 重等一整轮；若进入 dwell 或读数瞬间又发生换挡，同样重等并刷新温场快照。
-            read_attempts = self._slot_measure_attempts(channel, settings)
+            read_attempts = self._slot_measure_attempts(effective_channel, settings)
             temperature: float | None = None
             field: float | None = None
             resistance = 0.0
@@ -668,14 +1087,14 @@ class LR700Backend:
                     mid = self._query_bridge_settings(api)
                     self._verify_channel_readback(
                         input_channel,
-                        channel,
+                        effective_channel,
                         mid,
                     )
                     self._waiter(api, settle_seconds - first_quarter)
                     end_settle = self._query_bridge_settings(api)
                     self._verify_channel_readback(
                         input_channel,
-                        channel,
+                        effective_channel,
                         end_settle,
                     )
                     if not self._same_bridge_range_state(mid, end_settle):
@@ -700,7 +1119,7 @@ class LR700Backend:
                 before = self._query_bridge_settings(api)
                 self._verify_channel_readback(
                     input_channel,
-                    channel,
+                    effective_channel,
                     before,
                 )
                 if (
@@ -737,7 +1156,7 @@ class LR700Backend:
                 after = self._query_bridge_settings(api)
                 self._verify_channel_readback(
                     input_channel,
-                    channel,
+                    effective_channel,
                     after,
                 )
                 if not is_autorange or self._same_bridge_range_state(
@@ -821,11 +1240,17 @@ class LR700Backend:
                 row["FieldAverage"] = field
             # OVER_RANGE/OVERLOAD 下桥读数不可信；保持当前 Rn/Xn 以及所有未测槽位
             # 为空，状态码和温场快照足以说明这次测量尝试。
+            if not self._x10_channels:
+                self._update_autorange_range_cache(
+                    channel,
+                    input_channel,
+                    settled_bridge,
+                    resistance,
+                    reactance,
+                    status_code,
+                    using_sw_low_range=using_sw_low_range,
+                )
             if status_code == STATUS_CODE_NORMAL:
-                if is_autorange:
-                    self._autorange_last_range[input_channel] = int(
-                        settled_bridge["range_index"]
-                    )
                 row.update({
                     f"R{slot}": resistance,
                     f"X{slot}": reactance,
@@ -875,7 +1300,7 @@ class LR700Backend:
                 and self.sequence_active
                 and (
                     (is_autorange and self._autorange_running)
-                    or (not is_autorange and ("common" in settings or bool(self._x10_channels)))
+                    or (not is_autorange and ("common" in settings or using_sw_low_range or bool(self._x10_channels)))
                 )
             )
             if not keep_autorange_running:
@@ -930,6 +1355,9 @@ class LR700Backend:
             return status
         error = self._best_effort_safe_state(api, reset_mode=True)
         self.sequence_active = False
+        if self._runtime_channels:
+            self._runtime_channels.clear()
+            self._autorange_last_range.clear()
         if error is not None:
             api.status({
                 "Sequence": reason.title(),
@@ -974,6 +1402,7 @@ class LR700Backend:
         self._close_transport()
         self.sequence_active = False
         self.applied_settings = {}
+        self._runtime_channels.clear()
         self._x10_channels.clear()
         self._measurement_mode = 0
         self._autorange_last_range.clear()
@@ -1398,10 +1827,14 @@ class LR700Backend:
                 resolved_target = int(target_range_index)
             else:
                 resolved_target = max(min_range, min(max_range, int(current_range_index)))
+            effective_limit_a = min(
+                float(self.applied_settings["common"]["current_limit_a"]),
+                float(channel.get("current_limit_a", self.applied_settings["common"]["current_limit_a"])),
+            )
             self._require_safe_range_transition(
                 current_range_index,
                 resolved_target,
-                float(self.applied_settings["common"]["current_limit_a"]),
+                effective_limit_a,
             )
         commands = instrument.autorange_start_commands(
             input_channel,
@@ -1490,10 +1923,14 @@ class LR700Backend:
             and current_range_index is not None
             and str(channel.get("range_mode", "fixed")).strip().casefold() == "fixed"
         ):
+            effective_limit_a = min(
+                float(self.applied_settings["common"]["current_limit_a"]),
+                float(channel.get("current_limit_a", self.applied_settings["common"]["current_limit_a"])),
+            )
             self._require_safe_range_transition(
                 current_range_index,
                 int(channel["range_index"]),
-                float(self.applied_settings["common"]["current_limit_a"]),
+                effective_limit_a,
             )
         commands = instrument.configuration_commands(
             input_channel,
@@ -2220,6 +2657,7 @@ class LR700Backend:
         self.transport = None
         self.protocol_signature = ""
         self._last_safe_bridge = None
+        self._programmed_trace = None
         self._reset_autorange_session()
         if transport is not None:
             try:
@@ -2298,12 +2736,29 @@ class LR700Backend:
             )
             if needs_autorange_trace:
                 try:
-                    trace, effective_lo, effective_hi = generate_trace(common["current_limit_a"], lo, hi)
+                    ar_plan = plan_autorange(common["current_limit_a"], lo, hi)
                 except ValueError as exc:
                     raise ModuleError(str(exc), "LR700_INVALID_SETTINGS", "common.current_limit_a") from exc
+                trace = ar_plan["trace"]
+                effective_lo = ar_plan["hw_min_range"]
+                effective_hi = ar_plan["hw_max_range"]
+                hw_autorange_enabled = ar_plan["hw_autorange_enabled"]
+                sw_ranges = ar_plan["sw_ranges"]
+                effective_low_range = ar_plan["effective_min_range"]
+                effective_high_range = ar_plan["effective_max_range"]
+                for r_from in ar_plan["usable_ranges"]:
+                    for r_to in ar_plan["usable_ranges"]:
+                        cls._require_safe_range_transition(
+                            r_from,
+                            r_to,
+                            float(common["current_limit_a"]),
+                        )
             else:
                 trace = [minimum_excitation_index(r) for r in range(10)]
                 effective_lo, effective_hi = lo, hi
+                hw_autorange_enabled = True
+                sw_ranges = {}
+                effective_low_range, effective_high_range = lo, hi
             resolved = {}
             for slot, (key, supplied, override, enabled) in enumerate(parsed_rows, start=1):
                 channel = {
@@ -2577,10 +3032,21 @@ class LR700Backend:
             result["common"] = common
             result["channel_overrides"] = deepcopy(settings.get("channels", {}))
             result["autorange_trace"] = trace
+            result["autorange_hw_enabled"] = hw_autorange_enabled
+            result["autorange_sw_ranges"] = deepcopy(sw_ranges)
             result["effective_autorange_min_range"] = effective_lo
             result["effective_autorange_max_range"] = effective_hi
+            result["effective_low_range"] = effective_low_range
+            result["effective_high_range"] = effective_high_range
             for channel in channels.values():
                 channel["autorange_trace"] = trace
+                channel["autorange_hw_enabled"] = hw_autorange_enabled
+                channel["autorange_sw_ranges"] = deepcopy(sw_ranges)
+                channel["requested_autorange_min_range"] = lo
+                channel["requested_autorange_max_range"] = hi
+                channel["effective_low_range"] = effective_low_range
+                channel["effective_high_range"] = effective_high_range
+                channel["current_limit_a"] = float(common["current_limit_a"])
         result["channels"] = channels
         if require_resource:
             cls._validate_measure_duration(
