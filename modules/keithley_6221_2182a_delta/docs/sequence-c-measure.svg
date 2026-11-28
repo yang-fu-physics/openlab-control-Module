@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="1866" viewBox="0 0 1040 1866" role="img" aria-labelledby="title desc">
+<title id="title">C · 单槽位测量</title><desc id="desc">measure(slot, api) · 每次只返回当前逻辑通道的一行结果。块内指令自上而下依次执行，条件分支只执行符合当前配置的一支；时间标记区分固定等待、可配置等待与超时。A 到 D 的引用对应同目录分图。</desc>
+<defs><style>
+text { font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; fill:#1E293B; }
+.title { font-size:18px; font-weight:600; fill:#0F172A; }
+.subtitle { font-size:12px; fill:#64748B; }
+.actor { font-size:14px; font-weight:600; fill:#0F172A; }
+.step { font-size:13px; font-weight:600; }
+.branch { font-size:13px; font-weight:600; fill:#1E3A8A; }
+.code { font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; fill:#1E293B; }
+.note { font-size:12px; fill:#475569; }
+.fixed { fill:#0F766E; } .config { fill:#1D4ED8; } .timeout { fill:#92400E; }
+</style>
+<marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#2563EB"/></marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#D97706"/></marker>
+</defs>
+<rect x="1" y="1" width="1038" height="1864" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="28" y="33" class="title">C · 单槽位测量</text>
+<text x="28" y="58" class="subtitle">measure(slot, api) · 每次只返回当前逻辑通道的一行结果</text>
+<text x="28" y="79" class="subtitle">块内自上而下顺序执行；带条件的分支互斥。W=写入，Q=查询并读取；参数值来自本次 Apply。</text>
+<rect x="65" y="98" width="200" height="48" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
+<text x="165" y="119" text-anchor="middle" class="actor">主框架</text><text x="165" y="137" text-anchor="middle" class="subtitle">调度 · 错误传播 · DAT 写入</text>
+<rect x="405" y="98" width="210" height="48" rx="10" fill="#FFFFFF" stroke="#5EEAD4" stroke-dasharray="5 3"/>
+<text x="510" y="119" text-anchor="middle" class="actor">Delta 模块</text><text x="510" y="137" text-anchor="middle" class="subtitle">独立子进程 · 生命周期与协议编排</text>
+<rect x="750" y="98" width="260" height="48" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+<text x="880" y="119" text-anchor="middle" class="actor">6221 / 2182A / 可选切换器</text><text x="880" y="137" text-anchor="middle" class="subtitle">2182A 经 6221 串口转发，无独立 VISA</text>
+<line x1="165" y1="147" x2="165" y2="1798" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="510" y1="147" x2="510" y2="1798" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="870" y1="147" x2="870" y2="1798" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<text x="36" y="190" class="step" fill="#92400E">C00 · 槽位与调用预算</text>
+<text x="197" y="212" class="code">要求 Apply 已成功、序列 active</text>
+<text x="197" y="230" class="code">要求 CH&lt;slot&gt; 已启用</text>
+<text x="197" y="248" class="code">deadline = 调用起点 + api.timeout - 2 s</text>
+<line x1="197" y1="259" x2="866" y2="259" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="282" class="note">在本次 measure 开始时预留 2 秒；后续 ARM、切换等待等时间都会消耗这次调用预算。</text>
+<text x="36" y="325" class="step" fill="#0F172A">C01-S · 仅 Shared：切换前检查</text>
+<text x="522" y="347" class="code">Q SOUR:DELT:ARM?</text>
+<text x="522" y="365" class="code">Q SOUR:CURR?</text>
+<line x1="515" y1="376" x2="865" y2="376" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="399" class="note">要求 Armed=ON 且 |I| ≤ 100 fA；这里保持 Armed，不发送 Abort/Clear。</text>
+<text x="36" y="442" class="step" fill="#0F172A">C01-I · 仅 Independent：切换前关闭源</text>
+<text x="197" y="464" class="code">执行 D01–D04</text>
+<text x="197" y="482" class="code">即 Abort / Clear / OUTP? / CURR?</text>
+<line x1="197" y1="493" x2="866" y2="493" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="516" class="note">C01-S 与 C01-I 互斥。Independent 必须先确认输出 OFF 与零电流，然后才能切换。</text>
+<rect x="26" y="541" width="988" height="29" rx="8" fill="#F8FBFF" stroke="#BFDBFE"/>
+<text x="40" y="560" class="branch">C02 · 路由选择 · 下列三种分支互斥</text>
+<text x="36" y="605" class="step" fill="#0F172A">C02-N · None</text>
+<text x="197" y="627" class="code">只允许 CH1</text>
+<text x="197" y="645" class="code">不发送切换器命令</text>
+<text x="197" y="663" class="code">不执行 switch_settle_seconds 等待</text>
+<line x1="197" y1="674" x2="866" y2="674" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="697" class="note">None 分支随后直接进入 C03；不能用未连接切换器作为多通道回退方案。</text>
+<text x="36" y="740" class="step" fill="#0F172A">C02-7 · 7001</text>
+<text x="522" y="762" class="code">W ROUT:OPEN ALL</text>
+<text x="522" y="780" class="code">Q ROUT:OPEN? &lt;all_routes&gt;</text>
+<text x="522" y="798" class="code">W ROUT:CLOS &lt;target_routes&gt;</text>
+<text x="522" y="816" class="code">Q ROUT:CLOS? &lt;target_routes&gt;</text>
+<line x1="515" y1="827" x2="865" y2="827" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="850" class="note">OPEN 要求配置路由全为打开；CLOSE 要求目标四路全为闭合。未配置触点不在查询范围。</text>
+<text x="36" y="893" class="step" fill="#0F172A">C02-3 · 3706A</text>
+<text x="522" y="915" class="code">W channel.open(&quot;allslots&quot;)</text>
+<text x="522" y="933" class="code">Q print(channel.getclose(&quot;allslots&quot;))</text>
+<text x="522" y="951" class="code">W channel.exclusiveclose(&quot;&lt;targets&gt;&quot;)</text>
+<text x="522" y="969" class="code">Q print(channel.getclose(&quot;allslots&quot;))</text>
+<line x1="515" y1="980" x2="865" y2="980" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1003" class="note">先要求整机闭合集合为空，再要求它精确等于当前目标集合；路由列表来自 routing.toml。</text>
+<text x="36" y="1046" class="step" fill="#1D4ED8">C02-W · 存在切换器时才执行</text>
+<text x="197" y="1068" class="code config">[配置等待] switch_settle_seconds</text>
+<text x="197" y="1086" class="code">安装默认值为 0.0 s</text>
+<line x1="197" y1="1097" x2="866" y2="1097" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1120" class="note">等待位置：目标路由回读通过之后、重新 ARM 或触发之前；0 秒不代表现场无需等待。</text>
+<text x="36" y="1163" class="step" fill="#0F172A">C03 · 仅 Independent：当前通道配置与 ARM</text>
+<text x="197" y="1185" class="code">执行 A04–A06：当前通道设置</text>
+<text x="197" y="1203" class="code">执行 B03–B06：ARM / 等待 3 s / 确认</text>
+<line x1="197" y1="1214" x2="866" y2="1214" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1237" class="note">Shared 跳过 C03；Independent 每个参与槽位都执行，不能跨通道复用 Armed。</text>
+<text x="36" y="1280" class="step" fill="#0F172A">C04 · 两种模式共同：触发前再次确认</text>
+<text x="522" y="1302" class="code">Q SOUR:DELT:ARM?</text>
+<text x="522" y="1320" class="code">W INIT:IMM</text>
+<line x1="515" y1="1331" x2="865" y2="1331" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1354" class="note">确认 Armed=ON 后，只发一次软件触发；不会自动重放触发命令。</text>
+<text x="36" y="1397" class="step" fill="#92400E">C05 · 完成等待</text>
+<text x="522" y="1419" class="code">Q *OPC?</text>
+<text x="522" y="1437" class="code timeout">[超时上限] deadline - 当前时刻</text>
+<line x1="515" y1="1448" x2="865" y2="1448" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1471" class="note">剩余预算≤0 时转 D；否则查询并要求返回 1 或 +1。查询结束后恢复普通 I/O 超时，不是固定 sleep。</text>
+<text x="36" y="1514" class="step" fill="#0F172A">C06 · 取数与采集后检查</text>
+<text x="522" y="1536" class="code">Q TRAC:DATA?</text>
+<text x="522" y="1554" class="code">Q SYST:ERR?</text>
+<text x="522" y="1572" class="code">Q SOUR:DELT:ARM?</text>
+<text x="522" y="1590" class="code">Q SOUR:CURR?</text>
+<line x1="515" y1="1601" x2="865" y2="1601" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1624" class="note">按此顺序读取；错误码为 0、Armed=ON、|I| ≤ 100 fA。trace 还需检查样本数与数值有效性。</text>
+<text x="36" y="1667" class="step" fill="#0F172A">C07 · 返回当前通道结果</text>
+<text x="177" y="1689" class="code">模块换算电阻与标准差</text>
+<text x="177" y="1707" class="code">返回 (row, raw_values)</text>
+<text x="177" y="1725" class="code">核心校验、合并同槽位数据并写 DAT</text>
+<line x1="505" y1="1736" x2="170" y2="1736" stroke="#2563EB" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+<text x="40" y="1759" class="note">数据质量 Warning 留空电阻并返回状态码，可继续后续槽位；通信、路由或安全错误进入 D。</text><line x1="28" y1="1813" x2="1012" y2="1813" stroke="#E2E8F0"/><text x="28" y="1833" class="subtitle">代码依据：backend.py、keithley_6221.py、keithley_2182a.py、keithley_7001.py、keithley_3706a.py。</text><text x="28" y="1852" class="subtitle">仅描述当前代码；垂直间距不表示实际耗时。精确指令样例见 README 中的离线 CSV；不替代真机验证。</text></svg>

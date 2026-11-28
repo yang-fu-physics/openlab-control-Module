@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="1964" viewBox="0 0 1040 1964" role="img" aria-labelledby="title desc">
+<title id="title">A · 连接与配置</title><desc id="desc">configure(settings, api) · 首次连接与重新 Apply 的顺序。块内指令自上而下依次执行，条件分支只执行符合当前配置的一支；时间标记区分固定等待、可配置等待与超时。A 到 D 的引用对应同目录分图。</desc>
+<defs><style>
+text { font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; fill:#1E293B; }
+.title { font-size:18px; font-weight:600; fill:#0F172A; }
+.subtitle { font-size:12px; fill:#64748B; }
+.actor { font-size:14px; font-weight:600; fill:#0F172A; }
+.step { font-size:13px; font-weight:600; }
+.branch { font-size:13px; font-weight:600; fill:#1E3A8A; }
+.code { font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; fill:#1E293B; }
+.note { font-size:12px; fill:#475569; }
+.fixed { fill:#0F766E; } .config { fill:#1D4ED8; } .timeout { fill:#92400E; }
+</style>
+<marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#2563EB"/></marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#D97706"/></marker>
+</defs>
+<rect x="1" y="1" width="1038" height="1962" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="28" y="33" class="title">A · 连接与配置</text>
+<text x="28" y="58" class="subtitle">configure(settings, api) · 首次连接与重新 Apply 的顺序</text>
+<text x="28" y="79" class="subtitle">块内自上而下顺序执行；带条件的分支互斥。W=写入，Q=查询并读取；参数值来自本次 Apply。</text>
+<rect x="65" y="98" width="200" height="48" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
+<text x="165" y="119" text-anchor="middle" class="actor">主框架</text><text x="165" y="137" text-anchor="middle" class="subtitle">调度 · 错误传播 · DAT 写入</text>
+<rect x="405" y="98" width="210" height="48" rx="10" fill="#FFFFFF" stroke="#5EEAD4" stroke-dasharray="5 3"/>
+<text x="510" y="119" text-anchor="middle" class="actor">Delta 模块</text><text x="510" y="137" text-anchor="middle" class="subtitle">独立子进程 · 生命周期与协议编排</text>
+<rect x="750" y="98" width="260" height="48" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+<text x="880" y="119" text-anchor="middle" class="actor">6221 / 2182A / 可选切换器</text><text x="880" y="137" text-anchor="middle" class="subtitle">2182A 经 6221 串口转发，无独立 VISA</text>
+<line x1="165" y1="147" x2="165" y2="1896" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="510" y1="147" x2="510" y2="1896" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="870" y1="147" x2="870" y2="1896" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<text x="36" y="190" class="step" fill="#0F172A">A01 · 设置与旧连接</text>
+<text x="197" y="212" class="code">校验资源、通道、参数范围与预算</text>
+<text x="197" y="230" class="code">若已连接：先执行 D 的严格收尾</text>
+<text x="197" y="248" class="code">释放旧会话，旧配置置为不可用</text>
+<line x1="197" y1="259" x2="866" y2="259" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="282" class="note">任何失败立即返回错误；旧配置不能留给下一次 Run 使用。</text>
+<text x="36" y="325" class="step" fill="#0F172A">A02 · 按明确选择连接</text>
+<text x="522" y="347" class="code">6221: Q *IDN?</text>
+<text x="522" y="365" class="code">7001: Q *IDN? （仅选择 7001）</text>
+<text x="522" y="383" class="code">3706A: Q print(localnode.model)</text>
+<text x="522" y="401" class="code">None: 不打开切换器会话</text>
+<line x1="515" y1="412" x2="865" y2="412" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="435" class="note">先识别 6221，再识别所选切换器；身份不符立即拒绝，不自动降级。2182A 不单独打开 VISA。</text>
+<text x="36" y="478" class="step" fill="#0F172A">A03 · 安全初态与 2182A 身份</text>
+<text x="522" y="500" class="code">W *CLS</text>
+<text x="522" y="518" class="code">执行 D01–D05：源与路由安全确认</text>
+<text x="522" y="536" class="code">Q SYST:ERR?</text>
+<text x="522" y="554" class="code">Q SOUR:DELT:NVPRESENT?</text>
+<text x="522" y="572" class="code">Q2182A *IDN?</text>
+<line x1="515" y1="583" x2="865" y2="583" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="606" class="note">错误码必须为 0；确认 2182A 存在后，仍经串口查询身份。Q2182A 的 0.15 s 展开见图下方。</text>
+<text x="36" y="649" class="step" fill="#0F172A">A04 · 6221 完整配置（依次写入）</text>
+<text x="522" y="671" class="code">W UNIT V</text>
+<text x="522" y="689" class="code">W FORM:DATA ASC</text>
+<text x="522" y="707" class="code">W FORM:ELEM READ</text>
+<text x="522" y="725" class="code">W SENS:AVER:STAT OFF</text>
+<text x="522" y="743" class="code">W SOUR:CURR:COMP &lt;compliance_V&gt;</text>
+<text x="522" y="761" class="code">W SOUR:DELT:HIGH &lt;high_current_A&gt;</text>
+<text x="522" y="779" class="code">W SOUR:DELT:LOW &lt;low_current_A&gt;</text>
+<text x="522" y="797" class="code">W SOUR:DELT:DEL &lt;delta_delay_s&gt;</text>
+<text x="522" y="815" class="code">W SOUR:DELT:COUN &lt;count&gt;</text>
+<text x="522" y="833" class="code">W SOUR:SWE:COUN 1</text>
+<text x="522" y="851" class="code">W SOUR:DELT:CSW ON</text>
+<text x="522" y="869" class="code">W SOUR:DELT:CAB ON</text>
+<text x="522" y="887" class="code">W TRAC:POIN &lt;count&gt;</text>
+<line x1="515" y1="898" x2="865" y2="898" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="921" class="note">此步骤不 ARM。Delta delay 是仪表参数，不是在这些写命令之间调用 sleep。</text>
+<text x="36" y="964" class="step" fill="#0F172A">A05 · 2182A 设置与回读（经 6221）</text>
+<text x="522" y="986" class="code">固定量程：</text>
+<text x="522" y="1004" class="code">  W2182A VOLT:RANG:AUTO OFF</text>
+<text x="522" y="1022" class="code">  W2182A VOLT:RANG &lt;range_V&gt;</text>
+<text x="522" y="1040" class="code">  Q2182A VOLT:RANG:AUTO?</text>
+<text x="522" y="1058" class="code">  Q2182A VOLT:RANG?</text>
+<text x="522" y="1076" class="code">自动量程：替换上述四行为</text>
+<text x="522" y="1094" class="code">  W2182A VOLT:RANG:AUTO ON</text>
+<text x="522" y="1112" class="code">  Q2182A VOLT:RANG:AUTO?</text>
+<text x="522" y="1130" class="code">随后两种量程都继续：</text>
+<text x="522" y="1148" class="code">W2182A VOLT:NPLC &lt;integer_plc&gt;</text>
+<text x="522" y="1166" class="code">Q2182A VOLT:NPLC?</text>
+<text x="522" y="1184" class="code">W2182A VOLT:LPAS &lt;ON|OFF&gt;</text>
+<text x="522" y="1202" class="code">W2182A VOLT:DFIL:TCON MOV</text>
+<text x="522" y="1220" class="code">W2182A VOLT:DFIL:COUN &lt;filter_count&gt;</text>
+<text x="522" y="1238" class="code">W2182A VOLT:DFIL:WIND &lt;window_percent&gt;</text>
+<text x="522" y="1256" class="code">W2182A VOLT:DFIL:STAT &lt;ON|OFF&gt;</text>
+<text x="522" y="1274" class="code">Q2182A VOLT:LPAS?</text>
+<text x="522" y="1292" class="code">Q2182A VOLT:DFIL:STAT?</text>
+<line x1="515" y1="1303" x2="865" y2="1303" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1326" class="note">两种量程分支互斥。每条 Q2182A 都执行 SEND → 等待 0.15 s → ENT?；只回读图中列出的字段。</text>
+<text x="36" y="1369" class="step" fill="#0F172A">A06 · 6221 回读与错误检查</text>
+<text x="522" y="1391" class="code">Q SOUR:CURR:COMP?</text>
+<text x="522" y="1409" class="code">Q SOUR:DELT:HIGH?</text>
+<text x="522" y="1427" class="code">Q SOUR:DELT:LOW?</text>
+<text x="522" y="1445" class="code">Q SOUR:DELT:DEL?</text>
+<text x="522" y="1463" class="code">Q SOUR:DELT:COUN?</text>
+<text x="522" y="1481" class="code">Q SOUR:DELT:CSW?</text>
+<text x="522" y="1499" class="code">Q SOUR:DELT:CAB?</text>
+<text x="522" y="1517" class="code">Q SYST:ERR?</text>
+<line x1="515" y1="1528" x2="865" y2="1528" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1551" class="note">各设置与请求值比对；CSW/CAB 必须为 ON，错误码必须为 0；具体数值容差见 README。</text>
+<text x="36" y="1594" class="step" fill="#0F172A">A07 · Apply 完成或失败</text>
+<text x="197" y="1616" class="code">成功：再次执行 D01–D05</text>
+<text x="197" y="1634" class="code">确认后记录 applied_settings</text>
+<text x="197" y="1652" class="code">失败：尽力收尾 D00，释放已开会话</text>
+<text x="197" y="1670" class="code">保留并向核心传播错误</text>
+<line x1="197" y1="1681" x2="866" y2="1681" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1704" class="note">Apply 成功结束时输出仍为 OFF，不会直接启动采集。</text>
+<text x="36" y="1747" class="step" fill="#0F766E">桥接查询的固定展开 · 每次查询独立执行</text>
+<text x="522" y="1769" class="code">W SYST:COMM:SER:SEND &quot;&lt;query&gt;&quot;</text>
+<text x="522" y="1787" class="code fixed">[固定等待] 0.15 s</text>
+<text x="522" y="1805" class="code">Q SYST:COMM:SER:ENT?</text>
+<text x="522" y="1823" class="code">解析 2182A 回包并核对预期值</text>
+<line x1="515" y1="1834" x2="865" y2="1834" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="1857" class="note">W2182A 仅执行 SEND；普通写入不附加这项 0.15 s 等待。无效/空回包报错，不盲目重发查询。</text><line x1="28" y1="1911" x2="1012" y2="1911" stroke="#E2E8F0"/><text x="28" y="1931" class="subtitle">代码依据：backend.py、keithley_6221.py、keithley_2182a.py、keithley_7001.py、keithley_3706a.py。</text><text x="28" y="1950" class="subtitle">仅描述当前代码；垂直间距不表示实际耗时。精确指令样例见 README 中的离线 CSV；不替代真机验证。</text></svg>

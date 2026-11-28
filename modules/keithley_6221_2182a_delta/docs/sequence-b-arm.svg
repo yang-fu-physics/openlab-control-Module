@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="1228" viewBox="0 0 1040 1228" role="img" aria-labelledby="title desc">
+<title id="title">B · 启动与 ARM</title><desc id="desc">on_event(&quot;run_start&quot;, {}, api) · 两种模式的互斥分支。块内指令自上而下依次执行，条件分支只执行符合当前配置的一支；时间标记区分固定等待、可配置等待与超时。A 到 D 的引用对应同目录分图。</desc>
+<defs><style>
+text { font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; fill:#1E293B; }
+.title { font-size:18px; font-weight:600; fill:#0F172A; }
+.subtitle { font-size:12px; fill:#64748B; }
+.actor { font-size:14px; font-weight:600; fill:#0F172A; }
+.step { font-size:13px; font-weight:600; }
+.branch { font-size:13px; font-weight:600; fill:#1E3A8A; }
+.code { font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; fill:#1E293B; }
+.note { font-size:12px; fill:#475569; }
+.fixed { fill:#0F766E; } .config { fill:#1D4ED8; } .timeout { fill:#92400E; }
+</style>
+<marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#2563EB"/></marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#D97706"/></marker>
+</defs>
+<rect x="1" y="1" width="1038" height="1226" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="28" y="33" class="title">B · 启动与 ARM</text>
+<text x="28" y="58" class="subtitle">on_event(&quot;run_start&quot;, {}, api) · 两种模式的互斥分支</text>
+<text x="28" y="79" class="subtitle">块内自上而下顺序执行；带条件的分支互斥。W=写入，Q=查询并读取；参数值来自本次 Apply。</text>
+<rect x="65" y="98" width="200" height="48" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
+<text x="165" y="119" text-anchor="middle" class="actor">主框架</text><text x="165" y="137" text-anchor="middle" class="subtitle">调度 · 错误传播 · DAT 写入</text>
+<rect x="405" y="98" width="210" height="48" rx="10" fill="#FFFFFF" stroke="#5EEAD4" stroke-dasharray="5 3"/>
+<text x="510" y="119" text-anchor="middle" class="actor">Delta 模块</text><text x="510" y="137" text-anchor="middle" class="subtitle">独立子进程 · 生命周期与协议编排</text>
+<rect x="750" y="98" width="260" height="48" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+<text x="880" y="119" text-anchor="middle" class="actor">6221 / 2182A / 可选切换器</text><text x="880" y="137" text-anchor="middle" class="subtitle">2182A 经 6221 串口转发，无独立 VISA</text>
+<line x1="165" y1="147" x2="165" y2="1160" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="510" y1="147" x2="510" y2="1160" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="870" y1="147" x2="870" y2="1160" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<text x="36" y="190" class="step" fill="#0F172A">B01 · 两种模式共同前置</text>
+<text x="197" y="212" class="code">要求 Apply 已成功</text>
+<text x="197" y="230" class="code">执行 D01–D05：严格安全确认</text>
+<line x1="197" y1="241" x2="866" y2="241" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="264" class="note">若安全状态不能确认，不进入后续配置或 ARM。</text>
+<rect x="26" y="289" width="988" height="29" rx="8" fill="#F8FBFF" stroke="#BFDBFE"/>
+<text x="40" y="308" class="branch">Shared 分支 · 每次 Run 执行一次</text>
+<text x="36" y="353" class="step" fill="#0F172A">B02 · 应用公共设置</text>
+<text x="197" y="375" class="code">执行 A04–A06</text>
+<text x="197" y="393" class="code">使用本次公共 shared 配置</text>
+<line x1="197" y1="404" x2="866" y2="404" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="427" class="note">配置仍会写入并回读；不是因为 Apply 曾成功就直接跳过。</text>
+<text x="36" y="470" class="step" fill="#0F172A">B03 · ARM</text>
+<text x="522" y="492" class="code">W SOUR:DELT:ARM</text>
+<line x1="515" y1="503" x2="865" y2="503" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="526" class="note">将本地 Armed 先置为 false，显示 Arming；尚不能视为已完成。</text>
+<text x="36" y="569" class="step" fill="#0F766E">B04 · ARM 固定等待</text>
+<text x="197" y="591" class="code fixed">[固定等待] 3.0 s</text>
+<line x1="197" y1="602" x2="866" y2="602" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="625" class="note">通过 api.sleep 等待并检查 Pause/Stop；不是向 VISA 设置 3 秒超时。</text>
+<text x="36" y="668" class="step" fill="#0F172A">B05 · 先检查仪表错误</text>
+<text x="522" y="690" class="code">Q SYST:ERR?</text>
+<line x1="515" y1="701" x2="865" y2="701" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="724" class="note">要求错误码为 0；先暴露仪表错误，不能先把 Armed=OFF 作为唯一失败原因。</text>
+<text x="36" y="767" class="step" fill="#0F172A">B06 · 再确认 Armed</text>
+<text x="522" y="789" class="code">Q SOUR:DELT:ARM?</text>
+<line x1="515" y1="800" x2="865" y2="800" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="823" class="note">必须读回 ON，随后才将本次序列标为 active。</text>
+<rect x="26" y="848" width="988" height="29" rx="8" fill="#F8FBFF" stroke="#BFDBFE"/>
+<text x="40" y="867" class="branch">Independent 分支 · 与上面的 Shared 分支互斥</text>
+<text x="36" y="912" class="step" fill="#0F172A">B07 · 此时不配置、不 ARM</text>
+<text x="197" y="934" class="code">B01 成功后标记 sequence_active</text>
+<text x="197" y="952" class="code">进入 C：每槽位切换后执行</text>
+<text x="197" y="970" class="code">A04–A06，再执行 B03–B06</text>
+<line x1="197" y1="981" x2="866" y2="981" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1004" class="note">Independent 的 3 秒等待发生在每个参与槽位的 measure() 内，不发生在本次 run_start 内。</text>
+<text x="36" y="1047" class="step" fill="#BE123C">启动中途异常</text>
+<text x="197" y="1069" class="code">先请求 D00 的尽力收尾</text>
+<text x="197" y="1087" class="code">向核心传播错误并进入 D</text>
+<line x1="197" y1="1098" x2="866" y2="1098" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1121" class="note">即使异常发生在 ARM 等待期间，也需要请求收尾；worker 失效时不能假定物理输出已关闭。</text><line x1="28" y1="1175" x2="1012" y2="1175" stroke="#E2E8F0"/><text x="28" y="1195" class="subtitle">代码依据：backend.py、keithley_6221.py、keithley_2182a.py、keithley_7001.py、keithley_3706a.py。</text><text x="28" y="1214" class="subtitle">仅描述当前代码；垂直间距不表示实际耗时。精确指令样例见 README 中的离线 CSV；不替代真机验证。</text></svg>

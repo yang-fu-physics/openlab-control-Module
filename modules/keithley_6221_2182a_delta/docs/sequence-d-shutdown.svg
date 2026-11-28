@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="1588" viewBox="0 0 1040 1588" role="img" aria-labelledby="title desc">
+<title id="title">D · 停止、异常与关闭</title><desc id="desc">区分“已发出安全请求”与“已通过严格回读确认”。块内指令自上而下依次执行，条件分支只执行符合当前配置的一支；时间标记区分固定等待、可配置等待与超时。A 到 D 的引用对应同目录分图。</desc>
+<defs><style>
+text { font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; fill:#1E293B; }
+.title { font-size:18px; font-weight:600; fill:#0F172A; }
+.subtitle { font-size:12px; fill:#64748B; }
+.actor { font-size:14px; font-weight:600; fill:#0F172A; }
+.step { font-size:13px; font-weight:600; }
+.branch { font-size:13px; font-weight:600; fill:#1E3A8A; }
+.code { font-family:Consolas, 'Microsoft YaHei', monospace; font-size:12px; fill:#1E293B; }
+.note { font-size:12px; fill:#475569; }
+.fixed { fill:#0F766E; } .config { fill:#1D4ED8; } .timeout { fill:#92400E; }
+</style>
+<marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#2563EB"/></marker>
+<marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1 L9 5 L1 9 Z" fill="#D97706"/></marker>
+</defs>
+<rect x="1" y="1" width="1038" height="1586" rx="14" fill="#FFFFFF" stroke="#E2E8F0"/>
+<text x="28" y="33" class="title">D · 停止、异常与关闭</text>
+<text x="28" y="58" class="subtitle">区分“已发出安全请求”与“已通过严格回读确认”</text>
+<text x="28" y="79" class="subtitle">块内自上而下顺序执行；带条件的分支互斥。W=写入，Q=查询并读取；参数值来自本次 Apply。</text>
+<rect x="65" y="98" width="200" height="48" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
+<text x="165" y="119" text-anchor="middle" class="actor">主框架</text><text x="165" y="137" text-anchor="middle" class="subtitle">调度 · 错误传播 · DAT 写入</text>
+<rect x="405" y="98" width="210" height="48" rx="10" fill="#FFFFFF" stroke="#5EEAD4" stroke-dasharray="5 3"/>
+<text x="510" y="119" text-anchor="middle" class="actor">Delta 模块</text><text x="510" y="137" text-anchor="middle" class="subtitle">独立子进程 · 生命周期与协议编排</text>
+<rect x="750" y="98" width="260" height="48" rx="10" fill="#FFFFFF" stroke="#FCD34D"/>
+<text x="880" y="119" text-anchor="middle" class="actor">6221 / 2182A / 可选切换器</text><text x="880" y="137" text-anchor="middle" class="subtitle">2182A 经 6221 串口转发，无独立 VISA</text>
+<line x1="165" y1="147" x2="165" y2="1520" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="510" y1="147" x2="510" y2="1520" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<line x1="870" y1="147" x2="870" y2="1520" stroke="#CBD5E1" stroke-width="1.1" stroke-dasharray="4 4"/>
+<text x="36" y="190" class="step" fill="#BE123C">D00 · 异常时的尽力路径（不是严格确认）</text>
+<text x="522" y="212" class="code">6221: W SOUR:SWE:ABOR</text>
+<text x="522" y="230" class="code">6221: W SOUR:CLE</text>
+<text x="522" y="248" class="code">切换器: W ROUT:OPEN ALL （7001）</text>
+<text x="522" y="266" class="code">或 W channel.open(&quot;allslots&quot;)</text>
+<line x1="515" y1="277" x2="865" y2="277" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="300" class="note">测量/启动异常时先逐项尝试；不读回，不证明关断成功，也不替代下面的严格收尾。</text>
+<rect x="26" y="325" width="988" height="29" rx="8" fill="#F8FBFF" stroke="#BFDBFE"/>
+<text x="40" y="344" class="branch">严格路径 · 源与切换器分开尝试，最后汇总错误</text>
+<text x="36" y="389" class="step" fill="#0F172A">D01 · 终止源扫描</text>
+<text x="522" y="411" class="code">W SOUR:SWE:ABOR</text>
+<line x1="515" y1="422" x2="865" y2="422" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="445" class="note">由 on_event(&quot;run_end&quot;, {&quot;reason&quot;: ...}, api) 请求；任何一步失败都不能视为全部确认完成。</text>
+<text x="36" y="488" class="step" fill="#0F172A">D02 · 清除源输出</text>
+<text x="522" y="510" class="code">W SOUR:CLE</text>
+<line x1="515" y1="521" x2="865" y2="521" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="544" class="note">按该模块当前实现请求清除；不额外构造未实现的 OUTPUT OFF 命令。</text>
+<text x="36" y="587" class="step" fill="#0F172A">D03 · 确认输出状态</text>
+<text x="522" y="609" class="code">Q OUTP?</text>
+<line x1="515" y1="620" x2="865" y2="620" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="643" class="note">先读取输出状态，保存结果，再继续 D04 读取电流，两者合并判定。</text>
+<text x="36" y="686" class="step" fill="#0F172A">D04 · 确认零电流</text>
+<text x="522" y="708" class="code">Q SOUR:CURR?</text>
+<line x1="515" y1="719" x2="865" y2="719" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="742" class="note">同时要求 D03 输出 OFF、|I| ≤ 100 fA；源确认失败仍尝试 D05，最后统一报告失败。</text>
+<text x="36" y="785" class="step" fill="#0F172A">D05 · 有切换器时断开并确认路由</text>
+<text x="522" y="807" class="code">7001: W ROUT:OPEN ALL</text>
+<text x="522" y="825" class="code">7001: Q ROUT:OPEN? &lt;all_routes&gt;</text>
+<text x="522" y="843" class="code">或 3706A: W channel.open(&quot;allslots&quot;)</text>
+<text x="522" y="861" class="code">3706A: Q print(channel.getclose(&quot;allslots&quot;))</text>
+<text x="522" y="879" class="code">None: 不发送上述命令</text>
+<line x1="515" y1="890" x2="865" y2="890" stroke="#D97706" stroke-width="1.4" marker-end="url(#arrow-amber)"/>
+<text x="40" y="913" class="note">即使源收尾失败也尝试本步。7001 核对配置路由；3706A 要求整机闭合集合为空，两种分支互斥。</text>
+<text x="36" y="956" class="step" fill="#0F172A">D06 · run_end 结果</text>
+<text x="177" y="978" class="code">严格确认成功 + worker 可用：Enabled</text>
+<text x="177" y="996" class="code">失败或 worker 失效：Faulted / 故障处理</text>
+<text x="177" y="1014" class="code">worker 能执行时清除 Armed / active_channel</text>
+<line x1="505" y1="1025" x2="170" y2="1025" stroke="#2563EB" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+<text x="40" y="1048" class="note">本地状态已清除不证明仪表已安全；正常确认成功后才可再次进入 B。</text>
+<rect x="26" y="1073" width="988" height="29" rx="8" fill="#F8FBFF" stroke="#BFDBFE"/>
+<text x="40" y="1092" class="branch">Disable / 应用退出 · 还需要释放会话</text>
+<text x="36" y="1137" class="step" fill="#0F172A">D07 · close(api) 再次请求严格收尾</text>
+<text x="197" y="1159" class="code">再次执行 D01–D05</text>
+<text x="197" y="1177" class="code">未 Apply 且没有会话：不发硬件命令</text>
+<line x1="197" y1="1188" x2="866" y2="1188" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1211" class="note">即使收尾失败，也继续尝试释放已打开的会话，并向核心传播关闭失败。</text>
+<text x="36" y="1254" class="step" fill="#0F172A">D08 · 释放资源</text>
+<text x="197" y="1276" class="code">先 close 切换器 VISA 会话</text>
+<text x="197" y="1294" class="code">再 close 6221 VISA 会话</text>
+<text x="197" y="1312" class="code">清除 applied_settings 与连接身份</text>
+<line x1="197" y1="1323" x2="866" y2="1323" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1346" class="note">释放会话不等于关闭物理输出。Apply 失败时也要释放已打开的部分连接。</text>
+<text x="36" y="1389" class="step" fill="#92400E">超时边界</text>
+<text x="197" y="1411" class="code timeout">[清理预留] measure 起点预留 2 s</text>
+<text x="197" y="1429" class="code timeout">[普通 I/O 超时] 默认 3 s</text>
+<text x="197" y="1447" class="code">worker 终止不能替代仪表本机保护</text>
+<line x1="197" y1="1458" x2="866" y2="1458" stroke="#CBD5E1" stroke-width="1"/>
+<text x="40" y="1481" class="note">预留预算不保证每条清理 I/O 都能完成；阻塞/失联场景必须结合真实硬件验证。</text><line x1="28" y1="1535" x2="1012" y2="1535" stroke="#E2E8F0"/><text x="28" y="1555" class="subtitle">代码依据：backend.py、keithley_6221.py、keithley_2182a.py、keithley_7001.py、keithley_3706a.py。</text><text x="28" y="1574" class="subtitle">仅描述当前代码；垂直间距不表示实际耗时。精确指令样例见 README 中的离线 CSV；不替代真机验证。</text></svg>

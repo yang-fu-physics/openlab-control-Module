@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 650" width="940" height="650" role="img" aria-label="主框架、Delta 模块独立子进程与硬件仪表交互时序图">
+  <title>Delta 模块运行时序</title>
+  <desc>Enable 仅初始化；Apply 连接并验证仪表；Run 通过 on_event 准备测量，按逻辑槽位返回数据。完成、停止或错误后请求安全收尾，只有收尾成功且进程可用时才能再次运行。2182A 经 6221 转发通信，不占独立 VISA 地址。</desc>
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+      .title { font-size: 13.5px; font-weight: 600; fill: #0F172A; }
+      .subtitle { font-size: 11px; font-weight: 400; fill: #64748B; }
+      .msg { font-size: 12.5px; fill: #1E293B; }
+      .msg-bold { font-size: 12.5px; font-weight: 600; fill: #0F172A; }
+      .msg-muted { font-size: 12px; fill: #64748B; }
+      .code { font-size: 12px; font-weight: 600; fill: #0F766E; }
+      .hw-msg { font-size: 12px; fill: #92400E; }
+      .pill-text { font-size: 11px; font-weight: 500; fill: #0F766E; }
+    </style>
+
+    <filter id="card-shadow" x="-6%" y="-8%" width="112%" height="128%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.06"/>
+    </filter>
+
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 9 5 L 1 8.5 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 9 5 L 1 8.5 z" fill="#2563EB"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 9 5 L 1 8.5 z" fill="#D97706"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 9 5 L 1 8.5 z" fill="#0D9488"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 9 5 L 1 8.5 z" fill="#10B981"/>
+    </marker>
+    <marker id="cross-rose" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto">
+      <path d="M 2 2 L 8 8 M 8 2 L 2 8" stroke="#E11D48" stroke-width="1.8" stroke-linecap="round"/>
+    </marker>
+  </defs>
+
+  <!-- 画布背景卡片 -->
+  <rect x="1" y="1" width="938" height="648" rx="14" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.2"/>
+
+  <!-- 循环测量区块底板 -->
+  <rect x="118" y="270" width="782" height="176" rx="12" fill="#F8FBFF" stroke="#BFDBFE" stroke-width="1.2"/>
+  <rect x="132" y="259" width="218" height="22" rx="11" fill="#FFFFFF" stroke="#BFDBFE" stroke-width="1"/>
+  <rect x="135" y="262" width="44" height="16" rx="8" fill="#2563EB"/>
+  <text x="157" y="273.5" text-anchor="middle" class="sans" font-size="9.5" font-weight="700" fill="#FFFFFF" letter-spacing="0.5">LOOP</text>
+  <text x="187" y="274" class="sans" font-size="11.5" font-weight="500" fill="#1E3A8A">后续测量 · 按逻辑槽位调度</text>
+
+  <!-- 垂直生命线 -->
+  <line x1="195" y1="70" x2="195" y2="584" stroke="#CBD5E1" stroke-width="1.4" stroke-dasharray="4 4"/>
+  <line x1="515" y1="70" x2="515" y2="584" stroke="#CBD5E1" stroke-width="1.4" stroke-dasharray="4 4"/>
+  <line x1="815" y1="70" x2="815" y2="584" stroke="#CBD5E1" stroke-width="1.4" stroke-dasharray="4 4"/>
+
+  <!-- Delta 独立子进程存活周期条（open → close） -->
+  <rect x="509" y="96" width="12" height="476" rx="6" fill="#CCFBF1" stroke="#14B8A6" stroke-width="1.2"/>
+
+  <!-- 硬件通信激活条 -->
+  <rect x="810" y="165" width="10" height="45" rx="5" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1.2"/>
+  <rect x="810" y="325" width="10" height="43" rx="5" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1.2"/>
+
+  <!-- 顶部参与者卡片 -->
+  <!-- 1. 主框架 -->
+  <g filter="url(#card-shadow)">
+    <rect x="105" y="20" width="180" height="50" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>
+  </g>
+  <circle cx="171" cy="39" r="4" fill="#2563EB"/>
+  <text x="181" y="43.5" class="sans title">主框架</text>
+  <text x="195" y="59" text-anchor="middle" class="sans subtitle">调度 · 校验 · DAT 写入</text>
+
+  <!-- 2. Delta 模块 · 独立子进程 -->
+  <g filter="url(#card-shadow)">
+    <rect x="415" y="20" width="200" height="50" rx="10" fill="#FFFFFF" stroke="#5EEAD4" stroke-width="1.4" stroke-dasharray="5 3"/>
+  </g>
+  <circle cx="478" cy="39" r="4" fill="#0D9488"/>
+  <text x="488" y="43.5" class="sans title">Delta 模块</text>
+  <text x="515" y="59" text-anchor="middle" class="sans subtitle">独立子进程 · Subprocess</text>
+
+  <!-- 3. 硬件仪表 -->
+  <g filter="url(#card-shadow)">
+    <rect x="710" y="20" width="210" height="50" rx="10" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.2"/>
+  </g>
+  <circle cx="765" cy="39" r="4" fill="#D97706"/>
+  <text x="775" y="43.5" class="sans title">6221 + 2182A</text>
+  <text x="815" y="59" text-anchor="middle" class="sans subtitle">可选 7001 / 3706A 切换器</text>
+
+  <!-- 步骤 1：Enable → open() -->
+  <line x1="196" y1="104" x2="505" y2="104" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-slate)"/>
+  <text x="351" y="96" text-anchor="middle" class="sans msg">
+    <tspan class="msg-bold">Enable</tspan>
+    <tspan class="msg-muted"> · 启用模块 → </tspan>
+    <tspan class="mono code">open()</tspan>
+  </text>
+  <rect x="532" y="92" width="128" height="24" rx="12" fill="#F0FDFA" stroke="#99F6E4" stroke-width="1"/>
+  <text x="596" y="108" text-anchor="middle" class="sans pill-text">仅初始化，不连接</text>
+
+  <!-- 步骤 2：Apply Settings → configure() + 硬件配置与回读 -->
+  <line x1="196" y1="146" x2="505" y2="146" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-slate)"/>
+  <text x="351" y="138" text-anchor="middle" class="sans msg">
+    <tspan class="msg-bold">A · Apply Settings</tspan>
+    <tspan class="msg-muted"> · 应用参数 → </tspan>
+    <tspan class="mono code">configure()</tspan>
+  </text>
+
+  <line x1="522" y1="172" x2="806" y2="172" stroke="#D97706" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+  <text x="665" y="164" text-anchor="middle" class="sans hw-msg">连接仪表 · 核对身份 · 应用设置</text>
+
+  <line x1="809" y1="202" x2="525" y2="202" stroke="#D97706" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-amber)"/>
+  <text x="665" y="194" text-anchor="middle" class="sans hw-msg">身份、设置与输出状态回读</text>
+
+  <!-- 步骤 3：Run → on_event("run_start") -->
+  <line x1="196" y1="238" x2="505" y2="238" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-slate)"/>
+  <text x="351" y="230" text-anchor="middle" class="sans msg">
+    <tspan class="msg-bold">B · Run</tspan>
+    <tspan class="msg-muted"> · 开始序列 → </tspan>
+    <tspan class="mono code">on_event("run_start")</tspan>
+  </text>
+  <rect x="532" y="226" width="136" height="24" rx="12" fill="#F0FDFA" stroke="#99F6E4" stroke-width="1"/>
+  <text x="600" y="242" text-anchor="middle" class="sans pill-text">按模式准备 / ARM</text>
+
+  <!-- 步骤 4（循环内）：Measure → measure(slot) -->
+  <line x1="196" y1="306" x2="505" y2="306" stroke="#2563EB" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <text x="351" y="298" text-anchor="middle" class="sans msg">
+    <tspan class="msg-bold">C · Measure</tspan>
+    <tspan class="msg-muted"> · 按槽位调度 → </tspan>
+    <tspan class="mono code">measure(slot)</tspan>
+  </text>
+
+  <line x1="522" y1="332" x2="806" y2="332" stroke="#D97706" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+  <text x="665" y="324" text-anchor="middle" class="sans hw-msg">下发命令 · 执行当前通道 Delta 测量</text>
+
+  <line x1="809" y1="360" x2="525" y2="360" stroke="#D97706" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-amber)"/>
+  <text x="665" y="352" text-anchor="middle" class="sans hw-msg">返回测量结果</text>
+
+  <!-- 分支 A：正常返回并写 DAT -->
+  <line x1="508" y1="390" x2="199" y2="390" stroke="#0D9488" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-teal)"/>
+  <text x="351" y="382" text-anchor="middle" class="sans" font-size="12" fill="#0F766E">
+    <tspan font-weight="600">正常返回</tspan>
+    <tspan fill="#334155"> → 校验结果，合并并写入 </tspan>
+    <tspan class="mono" font-weight="600" fill="#1E293B">DAT</tspan>
+  </text>
+
+  <!-- 分支 B：停止或故障中断 -->
+  <rect x="242" y="402" width="218" height="20" rx="10" fill="#FFF1F2" stroke="#FECDD3" stroke-width="1"/>
+  <text x="351" y="415.5" text-anchor="middle" class="sans" font-size="11.5" font-weight="500" fill="#BE123C">停止或故障 · Stop / Error（跳出）</text>
+  <line x1="508" y1="429" x2="201" y2="429" stroke="#E11D48" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#cross-rose)"/>
+
+  <!-- 步骤 5：完成 / Stop / Error → on_event("run_end") -->
+  <line x1="196" y1="478" x2="505" y2="478" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-slate)"/>
+  <text x="351" y="470" text-anchor="middle" class="sans msg">
+    <tspan class="msg-bold">D · 完成 / Stop / Error</tspan>
+    <tspan class="msg-muted"> → </tspan>
+    <tspan class="mono code">on_event("run_end")</tspan>
+  </text>
+  <rect x="532" y="466" width="136" height="24" rx="12" fill="#F0FDFA" stroke="#99F6E4" stroke-width="1"/>
+  <text x="600" y="482" text-anchor="middle" class="sans pill-text">关输出、清零、断路由</text>
+
+  <!-- run_end 的硬件收尾与确认 -->
+  <line x1="678" y1="478" x2="806" y2="478" stroke="#D97706" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+  <line x1="809" y1="497" x2="680" y2="497" stroke="#D97706" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-amber)"/>
+  <text x="744" y="491" text-anchor="middle" class="sans hw-msg">回读确认</text>
+
+  <!-- 保持 Enabled 状态胶囊 -->
+  <rect x="180" y="504" width="350" height="26" rx="13" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1.2"/>
+  <circle cx="197" cy="517" r="3.8" fill="#10B981"/>
+  <text x="360" y="521" text-anchor="middle" class="sans" font-size="12" font-weight="600" fill="#065F46">收尾成功、进程可用 → 可再次 Run</text>
+
+  <!-- 左侧「再次 Run」闭环回流箭头 -->
+  <path d="M 180 517 L 76 517 Q 64 517 64 505 L 64 250 Q 64 238 76 238 L 190 238"
+        fill="none" stroke="#10B981" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#arrow-emerald)"/>
+  <rect x="28" y="366" width="72" height="24" rx="12" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1.1"/>
+  <text x="64" y="382" text-anchor="middle" class="sans" font-size="11.5" font-weight="600" fill="#047857">再次 Run</text>
+
+  <!-- 步骤 6：Disable / 退出 → close() -->
+  <line x1="196" y1="564" x2="505" y2="564" stroke="#64748B" stroke-width="1.5" marker-end="url(#arrow-slate)"/>
+  <text x="351" y="556" text-anchor="middle" class="sans msg">
+    <tspan class="msg-bold">D · Disable / 退出</tspan>
+    <tspan class="msg-muted"> → </tspan>
+    <tspan class="mono code" fill="#475569">close()</tspan>
+  </text>
+  <rect x="532" y="552" width="136" height="24" rx="12" fill="#F1F5F9" stroke="#CBD5E1" stroke-width="1"/>
+  <text x="600" y="568" text-anchor="middle" class="sans" font-size="11" font-weight="500" fill="#475569">请求收尾并释放连接</text>
+  <text x="105" y="615" class="sans subtitle">2182A 经 6221 的 RS-232 / Trigger Link 连接；仅 6221 与可选切换器占用 VISA 地址。</text>
+  <text x="105" y="634" class="sans subtitle">数据质量 Warning 可继续；收尾失败或子进程失效需故障处理，不能直接再次 Run。</text>
+</svg>
